@@ -1,0 +1,32 @@
+repos:
+  # Pre-commit hooks for general checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.4.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+
+  # Python-specific hooks for code formatting and linting
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+        language_version: python3
+        args: ['--line-length=80']  # Set line length to 80
+        files: \.py$  # Only run on .py files
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        language_version: python3
+        args: ['--profile=black','--line-length=80']
+        files: \.py$  # Only run on .py files
+
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.3.1
+    hooks:
+      - id: autoflake
+        language_version: python3
+        args: [ --remove-all-unused-imports,--remove-unused-variables,--remove-unused-variables,--ignore-init-module-imports,--in-place]
+        files: \.py$  # Only run on .py files
