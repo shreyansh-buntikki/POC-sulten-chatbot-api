@@ -1,0 +1,20 @@
+.env
+details.md
+QA.pdf
+sulten-db - erd.png
+sulten-prd.pdf
+Tech Approach.pdf
+.claude
+.venv
+.idea
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.claudeignore
+SONARQUBE_README.MD
+AGENTS.md
+sonar-project.properties
+db_backup.sql
+**/__pycache__/
+**/*.pyc
