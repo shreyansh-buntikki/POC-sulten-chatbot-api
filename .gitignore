@@ -15,6 +15,7 @@ __pycache__/
 SONARQUBE_README.MD
 AGENTS.md
 sonar-project.properties
-db_backup.sql
 **/__pycache__/
 **/*.pyc
+documents
+logs/

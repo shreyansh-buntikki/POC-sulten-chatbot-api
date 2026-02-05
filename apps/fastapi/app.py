@@ -13,6 +13,7 @@ sys.path.append(BASE_DIR)
 
 from apps.fastapi import logger
 from apps.fastapi.src.routes.index import index_route
+from apps.fastapi.src.routes.users import users_route
 from libs.services.fastapi.openapi_customization import custom_openapi
 from libs.utils.common.exceptions.fastapi import AppException
 from libs.utils.common.models.fastapi.responses import ErrorResponse
@@ -79,6 +80,7 @@ def root():
 
 
 app.include_router(index_route)
+app.include_router(users_route)
 
 
 if __name__ == "__main__":
