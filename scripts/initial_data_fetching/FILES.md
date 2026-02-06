@@ -78,7 +78,7 @@ python scripts/initial_data_fetching/populate_ingredients_with_nutrition_and_pri
 **Purpose:** Creates seasonality categories with translations
 
 **What it does:**
-- Creates 48 seasonality entries across 9 categories
+- Creates seasonality entries for WEATHER and FESTIVAL categories
 - Adds English and Norwegian translations for each seasonality
 - Stores in `seasonality` and `seasonality_translation` tables
 
@@ -88,20 +88,15 @@ python scripts/initial_data_fetching/populate_ingredients_with_nutrition_and_pri
 |------|---------------|
 | WEATHER | Winter, Summer, Spring, Autumn, Monsoon |
 | FESTIVAL | Christmas, Diwali, Easter, Thanksgiving, New Year, Eid, Holi |
-| INGREDIENT_AVAILABILITY | Strawberry Season, Asparagus Season, Mango Season, Apple Season, Pumpkin Season |
-| CULTURAL_OCCASION | Wedding, Birthday, Potluck, Picnic |
-| DIETARY_PRACTICE | Ramadan, Lent, Navratri Fasting, Vegan |
-| MEAL_TIMING | Breakfast, Brunch, Lunch, Dinner, Late Night, Snack |
-| LIFESTYLE | Comfort Food, Party Food, Detox, Cozy, Outdoor, Quick & Easy |
-| REGIONAL | Nordic, Indian, Italian, Asian, Mexican, Middle Eastern |
-| HEALTH_CYCLE | Immunity Boosting, Summer Hydration, Winter Nourishment, Post-Workout, Gut Health |
+
+> **Note:** The original script created 9 categories (48 seasonalities). Additional categories have been removed, keeping only WEATHER and FESTIVAL.
 
 **Usage:**
 ```bash
 python scripts/initial_data_fetching/create_seasonalities.py
 ```
 
-**Results:** 48 seasonalities with 96 translations
+**Results:** 12 seasonalities with 24 translations (after removal)
 
 **Requirements:**
 - Database connection
@@ -114,22 +109,20 @@ python scripts/initial_data_fetching/create_seasonalities.py
 **Purpose:** Automatically maps recipes to seasonalities using intelligent keyword matching
 
 **What it does:**
-- Analyzes 3,298 published recipe names
+- Analyzes published recipe names
 - Uses keyword matching to assign appropriate seasonalities
 - Creates entries in `recipe_seasonality` table
 
 **Keyword Matching Examples:**
-- "Pumpkin" → Autumn, Pumpkin Season
+- "Pumpkin" → Autumn
 - "Christmas" → Christmas
-- "Taco" → Mexican
-- "Pancake" → Breakfast
-- "Soup" → Comfort Food, Winter
-- "Grill" → Outdoor, Summer
-- "Vegan" → Vegan (Dietary Practice)
+- "Soup" → Winter
+- "Grill" → Summer
+- "Sun" → Summer
 
 **Key Features:**
 - `RecipeSeasonalityMapper` class with intelligent categorization
-- Seasonality type detection (WEATHER, FESTIVAL, REGIONAL, etc.)
+- Seasonality type detection (WEATHER, FESTIVAL)
 - Keyword lists for each seasonality type
 - Handles multi-language recipe names (Norwegian, English)
 
@@ -138,10 +131,10 @@ python scripts/initial_data_fetching/create_seasonalities.py
 python scripts/initial_data_fetching/map_recipes_to_seasonalities.py
 ```
 
-**Results:**
-- 1,750 recipes mapped (53.1% of 3,298)
-- 3,135 total mappings created
-- Average 1.8 seasonalities per mapped recipe
+**Results:** (After type reduction)
+- ~579 recipes mapped to WEATHER seasonalities (775 mappings)
+- ~163 recipes mapped to FESTIVAL seasonalities (166 mappings)
+- Total: ~941 mappings across 579 recipes
 
 **Requirements:**
 - Database connection

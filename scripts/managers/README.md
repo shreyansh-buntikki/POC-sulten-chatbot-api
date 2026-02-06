@@ -101,7 +101,9 @@ python scripts/managers/seasonality_manager.py remove "Pizza" Winter
 python scripts/managers/seasonality_manager.py stats
 ```
 
-**Seasonality Types:** `WEATHER`, `FESTIVAL`, `INGREDIENT_AVAILABILITY`, `CULTURAL_OCCASION`, `DIETARY_PRACTICE`, `MEAL_TIMING`, `LIFESTYLE`, `REGIONAL`, `HEALTH_CYCLE`
+**Seasonality Types:** `WEATHER`, `FESTIVAL`
+
+> **Note:** Only WEATHER and FESTIVAL categories are active. Other categories have been removed.
 
 **Example Output:**
 ```
@@ -112,11 +114,8 @@ python scripts/managers/seasonality_manager.py stats
      • Autumn
      • Winter
 
-  [INGREDIENT_AVAILABILITY]
-     • Pumpkin Season
-
-  [LIFESTYLE]
-     • Comfort Food
+  [FESTIVAL]
+     • Thanksgiving
 ```
 
 ---
@@ -179,5 +178,5 @@ python scripts/managers/seasonality_manager.py stats
 ```
 Nutrition:  1,698 / 2,841 ingredients (59.8%)
 Pricing:    2,841 / 2,841 ingredients (100%)
-Seasonality:  1,750 / 3,298 recipes (53.1%)
+Seasonality:  579 / 3,298 recipes (17.6%) - WEATHER & FESTIVAL only
 ```

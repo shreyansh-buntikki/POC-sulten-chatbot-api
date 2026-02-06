@@ -144,13 +144,8 @@ The `add` command provides an interactive prompt where you can:
 **Seasonality Types:**
 - `WEATHER` - Winter, Summer, Spring, Autumn, Monsoon
 - `FESTIVAL` - Christmas, Diwali, Easter, Thanksgiving, New Year, Eid, Holi
-- `INGREDIENT_AVAILABILITY` - Strawberry Season, Asparagus Season, Mango Season, etc.
-- `CULTURAL_OCCASION` - Wedding, Birthday, Potluck, Picnic
-- `DIETARY_PRACTICE` - Ramadan, Lent, Navratri Fasting, Vegan
-- `MEAL_TIMING` - Breakfast, Brunch, Lunch, Dinner, Late Night, Snack
-- `LIFESTYLE` - Comfort Food, Party Food, Detox, Cozy, Outdoor, Quick & Easy
-- `REGIONAL` - Nordic, Indian, Italian, Asian, Mexican, Middle Eastern
-- `HEALTH_CYCLE` - Immunity Boosting, Summer Hydration, Winter Nourishment, etc.
+
+> **Note:** Only WEATHER and FESTIVAL categories are active. Other categories (INGREDIENT_AVAILABILITY, CULTURAL_OCCASION, DIETARY_PRACTICE, MEAL_TIMING, LIFESTYLE, REGIONAL, HEALTH_CYCLE) have been removed.
 
 **Key Commands:**
 - `list-seasonalities [type]` - List all seasonalities (optionally filter by type)

@@ -155,6 +155,89 @@ Sample updated pricing (after fix):
 
 ---
 
+### `remove_seasonality_types.py`
+**Type:** Update Script (Re-runnable)
+**Purpose:** Remove specific seasonality types and all related data
+
+**What it does:**
+- Removes seasonality types and all their related data
+- Deletes in correct order due to foreign key constraints:
+  1. Recipe-seasonality mappings
+  2. Seasonality translations
+  3. Seasonality entries
+- Shows state before and after deletion
+- Requires confirmation before proceeding
+
+**Types Configured for Removal:**
+- `HEALTH_CYCLE` - Immunity Boosting, Summer Hydration, Winter Nourishment, etc.
+- `MEAL_TIMING` - Breakfast, Brunch, Lunch, Dinner, Late Night, Snack
+- `DIETARY_PRACTICE` - Ramadan, Lent, Navratri Fasting, Vegan
+- `CULTURAL_OCCASION` - Wedding, Birthday, Potluck, Picnic
+- `INGREDIENT_AVAILABILITY` - Strawberry Season, Asparagus Season, etc.
+- `LIFESTYLE` - Comfort Food, Party Food, Detox, Cozy, Outdoor, Quick & Easy
+- `REGIONAL` - Nordic, Indian, Italian, Asian, Mexican, Middle Eastern
+
+**Types Kept:**
+- `WEATHER` - Winter, Summer, Spring, Autumn, Monsoon
+- `FESTIVAL` - Christmas, Diwali, Easter, Thanksgiving, New Year, Eid, Holi
+
+**Usage:**
+```bash
+python scripts/updates/remove_seasonality_types.py
+```
+
+**What it displays:**
+- Current state before deletion (count by type)
+- Number of seasonalities to be removed by type
+- Confirmation prompt
+- Progress of deletion (mappings, translations, entries)
+- Final state after deletion
+- List of remaining seasonalities
+
+**Example Output:**
+```
+=== CURRENT STATE ===
+Type                      Seasonalities   Recipes    Mappings
+------------------------------------------------------------
+CULTURAL_OCCASION         4               91         91         [TO DELETE]
+DIETARY_PRACTICE          4               196        197        [TO DELETE]
+FESTIVAL                  7               163        166
+WEATHER                   5               579        775
+
+=== REMOVING SEASONALITY TYPES ===
+Found 36 seasonalities to remove
+Removing...
+  ✓ Removed 2194 recipe-seasonality mappings
+  ✓ Removed 72 translations
+  ✓ Removed 36 seasonality entries
+```
+
+**Results:**
+- Removes 2,194 recipe-seasonality mappings
+- Removes 72 translations (36 seasonalities × 2 languages)
+- Removes 36 seasonality entries
+- Leaves only WEATHER (5) and FESTIVAL (7) seasonalities
+
+**Key Classes:**
+- `SeasonalityTypeRemover` - Handles the removal process
+  - `show_current_state()` - Shows state before deletion
+  - `get_seasonalities_to_remove()` - Gets IDs of seasonalities to remove
+  - `remove_recipe_mappings(seasonality_ids)` - Removes mappings
+  - `remove_translations(seasonality_ids)` - Removes translations
+  - `remove_seasonalities()` - Removes seasonality entries
+  - `show_final_state()` - Shows state after deletion
+
+**Requirements:**
+- Database connection (configured in `.env`)
+- Tables `seasonality`, `seasonality_translation`, `recipe_seasonality` must exist
+- Seasonalities must exist (created by `create_seasonalities.py`)
+
+**When to Re-run:**
+- If you need to remove additional seasonality types (modify `TYPES_TO_REMOVE` in the script)
+- After adding new seasonality types that need to be removed
+
+---
+
 ## 🔄 Execution Order
 
 Run these scripts in this order after initial data population:
@@ -165,9 +248,12 @@ python scripts/updates/update_pricing_units.py
 
 # 2. Then, convert to realistic country-specific pricing
 python scripts/updates/update_country_pricing.py
+
+# 3. Optionally, remove unwanted seasonality types (if needed)
+python scripts/updates/remove_seasonality_types.py
 ```
 
-**Note:** The order matters because `update_country_pricing.py` assumes ingredients have proper units assigned by `update_pricing_units.py`.
+**Note:** The order matters for pricing scripts because `update_country_pricing.py` assumes ingredients have proper units assigned by `update_pricing_units.py`. The seasonality removal script can be run independently at any time.
 
 ---
 
@@ -177,6 +263,7 @@ python scripts/updates/update_country_pricing.py
 |------|-------------|------------|---------|------|
 | `update_pricing_units.py` | ✅ | Pricing records exist | Units, quantities, prices | <5 min |
 | `update_country_pricing.py` | ✅ | Units assigned | Country-specific prices | <5 min |
+| `remove_seasonality_types.py` | ✅ | Seasonalities exist | Removes seasonality types | <1 min |
 
 ---
 

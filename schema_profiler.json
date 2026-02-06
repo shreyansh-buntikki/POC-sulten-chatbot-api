@@ -1,0 +1,2393 @@
+{
+  "database_name": "sulten-db",
+  "schema": "public",
+  "enum_types": {},
+  "tables": {
+    "bundle": {
+      "table_name": "bundle",
+      "description": "Table bundle",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "ingress",
+          "type": "TEXT",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "isActive",
+          "type": "BOOLEAN",
+          "nullable": false,
+          "default": "false",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "image",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "userUid",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "user.uid"
+        },
+        {
+          "name": "pricingDetailId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "bundle_price.id"
+        },
+        {
+          "name": "deletedAt",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "bundle_price": {
+      "table_name": "bundle_price",
+      "description": "Table bundle_price",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "price",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "iosName",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "androidName",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "bundle_recipe": {
+      "table_name": "bundle_recipe",
+      "description": "Table bundle_recipe",
+      "columns": [
+        {
+          "name": "bundleId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "bundle.id"
+        },
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe.id"
+        },
+        {
+          "name": "order",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "isFree",
+          "type": "BOOLEAN",
+          "nullable": false,
+          "default": "false",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "deletedAt",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "chat_message": {
+      "table_name": "chat_message",
+      "description": "Table chat_message",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "session_id",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "chat_session.id"
+        },
+        {
+          "name": "role",
+          "type": "VARCHAR(20)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "content",
+          "type": "TEXT",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "meta",
+          "type": "JSONB",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "chat_session": {
+      "table_name": "chat_session",
+      "description": "Table chat_session",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "user_uid",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "title",
+          "type": "VARCHAR(255)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "created_at",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updated_at",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "is_active",
+          "type": "BOOLEAN",
+          "nullable": true,
+          "default": "true",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "country": {
+      "table_name": "country",
+      "description": "Table country",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "code",
+          "type": "VARCHAR(3)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR(100)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "currency": {
+      "table_name": "currency",
+      "description": "Table currency",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "code",
+          "type": "VARCHAR(3)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR(50)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "symbol",
+          "type": "VARCHAR(10)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "ingredient": {
+      "table_name": "ingredient",
+      "description": "Table ingredient",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "languageId",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "language.id"
+        },
+        {
+          "name": "embedding",
+          "type": "USER-DEFINED",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "ingredient_macros": {
+      "table_name": "ingredient_macros",
+      "description": "Table ingredient_macros",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "ingredientId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "ingredient.id"
+        },
+        {
+          "name": "servingSize",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "100",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "energyKcal",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "energyKj",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "protein",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "carbohydrates",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "totalFiber",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "solubleFiber",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "insolubleFiber",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "totalSugars",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "addedSugar",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "starch",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "totalFat",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "saturatedFat",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "transFat",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "monounsaturatedFat",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "polyunsaturatedFat",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "cholesterol",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "ingredient_micros": {
+      "table_name": "ingredient_micros",
+      "description": "Table ingredient_micros",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "ingredientId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "ingredient.id"
+        },
+        {
+          "name": "servingSize",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "100",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminA",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminC",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminD",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminE",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminK",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "thiamineB1",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "riboflavinB2",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "niacinB3",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "pantothenicAcidB5",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminB6",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "biotinB7",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "folateB9",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "vitaminB12",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "choline",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "calcium",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "iron",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "magnesium",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "phosphorus",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "potassium",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "sodium",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "zinc",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "copper",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "manganese",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "selenium",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "fluoride",
+          "type": "NUMERIC(10, 2)",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "ingredient_pricing": {
+      "table_name": "ingredient_pricing",
+      "description": "Table ingredient_pricing",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "ingredientId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "ingredient.id"
+        },
+        {
+          "name": "countryId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "country.id"
+        },
+        {
+          "name": "currencyId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "currency.id"
+        },
+        {
+          "name": "pricePerUnit",
+          "type": "NUMERIC(10, 2)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "quantity",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "measuringUnitId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "measuring_unit.id"
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "language": {
+      "table_name": "language",
+      "description": "Table language",
+      "columns": [
+        {
+          "name": "id",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "globalName",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "like": {
+      "table_name": "like",
+      "description": "Table like",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "entityId",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "entityType",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "userUid",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "user.uid"
+        }
+      ]
+    },
+    "measuring_unit": {
+      "table_name": "measuring_unit",
+      "description": "Table measuring_unit",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "measuring_unit_translation": {
+      "table_name": "measuring_unit_translation",
+      "description": "Table measuring_unit_translation",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "nextval('measuring_unit_translation_id_seq'::regclass)",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "longName",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "languageId",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "language.id"
+        },
+        {
+          "name": "measuringUnitId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "measuring_unit.id"
+        }
+      ]
+    },
+    "migrations": {
+      "table_name": "migrations",
+      "description": "Table migrations",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "nextval('migrations_id_seq'::regclass)",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "timestamp",
+          "type": "BIGINT",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "recipe": {
+      "table_name": "recipe",
+      "description": "Table recipe",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "slug",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "ingress",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "image",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "publishedAt",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "status",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": "'draft'::character varying",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "difficulty",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": "'medium'::character varying",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "servings",
+          "type": "INTEGER",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "prepTime",
+          "type": "INTEGER",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "cookTime",
+          "type": "INTEGER",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "userUid",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "user.uid"
+        },
+        {
+          "name": "languageId",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "language.id"
+        },
+        {
+          "name": "deletedAt",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "private",
+          "type": "BOOLEAN",
+          "nullable": false,
+          "default": "false",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "search_vector",
+          "type": "TSVECTOR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "embedding",
+          "type": "USER-DEFINED",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "recipe_ingredient": {
+      "table_name": "recipe_ingredient",
+      "description": "Table recipe_ingredient",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "amount",
+          "type": "DOUBLE PRECISION",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "section",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "unitId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "measuring_unit.id"
+        },
+        {
+          "name": "ingredientId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "ingredient.id"
+        },
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "recipe.id"
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "deletedAt",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "order",
+          "type": "INTEGER",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "recipe_instruction": {
+      "table_name": "recipe_instruction",
+      "description": "Table recipe_instruction",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "description",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "image",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "recipe.id"
+        },
+        {
+          "name": "deletedAt",
+          "type": "TIMESTAMP",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "order",
+          "type": "INTEGER",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "recipe_instruction_selected_ingredients_ingredient": {
+      "table_name": "recipe_instruction_selected_ingredients_ingredient",
+      "description": "Table recipe_instruction_selected_ingredients_ingredient",
+      "columns": [
+        {
+          "name": "recipeInstructionId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe_instruction.id"
+        },
+        {
+          "name": "ingredientId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "ingredient.id"
+        }
+      ]
+    },
+    "recipe_recipe_types_recipe_type": {
+      "table_name": "recipe_recipe_types_recipe_type",
+      "description": "Table recipe_recipe_types_recipe_type",
+      "columns": [
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe.id"
+        },
+        {
+          "name": "recipeTypeId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe_type.id"
+        }
+      ]
+    },
+    "recipe_seasonality": {
+      "table_name": "recipe_seasonality",
+      "description": "Table recipe_seasonality",
+      "columns": [
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe.id"
+        },
+        {
+          "name": "seasonalityId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "seasonality.id"
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "recipe_tags_tag": {
+      "table_name": "recipe_tags_tag",
+      "description": "Table recipe_tags_tag",
+      "columns": [
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe.id"
+        },
+        {
+          "name": "tagId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "tag.id"
+        }
+      ]
+    },
+    "recipe_type": {
+      "table_name": "recipe_type",
+      "description": "Table recipe_type",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "recipe_type_translation": {
+      "table_name": "recipe_type_translation",
+      "description": "Table recipe_type_translation",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "nextval('recipe_type_translation_id_seq'::regclass)",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "languageId",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "language.id"
+        },
+        {
+          "name": "recipeTypeId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "recipe_type.id"
+        }
+      ]
+    },
+    "seasonality": {
+      "table_name": "seasonality",
+      "description": "Table seasonality",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "type",
+          "type": "VARCHAR(50)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "isActive",
+          "type": "BOOLEAN",
+          "nullable": false,
+          "default": "true",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "embedding",
+          "type": "USER-DEFINED",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "seasonality_translation": {
+      "table_name": "seasonality_translation",
+      "description": "Table seasonality_translation",
+      "columns": [
+        {
+          "name": "id",
+          "type": "INTEGER",
+          "nullable": false,
+          "default": "nextval('measuring_unit_translation_id_seq'::regclass)",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR(255)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "description",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "languageId",
+          "type": "VARCHAR(2)",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "language.id"
+        },
+        {
+          "name": "seasonalityId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "seasonality.id"
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "updatedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "tag": {
+      "table_name": "tag",
+      "description": "Table tag",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "embedding",
+          "type": "USER-DEFINED",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "user": {
+      "table_name": "user",
+      "description": "Table user",
+      "columns": [
+        {
+          "name": "uid",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "username",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "bio",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "createdAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "lastSeen",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "name",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "image",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "dob",
+          "type": "TIMESTAMPTZ",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "gender",
+          "type": "USER-DEFINED",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "messagingTokens",
+          "type": "TEXT",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "termsAccepted",
+          "type": "BOOLEAN",
+          "nullable": true,
+          "default": "true",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "role",
+          "type": "USER-DEFINED",
+          "nullable": false,
+          "default": "'community'::user_role_enum",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "tag",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": "'community'::character varying",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    },
+    "user_likes_recipe": {
+      "table_name": "user_likes_recipe",
+      "description": "Table user_likes_recipe",
+      "columns": [
+        {
+          "name": "userUid",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "user.uid"
+        },
+        {
+          "name": "recipeId",
+          "type": "UUID",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": "recipe.id"
+        }
+      ]
+    },
+    "user_purchase": {
+      "table_name": "user_purchase",
+      "description": "Table user_purchase",
+      "columns": [
+        {
+          "name": "id",
+          "type": "UUID",
+          "nullable": false,
+          "default": "uuid_generate_v4()",
+          "autoincrement": false,
+          "is_primary_key": true,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "transactionId",
+          "type": "VARCHAR",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "purchaseType",
+          "type": "USER-DEFINED",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "platform",
+          "type": "USER-DEFINED",
+          "nullable": false,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "purchasedAt",
+          "type": "TIMESTAMP",
+          "nullable": false,
+          "default": "now()",
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        },
+        {
+          "name": "userUid",
+          "type": "VARCHAR",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "user.uid"
+        },
+        {
+          "name": "bundleId",
+          "type": "UUID",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": "bundle.id"
+        },
+        {
+          "name": "purchasedAtMillis",
+          "type": "BIGINT",
+          "nullable": true,
+          "default": null,
+          "autoincrement": false,
+          "is_primary_key": false,
+          "description": "",
+          "foreign_key": null
+        }
+      ]
+    }
+  }
+}

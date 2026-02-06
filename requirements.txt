@@ -37,6 +37,7 @@ multidict==6.7.1
 nodeenv==1.10.0
 numpy==2.4.2
 openai==2.16.0
+openai-agents==0.8.0
 packaging==24.2
 pgvector==0.4.2
 platformdirs==4.3.6

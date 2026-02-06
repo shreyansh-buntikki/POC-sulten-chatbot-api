@@ -57,11 +57,13 @@ Use these scripts for **one-time data corrections**.
 |--------|---------|-----------|
 | `update_pricing_units.py` | Fix measuring units for pricing | ✅ |
 | `update_country_pricing.py` | Fix country-specific currency conversion | ✅ |
+| `remove_seasonality_types.py` | Remove unwanted seasonality types | ✅ |
 
 **When to use:**
 - After initial data import to fix units
 - When pricing strategy changes
 - To correct currency conversion issues
+- To remove unwanted seasonality categories
 
 ---
 
@@ -70,7 +72,7 @@ Use these scripts for **one-time data corrections**.
 ### First Time Setup (New Database)
 
 ```bash
-# 1. Create seasonalities
+# 1. Create seasonalities (WEATHER and FESTIVAL types)
 python scripts/initial_data_fetching/create_seasonalities.py
 
 # 2. Populate ingredients with nutrition & pricing (takes 30-60 min)
@@ -84,6 +86,9 @@ python scripts/updates/update_country_pricing.py
 
 # 5. Map recipes to seasonalities
 python scripts/initial_data_fetching/map_recipes_to_seasonalities.py
+
+# Optional: Remove unwanted seasonality types
+python scripts/updates/remove_seasonality_types.py
 ```
 
 ### Daily Operations

@@ -1,2 +1,5 @@
-{"level": "INFO", "app_name": "fastapi", "file_name": "app.py", "request_route": "-", "func_name": "root", "message": "Fastapi Framework accessed ..."}
-{"level": "INFO", "app_name": "fastapi", "file_name": "app.py", "request_route": "-", "func_name": "root", "message": "Fastapi Framework accessed ..."}
+{"level": "INFO", "app_name": "fastapi", "file_name": "users.py", "request_route": "-", "func_name": "get_user", "message": "Fetching user with UID: fseWWoA6EAgIzS8aAFzdvFkYPrJ3"}
+{"level": "INFO", "app_name": "fastapi", "file_name": "users.py", "request_route": "-", "func_name": "list_users", "message": "Fetching users - skip: 0, limit: 100, role: None, gender: None"}
+{"level": "INFO", "app_name": "fastapi", "file_name": "users.py", "request_route": "-", "func_name": "get_user", "message": "Fetching user with UID: fseWWoA6EAgIzS8aAFzdvFkYPrJ3"}
+{"level": "INFO", "app_name": "fastapi", "file_name": "users.py", "request_route": "-", "func_name": "list_users", "message": "Fetching users - skip: 0, limit: 100, role: None, gender: None"}
+{"level": "INFO", "app_name": "fastapi", "file_name": "users.py", "request_route": "-", "func_name": "get_user", "message": "Fetching user with UID: fseWWoA6EAgIzS8aAFzdvFkYPrJ3"}
