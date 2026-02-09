@@ -2,7 +2,7 @@
 Chat Routes - API endpoints for chatbot operations
 """
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -81,6 +81,7 @@ class ChatRoutes:
     )
     async def send_message(
         request: MessageRequest,
+        language: Optional[str] = Header(None, description="Language code (e.g., 'en', 'no') for filtering recipes"),
         db: Session = Depends(get_db)
     ):
         """
@@ -90,8 +91,9 @@ class ChatRoutes:
         - If `session_id` is omitted, creates a new session
         - Maintains context from the last 10 messages
         - Routes through appropriate AI agent based on intent
+        - Language header filters recipes by languageId
         """
-        logger.info(f"Message received - session: {request.session_id}, user: {request.user_uid}")
+        logger.info(f"Message received - session: {request.session_id}, user: {request.user_uid}, language: {language}")
 
         try:
             chat_service = ChatService(db)
@@ -99,7 +101,8 @@ class ChatRoutes:
             result = await chat_service.send_message(
                 session_id=request.session_id,
                 user_uid=request.user_uid,
-                message=request.message
+                message=request.message,
+                language=language
             )
 
             if "error" in result:

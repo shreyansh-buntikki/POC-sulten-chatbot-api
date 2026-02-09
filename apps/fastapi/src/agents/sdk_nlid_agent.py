@@ -92,6 +92,14 @@ Choose the most appropriate intent from the following categories:
 Extract the following types of entities:
 
 - **Ingredients**: Food items (chicken, pasta, tomatoes, garlic, etc.)
+  - IMPORTANT: Handle synonyms and variants (e.g., "chole" → "chickpeas", "garbanzo beans")
+  - Common synonyms to recognize:
+    * chole/chana → chickpeas
+    * aloo → potatoes
+    * gobi → cauliflower
+    * matar → peas
+    * palak → spinach
+    * dal → lentils
 - **Recipes**: Dish names (carbonara, stir fry, lasagna, etc.)
 - **Cuisines**: Italian, Mexican, Indian, Chinese, etc.
 - **Meal Types**: breakfast, lunch, dinner, snack, dessert
@@ -116,8 +124,18 @@ Extract user preferences and constraints:
 
 Identify filters users want to apply to results:
 
-- **Cuisine Filters**: specific cuisines to include/exclude
-- **Ingredient Filters**: must-have or must-exclude ingredients
+- **Cuisine Filters (CRITICAL)**: When user mentions a cuisine type (italian, mexican, indian, chinese, thai, etc.), add to "cuisines" array
+  - Examples: "italian recipes" → cuisines: ['italian']
+  - "mexican food" → cuisines: ['mexican']
+  - "indian dishes" → cuisines: ['indian']
+
+- **Ingredient Filters (CRITICAL)**:
+  - "include_ingredients": Ingredients the recipe MUST contain
+  - "excluded_ingredients": Ingredients the recipe must NOT contain (allergies, dislikes)
+  - When user says "using X" or "with X", put X in "include_ingredients"
+  - When user says "without X" or "no X", put X in "excluded_ingredients"
+  - When user says "allergic to X", put X in "excluded_ingredients"
+
 - **Nutrition Filters**: calorie limits, macro requirements
 - **Time Filters**: max prep/cook time
 - **Difficulty Filters**: only easy recipes, etc.

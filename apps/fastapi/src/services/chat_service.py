@@ -8,6 +8,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from openai import OpenAI
 
+from apps.fastapi import logger
 from apps.fastapi.src.services.conversation_store import ConversationStore
 from apps.fastapi.src.services.pipeline_orchestrator_sdk import RecipeSearchPipelineSDK
 from models import ChatSession, ChatMessage, ChatMessageRoleEnum
@@ -96,7 +97,7 @@ class ChatService:
             limit: Maximum number of sessions
 
         Returns:
-            List of session dictionaries with query and answer
+            List of session dictionaries with query, answer, and recipe details
         """
         sessions = self.conversation_store.get_user_sessions(user_uid, limit)
 
@@ -113,15 +114,32 @@ class ChatService:
             # Get messages for this session
             messages = self.conversation_store.get_messages(str(s.id))
 
+            if not messages:
+                logger.warning(f"[CHAT SERVICE] Session {s.id} has no messages")
+                result.append(session_data)
+                continue
+
             # Find first user message (query)
             first_user_msg = next((m for m in messages if m.role == "user"), None)
-            if first_user_msg:
+            if first_user_msg and first_user_msg.content:
                 session_data["user_query"] = first_user_msg.content
+            else:
+                logger.warning(f"[CHAT SERVICE] Session {s.id} has no user message with content")
 
             # Find last assistant message (answer)
             assistant_msgs = [m for m in messages if m.role == "assistant"]
             if assistant_msgs:
-                session_data["assistant_answer"] = assistant_msgs[-1].content
+                last_assistant = assistant_msgs[-1]
+                if last_assistant.content:
+                    session_data["assistant_answer"] = last_assistant.content
+                else:
+                    logger.warning(f"[CHAT SERVICE] Session {s.id} has empty assistant message")
+                # Include recipe details if present in metadata
+                recipes = last_assistant.meta.get("recipes") if last_assistant.meta else None
+                if recipes:
+                    session_data["recipes"] = recipes
+            else:
+                logger.warning(f"[CHAT SERVICE] Session {s.id} has no assistant messages")
 
             result.append(session_data)
 
@@ -166,7 +184,8 @@ class ChatService:
         self,
         session_id: Optional[str],
         user_uid: Optional[str],
-        message: str
+        message: str,
+        language: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Send a message and get AI response using the 10-stage pipeline
@@ -175,6 +194,7 @@ class ChatService:
             session_id: Existing session ID (None creates new session)
             user_uid: Optional user identifier
             message: User's message content
+            language: Optional language code (e.g., 'en', 'no') for filtering recipes
 
         Returns:
             Dictionary with response and updated session info
@@ -202,7 +222,8 @@ class ChatService:
             result = await self.pipeline.process_query(
                 query=message,
                 session_id=str(session.id),
-                user_uid=user_uid
+                user_uid=user_uid,
+                language=language or "en"  # Default to 'en' if not provided
             )
         except Exception as e:
             # Ensure database is in clean state after pipeline error
@@ -216,22 +237,50 @@ class ChatService:
 
         # Step 4: Save assistant response
         try:
+            # Include full recipe details in metadata if present
+            # Convert enums to strings for JSON serialization
+            retrieval_strategy = result["metadata"].get("retrieval_strategy")
+            retrieval_strategy_str = str(retrieval_strategy) if retrieval_strategy else None
+
+            assistant_metadata = {
+                "intent": result["metadata"].get("intent"),
+                "retrieval_strategy": retrieval_strategy_str,
+                "num_results": result["metadata"].get("num_results"),
+                "is_cooking_related": result["metadata"].get("is_cooking_related"),
+                "created_at": datetime.utcnow().isoformat()
+            }
+
+            # Only include recipes if they exist (to avoid huge metadata)
+            # Also sanitize recipe data to remove UUIDs from metadata
+            if "recipes" in result["metadata"]:
+                recipes = result["metadata"]["recipes"]
+                # Store minimal recipe info to avoid size issues
+                assistant_metadata["recipes"] = [
+                    {
+                        "id": r.get("id"),
+                        "name": r.get("name"),
+                        "difficulty": r.get("difficulty"),
+                        "prep_time": r.get("prep_time"),
+                        "cook_time": r.get("cook_time"),
+                        "servings": r.get("servings"),
+                    }
+                    for r in recipes
+                ]
+
             assistant_msg = self.conversation_store.add_message(
                 session.id,
                 "assistant",
                 result["response"],
-                {
-                    "intent": result["metadata"].get("intent"),
-                    "retrieval_strategy": result["metadata"].get("retrieval_strategy"),
-                    "num_results": result["metadata"].get("num_results"),
-                    "is_cooking_related": result["metadata"].get("is_cooking_related"),
-                    "created_at": datetime.utcnow().isoformat()
-                }
+                assistant_metadata
             )
+            logger.info(f"[CHAT SERVICE] Saved assistant message for session {session.id}")
         except Exception as e:
             # If we can't save the assistant message, at least return what we have
             self.db.rollback()
             assistant_msg = None
+            logger.error(f"[CHAT SERVICE] Failed to save assistant message for session {session.id}: {e}")
+            import traceback
+            logger.error(f"[CHAT SERVICE] Traceback: {traceback.format_exc()}")
 
         # Step 5: Format response
         response_data = {

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_
 
 from models import (
-    User, UserLikesRecipe, UserPurchase, BundleRecipe,
+    User, UserLikesRecipe, BundleRecipe,
     Recipe, RecipeSeasonality, Seasonality, Tag, RecipeTagsTag
 )
 
@@ -91,20 +91,21 @@ class UserContextService:
 
     def _get_purchased_recipes(self, user_uid: str) -> Set[str]:
         """Get set of recipe IDs the user has purchased via bundles"""
-        # Get user's bundle purchases
-        purchases = self.db.query(UserPurchase).filter(
+        # Get all bundles where userUid matches (user owns/purchased these bundles)
+        from models import Bundle
+        bundles = self.db.query(Bundle).filter(
             and_(
-                UserPurchase.userUid == user_uid,
-                UserPurchase.bundleId.isnot(None)
+                Bundle.userUid == user_uid,
+                Bundle.deletedAt.is_(None)
             )
         ).all()
 
-        bundle_ids = [p.bundleId for p in purchases]
-
-        if not bundle_ids:
+        if not bundles:
             return set()
 
-        # Get all recipes in purchased bundles
+        bundle_ids = [b.id for b in bundles]
+
+        # Get all recipes in these bundles
         bundle_recipes = self.db.query(BundleRecipe).filter(
             and_(
                 BundleRecipe.bundleId.in_(bundle_ids),

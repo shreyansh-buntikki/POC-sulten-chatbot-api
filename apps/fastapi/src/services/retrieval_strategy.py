@@ -7,6 +7,23 @@ from enum import Enum
 from dataclasses import dataclass
 
 
+# Ingredient synonym mapping for common ingredient name variations
+INGREDIENT_SYNONYMS = {
+    "chole": ["chickpeas", "garbanzo beans", "chana"],
+    "chana": ["chickpeas", "garbanzo beans", "chole"],
+    "aloo": ["potatoes", "potato"],
+    "gobi": ["cauliflower"],
+    "matar": ["peas"],
+    "palak": ["spinach"],
+    "dal": ["lentils"],
+    "rajma": ["kidney beans", "red kidney beans"],
+    "bhindi": ["okra"],
+    "bindi": ["okra"],
+    "sarson": ["mustard greens"],
+    "makki": ["corn flour", "cornmeal"],
+}
+
+
 class RetrievalStrategy(str, Enum):
     """Retrieval strategy types"""
     SQL_ONLY = "sql_only"
@@ -73,6 +90,32 @@ class RetrievalStrategyDecider:
 
     def __init__(self):
         pass
+
+    def _expand_ingredient_synonyms(
+        self,
+        ingredients: List[str]
+    ) -> List[str]:
+        """
+        Expand ingredient list with synonyms
+
+        Args:
+            ingredients: List of ingredient names
+
+        Returns:
+            Expanded list including original ingredients and their synonyms
+        """
+        expanded = set(ingredients)  # Start with originals
+
+        for ingredient in ingredients:
+            ingredient_lower = ingredient.lower().strip()
+            # Check if this ingredient has known synonyms
+            for key, synonyms in INGREDIENT_SYNONYMS.items():
+                if ingredient_lower == key or ingredient_lower in [s.lower() for s in synonyms]:
+                    # Add all synonyms
+                    expanded.update(synonyms)
+                    expanded.add(key)
+
+        return list(expanded)
 
     def decide_strategy(
         self,
@@ -298,10 +341,24 @@ class RetrievalStrategyDecider:
             sql_filters["tags"] = filters["tags"]
 
         if filters.get("include_ingredients"):
-            sql_filters["included_ingredients"] = filters["include_ingredients"]
+            # Expand ingredient synonyms for better matching
+            ingredients = filters["include_ingredients"]
+            if isinstance(ingredients, list):
+                expanded = self._expand_ingredient_synonyms(ingredients)
+                sql_filters["included_ingredients"] = expanded
+            else:
+                sql_filters["included_ingredients"] = [ingredients]
 
         if filters.get("included_ingredients"):
-            sql_filters["included_ingredients"] = filters["included_ingredients"]
+            # Expand ingredient synonyms for better matching
+            ingredients = filters["included_ingredients"]
+            if isinstance(ingredients, list):
+                expanded = self._expand_ingredient_synonyms(ingredients)
+                # Merge with any existing ingredients
+                existing = sql_filters.get("included_ingredients", [])
+                sql_filters["included_ingredients"] = list(set(existing + expanded))
+            else:
+                sql_filters["included_ingredients"] = [ingredients]
 
         if filters.get("excluded_ingredients"):
             sql_filters["excluded_ingredients"] = filters["excluded_ingredients"]

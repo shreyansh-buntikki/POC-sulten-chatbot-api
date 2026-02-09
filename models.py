@@ -361,6 +361,13 @@ class Bundle(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     createdAt = Column(DateTime(timezone=True), server_default=func.now())
     updatedAt = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    name = Column(String, nullable=False)
+    ingress = Column(Text, nullable=False)
+    isActive = Column(Boolean, nullable=False, default=False)
+    image = Column(String)
+    userUid = Column(String, ForeignKey('user.uid'))
+    pricingDetailId = Column(UUID(as_uuid=True), ForeignKey('bundle_price.id'))
+    deletedAt = Column(DateTime(timezone=True))
 
 
 class BundlePrice(Base):

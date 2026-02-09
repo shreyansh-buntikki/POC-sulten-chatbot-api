@@ -56,7 +56,6 @@ class SchemaUnderstandingService:
             "bundle_recipe",
             "bundle",
             "user_likes_recipe",
-            "user_purchase",
         ],
         "nutritional_info": [
             "recipe",
@@ -91,9 +90,8 @@ class SchemaUnderstandingService:
         "recipe_seasonality": "Junction table linking recipes to seasonal occasions (summer, festive, etc.)",
         "seasonality": "Seasonality reference table with types (WEATHER, FESTIVAL, INGREDIENT_AVAILABILITY, etc.)",
         "bundle_recipe": "Junction table linking premium recipes to bundles (paid content)",
-        "bundle": "Bundle table for recipe collections sold together",
+        "bundle": "Bundle table for recipe collections - bundle.userUid indicates the user who purchased/owns the bundle",
         "user_likes_recipe": "User-recipe like relationship for personalization",
-        "user_purchase": "User purchase records for bundles/recipes",
         "ingredient_macros": "Nutritional macros for ingredients (calories, protein, carbs, fat, fiber)",
         "ingredient_micros": "Nutritional micros for ingredients (vitamins, minerals)",
         "chat_session": "Chat session for conversation tracking",
@@ -104,8 +102,8 @@ class SchemaUnderstandingService:
     BUSINESS_RULES = [
         "Always exclude recipes where private=true unless user is the creator",
         "Always exclude recipes where deletedAt is not null",
-        "For bundle_recipe: check if user has purchased the bundle via user_purchase",
-        "Bundle recipes not purchased should return only name (name_only access)",
+        "For bundle_recipe: check if bundle.userUid matches the current user (user owns/purchased the bundle)",
+        "Bundle recipes where isFree=false and user doesn't own the bundle should return only name (name_only access)",
         "Recipe search should exclude allergic ingredients from user context",
         "Join user_likes_recipe to identify user's liked recipes for ranking",
         "Time filters should apply to (prepTime + cookTime) in minutes",
@@ -156,7 +154,7 @@ class SchemaUnderstandingService:
             table_names.update(["user_likes_recipe"])
             # Add bundle tables only if we need to check access
             if intent == "recipe_search":
-                table_names.update(["bundle_recipe", "bundle", "user_purchase"])
+                table_names.update(["bundle_recipe", "bundle"])
 
         # Build table schemas
         tables = []
@@ -200,53 +198,40 @@ class SchemaUnderstandingService:
         """
         Extract foreign key relationships between relevant tables
 
-        Returns list of: {from_table, from_column, to_table, to_column}
+        Uses schema_profiler.json as single source of truth for relationships.
+
+        Returns list of: {from, from_column, to, to_column}
         """
-        # Hardcoded relationships based on known schema
-        # In production, this would come from schema_profiler.json or database metadata
-        relationships = [
-            # Recipe relationships
-            {"from": "recipe", "from_column": "id", "to": "recipe_ingredient", "to_column": "recipeId"},
-            {"from": "recipe", "from_column": "id", "to": "recipe_instruction", "to_column": "recipeId"},
-            {"from": "recipe", "from_column": "id", "to": "recipe_tags_tag", "to_column": "recipeId"},
-            {"from": "recipe", "from_column": "id", "to": "recipe_seasonality", "to_column": "recipeId"},
-            {"from": "recipe", "from_column": "userUid", "to": "user", "to_column": "uid"},
-
-            # Ingredient relationships
-            {"from": "recipe_ingredient", "from_column": "ingredientId", "to": "ingredient", "to_column": "id"},
-            {"from": "ingredient", "from_column": "id", "to": "ingredient_macros", "to_column": "ingredientId"},
-            {"from": "ingredient", "from_column": "id", "to": "ingredient_micros", "to_column": "ingredientId"},
-
-            # Tag relationships
-            {"from": "recipe_tags_tag", "from_column": "tagId", "to": "tag", "to_column": "id"},
-
-            # Seasonality relationships
-            {"from": "recipe_seasonality", "from_column": "seasonalityId", "to": "seasonality", "to_column": "id"},
-
-            # Bundle relationships
-            {"from": "bundle_recipe", "from_column": "recipeId", "to": "recipe", "to_column": "id"},
-            {"from": "bundle_recipe", "from_column": "bundleId", "to": "bundle", "to_column": "id"},
-            {"from": "bundle_price", "from_column": "bundleId", "to": "bundle", "to_column": "id"},
-
-            # User relationships
-            {"from": "user_likes_recipe", "from_column": "recipeId", "to": "recipe", "to_column": "id"},
-            {"from": "user_likes_recipe", "from_column": "userUid", "to": "user", "to_column": "uid"},
-            {"from": "user_purchase", "from_column": "bundleId", "to": "bundle", "to_column": "id"},
-            {"from": "user_purchase", "from_column": "userUid", "to": "user", "to_column": "uid"},
-
-            # Chat relationships
-            {"from": "chat_message", "from_column": "sessionId", "to": "chat_session", "to_column": "id"},
-            {"from": "chat_session", "from_column": "userUid", "to": "user", "to_column": "uid"},
-        ]
+        # Import relationships from schema profiler data
+        try:
+            from apps.fastapi.src.services.schema_profiler_data import get_all_relationships
+            all_relationships = get_all_relationships()
+        except ImportError:
+            # Fallback to hardcoded relationships if profiler not available
+            all_relationships = self._get_hardcoded_relationships()
 
         # Filter to only include relationships between relevant tables
         filtered = []
         table_set = set(table_names)
-        for rel in relationships:
+        for rel in all_relationships:
             if rel["from"] in table_set or rel["to"] in table_set:
                 filtered.append(rel)
 
         return filtered
+
+    def _get_hardcoded_relationships(self) -> List[Dict[str, str]]:
+        """Fallback hardcoded relationships (used only if profiler unavailable)"""
+        return [
+            {"from": "recipe", "from_column": "id", "to": "recipe_ingredient", "to_column": "recipeId"},
+            {"from": "recipe", "from_column": "id", "to": "recipe_instruction", "to_column": "recipeId"},
+            {"from": "recipe", "from_column": "id", "to": "recipe_tags_tag", "to_column": "recipeId"},
+            {"from": "recipe", "from_column": "id", "to": "recipe_seasonality", "to_column": "recipeId"},
+            {"from": "recipe_ingredient", "from_column": "ingredientId", "to": "ingredient", "to_column": "id"},
+            {"from": "recipe_tags_tag", "from_column": "tagId", "to": "tag", "to_column": "id"},
+            {"from": "recipe_seasonality", "from_column": "seasonalityId", "to": "seasonality", "to_column": "id"},
+            {"from": "bundle_recipe", "from_column": "recipeId", "to": "recipe", "to_column": "id"},
+            {"from": "user_likes_recipe", "from_column": "recipeId", "to": "recipe", "to_column": "id"},
+        ]
 
     def _filter_business_rules(
         self,
@@ -269,11 +254,11 @@ class SchemaUnderstandingService:
         # Bundle access rules
         if session_context.get("user_uid"):
             rules.extend([
-                "Check user_purchase table to see if user purchased bundles containing the recipe",
-                "If recipe is in bundle_recipe but user hasn't purchased: return name_only access",
+                "Check bundle.userUid to see if user owns/purchased bundles containing the recipe",
+                "If recipe is in bundle_recipe with isFree=false and bundle.userUid != user: return name_only access",
             ])
         else:
-            rules.append("Anonymous users cannot access bundle-only recipes (return name_only)")
+            rules.append("Anonymous users cannot access paid bundle-only recipes (return name_only)")
 
         # Allergen exclusion rules
         if sql_filters.get("excluded_ingredients") or session_context.get("excluded_ingredients"):

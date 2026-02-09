@@ -191,14 +191,30 @@ class ConversationStore:
             )
             self.db.add(message)
 
-            # Update session activity
-            self.update_session_activity(session_id)
+            # Update session activity (don't commit here - let the main commit happen)
+            session = self.get_session(session_id)
+            if session:
+                session.updated_at = datetime.utcnow()
 
+            # Single commit at the end
             self.db.commit()
             self.db.refresh(message)
+
+            # Log successful save
+            import logging
+            logger = logging.getLogger("apps.fastapi")
+            logger.info(f"[CONVERSATION STORE] Saved {role} message {message.id} for session {session_id}")
+
             return message
         except Exception as e:
             self.db.rollback()
+
+            # Log error details
+            import logging
+            logger = logging.getLogger("apps.fastapi")
+            logger.error(f"[CONVERSATION STORE] Failed to save {role} message for session {session_id}: {e}")
+            logger.error(f"[CONVERSATION STORE] Content length: {len(content)}, Metadata size: {len(str(metadata)) if metadata else 0}")
+
             raise
 
     def get_messages(

@@ -174,7 +174,7 @@ Examples:
             'lunch', 'dinner', 'snack', 'dessert', 'bake', 'roast',
             'fry', 'boil', 'grill', 'nutrition', 'calorie', 'protein',
             'carb', 'vitamin', 'healthy', 'diet', 'vegetarian', 'vegan',
-            'gluten', 'allerg', 'substitute', 'flavor', 'taste', 'dish',
+            'gluten', 'allergy', 'substitute', 'flavor', 'taste', 'dish',
             'cuisine', 'chef', 'kitchen', 'spice', 'herb', 'sauce'
         ]
 

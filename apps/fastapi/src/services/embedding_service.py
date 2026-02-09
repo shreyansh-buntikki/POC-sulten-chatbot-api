@@ -228,7 +228,8 @@ class EmbeddingService:
         self,
         query_text: str,
         limit: int = 10,
-        threshold: float = 0.7
+        threshold: float = 0.7,
+        language_id: Optional[str] = None
     ) -> List[Tuple[Recipe, float]]:
         """
         Search recipes by semantic similarity using cosine similarity
@@ -237,10 +238,16 @@ class EmbeddingService:
             query_text: Search query text
             limit: Maximum number of results
             threshold: Minimum similarity score (0-1)
+            language_id: Optional language ID filter (e.g., 'en', 'no')
 
         Returns:
             List of (Recipe, similarity_score) tuples
         """
+        # Debug logging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[EMBEDDING SEARCH] START - query_text={query_text[:50]}, language_id={language_id}, threshold={threshold}")
+
         # Generate embedding for query
         query_embedding = self._generate_embedding(query_text)
         if not query_embedding:
@@ -249,8 +256,32 @@ class EmbeddingService:
         # Convert to pgvector format for PostgreSQL
         embedding_array = f"[{','.join(map(str, query_embedding))}]"
 
+        # Build WHERE clause conditions
+        where_conditions = [
+            "embedding IS NOT NULL",
+            "1 - (embedding <=> CAST(:query_embedding AS vector)) >= :threshold",
+            '"deletedAt" IS NULL',
+            '"status" = :status'  #-- Only published recipes
+        ]
+        params = {
+            "query_embedding": embedding_array,
+            "threshold": threshold,
+            "limit": limit,
+            "status": "published"
+        }
+
+        # Add language filter if provided
+        if language_id:
+            where_conditions.append('"languageId" = :language_id')
+            params["language_id"] = language_id
+            logger.warning(f"[EMBEDDING SEARCH] Language filter added: languageId={language_id}")
+        else:
+            logger.warning(f"[EMBEDDING SEARCH] NO language filter - language_id is None or empty!")
+
+        logger.warning(f"[EMBEDDING SEARCH] WHERE conditions: {where_conditions}")
+
         # Use cosine similarity search (1 - cosine_distance)
-        sql_query = text("""
+        sql_query = text(f"""
             SELECT id,
                    name,
                    slug,
@@ -260,22 +291,15 @@ class EmbeddingService:
                    "prepTime",
                    "cookTime",
                    servings,
+                   "languageId",
                    1 - (embedding <=> CAST(:query_embedding AS vector)) as similarity
             FROM recipe
-            WHERE embedding IS NOT NULL
-              AND 1 - (embedding <=> CAST(:query_embedding AS vector)) >= :threshold
+            WHERE {' AND '.join(where_conditions)}
             ORDER BY embedding <=> CAST(:query_embedding AS vector)
             LIMIT :limit
         """)
 
-        result = self.db.execute(
-            sql_query,
-            {
-                "query_embedding": embedding_array,
-                "threshold": threshold,
-                "limit": limit
-            }
-        )
+        result = self.db.execute(sql_query, params)
 
         recipes = []
         for row in result:
@@ -288,10 +312,18 @@ class EmbeddingService:
                 difficulty=row[5],
                 prepTime=row[6],
                 cookTime=row[7],
-                servings=row[8]
+                servings=row[8],
+                languageId=row[9]
             )
-            similarity = float(row[9])
+            similarity = float(row[10])
             recipes.append((recipe, similarity))
+
+        logger.warning(f"[EMBEDDING SEARCH] Query executed, returning {len(recipes)} results")
+        for i, (recipe, score) in enumerate(recipes[:5]):
+            logger.warning(
+                f"[EMBEDDING SEARCH]   Result {i+1}: {recipe.name} "
+                f"(languageId={recipe.languageId}, score={score:.3f})"
+            )
 
         return recipes
 

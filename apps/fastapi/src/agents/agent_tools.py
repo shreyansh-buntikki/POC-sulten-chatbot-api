@@ -11,7 +11,7 @@ from models import (
     Recipe, Ingredient, RecipeIngredient, Seasonality,
     SeasonalityTranslation, SeasonalityTypeEnum, Tag,
     RecipeTagsTag, RecipeSeasonality, UserLikesRecipe,
-    IngredientMacros, IngredientMicros
+    IngredientMacros, IngredientMicros, MeasuringUnit
 )
 
 
@@ -23,7 +23,8 @@ def search_recipes_by_embedding(
     db: Session,
     query_text: str,
     limit: int = 10,
-    threshold: float = 0.65
+    threshold: float = 0.65,
+    language_id: Optional[str] = None
 ) -> List[Tuple[Recipe, float]]:
     """
     Search recipes using semantic embeddings.
@@ -33,18 +34,31 @@ def search_recipes_by_embedding(
         query_text: Search query text
         limit: Maximum number of results
         threshold: Minimum similarity score (0-1)
+        language_id: Optional language ID filter (e.g., 'en', 'no')
 
     Returns:
         List of (Recipe, similarity_score) tuples
     """
+    # Debug logging
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"[AGENT_TOOLS] search_recipes_by_embedding called - query={query_text[:30]}, language_id={language_id}, threshold={threshold}")
+
     from apps.fastapi.src.services.embedding_service import EmbeddingService
 
     embedding_service = EmbeddingService(db)
-    return embedding_service.search_recipes_by_embedding(
+    results = embedding_service.search_recipes_by_embedding(
         query_text=query_text,
         limit=limit,
-        threshold=threshold
+        threshold=threshold,
+        language_id=language_id
     )
+
+    logger.warning(f"[AGENT_TOOLS] search_recipes_by_embedding returned {len(results)} results")
+    for i, (recipe, score) in enumerate(results[:5]):
+        logger.warning(f"[AGENT_TOOLS]   Result {i+1}: {recipe.name} (languageId={recipe.languageId}, score={score:.3f})")
+
+    return results
 
 
 def get_recipe_details(
@@ -77,12 +91,22 @@ def get_recipe_details(
     for ri in ingredients:
         if ri.ingredientId:
             ingr = db.query(Ingredient).filter(Ingredient.id == ri.ingredientId).first()
+            unit_name = None
+            if ri.unitId:
+                unit = db.query(MeasuringUnit).filter(MeasuringUnit.id == ri.unitId).first()
+                if unit:
+                    # Try to get translation if available
+                    translation = db.execute(text("""
+                        SELECT name FROM measuring_unit_translation
+                        WHERE "measuringUnitId" = :unit_id AND "languageId" = 'en'
+                    """), {"unit_id": str(unit.id)}).fetchone()
+                    unit_name = translation[0] if translation else unit.id
             if ingr:
                 ingredient_list.append({
                     "id": str(ingr.id),
                     "name": ingr.name,
                     "amount": ri.amount,
-                    "unit": str(ri.unitId) if ri.unitId else None
+                    "unit": unit_name
                 })
 
     # Get instructions

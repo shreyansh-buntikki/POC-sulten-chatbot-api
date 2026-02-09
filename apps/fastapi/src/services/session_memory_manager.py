@@ -317,8 +317,8 @@ class SessionMemoryManager:
                     session.filters.tags.append(tag)
 
         if filters.get('cuisines'):
-            entities_cuisines = entities.get('cuisines', [])
-            for cuisine in entities_cuisines:
+            # Use cuisines from filters (not entities) - this is where NLID puts them
+            for cuisine in filters['cuisines']:
                 if cuisine not in session.filters.cuisines:
                     session.filters.cuisines.append(cuisine)
 
