@@ -11,7 +11,7 @@ from openai import OpenAI
 from apps.fastapi import logger
 from apps.fastapi.src.services.conversation_store import ConversationStore
 from apps.fastapi.src.services.pipeline_orchestrator_sdk import RecipeSearchPipelineSDK
-from models import ChatSession, ChatMessage, ChatMessageRoleEnum
+from models import ChatSession, ChatMessage, ChatMessageRoleEnum, User
 from database import get_db
 
 # Configuration
@@ -41,6 +41,21 @@ class ChatService:
 
         # Initialize recipe search pipeline (SDK-based 10-stage architecture)
         self.pipeline = RecipeSearchPipelineSDK(db, self.openai_client)
+
+    def _validate_user_exists(self, user_uid: str) -> None:
+        """
+        Validate that a user exists in the database.
+
+        Args:
+            user_uid: User identifier to validate
+
+        Raises:
+            ValueError: If user does not exist
+        """
+        user = self.db.query(User).filter(User.uid == user_uid).first()
+        if not user:
+            logger.error(f"[CHAT SERVICE] User not found: {user_uid}")
+            raise ValueError(f"User '{user_uid}' does not exist")
 
     async def create_session(
         self,
@@ -99,6 +114,9 @@ class ChatService:
         Returns:
             List of session dictionaries with query, answer, and recipe details
         """
+        # Validate user exists before loading conversation history
+        self._validate_user_exists(user_uid)
+
         sessions = self.conversation_store.get_user_sessions(user_uid, limit)
 
         result = []
@@ -122,7 +140,11 @@ class ChatService:
             # Find first user message (query)
             first_user_msg = next((m for m in messages if m.role == "user"), None)
             if first_user_msg and first_user_msg.content:
-                session_data["user_query"] = first_user_msg.content
+                session_data["user_message"] = {
+                    "id": str(first_user_msg.id),
+                    "content": first_user_msg.content,
+                    "created_at": first_user_msg.created_at.isoformat() if first_user_msg.created_at else None
+                }
             else:
                 logger.warning(f"[CHAT SERVICE] Session {s.id} has no user message with content")
 
@@ -131,13 +153,29 @@ class ChatService:
             if assistant_msgs:
                 last_assistant = assistant_msgs[-1]
                 if last_assistant.content:
-                    session_data["assistant_answer"] = last_assistant.content
+                    session_data["assistant_message"] = {
+                        "id": str(last_assistant.id),
+                        "content": last_assistant.content,
+                        "created_at": last_assistant.created_at.isoformat() if last_assistant.created_at else None
+                    }
                 else:
                     logger.warning(f"[CHAT SERVICE] Session {s.id} has empty assistant message")
-                # Include recipe details if present in metadata
-                recipes = last_assistant.meta.get("recipes") if last_assistant.meta else None
-                if recipes:
-                    session_data["recipes"] = recipes
+
+                # Include metadata with recipe details if present
+                if last_assistant.meta:
+                    # Build metadata object with all fields
+                    metadata = {}
+                    for key, value in last_assistant.meta.items():
+                        if key != "recipes":  # Skip recipes for now, will add separately
+                            metadata[key] = value
+
+                    # Add recipes to metadata if present
+                    recipes = last_assistant.meta.get("recipes")
+                    if recipes:
+                        metadata["recipes"] = recipes
+
+                    if metadata:  # Only add metadata if there's something in it
+                        session_data["metadata"] = metadata
             else:
                 logger.warning(f"[CHAT SERVICE] Session {s.id} has no assistant messages")
 
@@ -199,6 +237,10 @@ class ChatService:
         Returns:
             Dictionary with response and updated session info
         """
+        # Validate user exists if user_uid is provided
+        if user_uid:
+            self._validate_user_exists(user_uid)
+
         # Step 1: Get or create session
         if session_id:
             session = self.conversation_store.get_session(session_id)
@@ -250,19 +292,32 @@ class ChatService:
                 "created_at": datetime.utcnow().isoformat()
             }
 
-            # Only include recipes if they exist (to avoid huge metadata)
-            # Also sanitize recipe data to remove UUIDs from metadata
+            # Store full recipe details in metadata for proper UI rendering
+            # This ensures chat history displays recipe cards with ingredients/instructions dropdowns
             if "recipes" in result["metadata"]:
                 recipes = result["metadata"]["recipes"]
-                # Store minimal recipe info to avoid size issues
                 assistant_metadata["recipes"] = [
                     {
                         "id": r.get("id"),
                         "name": r.get("name"),
+                        "description": r.get("description"),
+                        "ingress": r.get("ingress"),
                         "difficulty": r.get("difficulty"),
                         "prep_time": r.get("prep_time"),
                         "cook_time": r.get("cook_time"),
+                        "total_time": r.get("total_time"),
+                        "image": r.get("image"),
                         "servings": r.get("servings"),
+                        "similarity": r.get("similarity"),
+                        "priority_score": r.get("priority_score"),
+                        "access_level": r.get("access_level"),
+                        "is_liked": r.get("is_liked"),
+                        "is_created": r.get("is_created"),
+                        "is_bundle_recipe": r.get("is_bundle_recipe"),
+                        "is_bundle_free_recipe": r.get("is_bundle_free_recipe"),
+                        "bundle_name": r.get("bundle_name"),
+                        "ingredients": r.get("ingredients", []),
+                        "instructions": r.get("instructions", []),
                     }
                     for r in recipes
                 ]
@@ -275,12 +330,23 @@ class ChatService:
             )
             logger.info(f"[CHAT SERVICE] Saved assistant message for session {session.id}")
         except Exception as e:
-            # If we can't save the assistant message, at least return what we have
+            # If we can't save the assistant message, delete the user message to prevent incomplete sessions
+            # This ensures sessions always have paired user-assistant messages
             self.db.rollback()
             assistant_msg = None
             logger.error(f"[CHAT SERVICE] Failed to save assistant message for session {session.id}: {e}")
             import traceback
             logger.error(f"[CHAT SERVICE] Traceback: {traceback.format_exc()}")
+
+            # Delete the user message to prevent incomplete session in database
+            try:
+                from models import ChatMessage
+                self.db.query(ChatMessage).filter(ChatMessage.id == user_msg.id).delete()
+                self.db.commit()
+                logger.warning(f"[CHAT SERVICE] Deleted user message {user_msg.id} to prevent incomplete session")
+            except Exception as delete_error:
+                self.db.rollback()
+                logger.error(f"[CHAT SERVICE] Failed to delete user message {user_msg.id}: {delete_error}")
 
         # Step 5: Format response
         response_data = {
@@ -295,7 +361,8 @@ class ChatService:
                 "content": result["response"],
                 "created_at": assistant_msg.created_at.isoformat() if assistant_msg and assistant_msg.created_at else None
             },
-            "metadata": result["metadata"]
+            "metadata": result["metadata"],
+            "persisted": assistant_msg is not None  # Flag indicating if messages were saved to database
         }
 
         return response_data

@@ -117,6 +117,288 @@ class RetrievalStrategyDecider:
 
         return list(expanded)
 
+    # Refinement detection patterns - these indicate user is refining previous search
+    REFINEMENT_PATTERNS = [
+        "allergic to", "allergy", "don't like", "dont like", "hate",
+        "without", "no ", "except", "but no", "not include",
+        "prefer", "instead of", "make it", "change to",
+        "i am vegetarian", "i'm vegetarian", "im vegetarian",  # Dietary preferences
+        "i am vegan", "i'm vegan", "im vegan",
+        "i am gluten-free", "i'm gluten-free", "gluten free",
+        "show me", "only", "just", "asian", "indian", "italian"  # Cuisine/type refinements
+    ]
+
+    # Intents that typically indicate refinement vs new search
+    REFINEMENT_INTENTS = ["ingredient_substitution", "nutritional_info"]
+
+    def _is_query_refinement(
+        self,
+        query: str,
+        intent: str,
+        session_context: Dict[str, Any]
+    ) -> tuple[bool, str]:
+        """
+        Detect if user is refining previous search vs starting a new one
+
+        Args:
+            query: Current user query
+            intent: Detected intent from NLID
+            session_context: Session context with previous searches
+
+        Returns:
+            Tuple of (is_refinement, original_vector_query)
+        """
+        # Check if there's a previous search to refine
+        context_entities = session_context.get("context_entities", {})
+        last_vector_query = context_entities.get("last_vector_query")
+        last_intent = session_context.get("last_intent")
+
+        # Get conversation history to find the most recent recipe search
+        conversation_history = session_context.get("conversation_history", [])
+
+        # If we have a previous recipe search context, use it
+        has_recipe_search_context = last_vector_query and last_intent == "recipe_search"
+
+        # If not, look through conversation history for the most recent recipe search
+        if not has_recipe_search_context and conversation_history:
+            # Look backwards through conversation history to find most recent recipe search
+            for message in reversed(conversation_history):
+                # Note: The conversation history items may have different structures
+                # For now, let's check if message has the expected metadata structure
+                metadata = message.get("meta", {}) or message.get("metadata", {})
+                if metadata.get("intent") == "recipe_search":
+                    # Try to extract vector_query from metadata
+                    meta_data = metadata.get("metadata", {}) if "metadata" in message else metadata
+                    if meta_data.get("vector_query"):
+                        last_vector_query = meta_data.get("vector_query")
+                        has_recipe_search_context = True
+                        break
+
+        # No previous search context
+        if not has_recipe_search_context:
+            return False, ""
+
+        query_lower = query.lower()
+
+        # Check if current query has refinement patterns
+        has_refinement_pattern = any(
+            pattern in query_lower for pattern in self.REFINEMENT_PATTERNS
+        )
+
+        # Check if intent is typically a refinement
+        is_refinement_intent = intent in self.REFINEMENT_INTENTS
+
+        # Check if current query is short (typically refinements are brief)
+        is_short_query = len(query.split()) <= 6
+
+        # Check if current query lacks new ingredients (refinements usually add constraints)
+        filters = session_context.get("filters", {})
+        has_new_included_ingredients = bool(filters.get("included_ingredients"))
+
+        # Return both boolean and original vector query
+        is_refinement = has_refinement_pattern or (is_refinement_intent and is_short_query and not has_new_included_ingredients)
+        original_vector_query = last_vector_query if is_refinement else ""
+        return is_refinement, original_vector_query
+
+    def _build_contextual_vector_query(
+        self,
+        query: str,
+        session_context: Dict[str, Any]
+    ) -> str:
+        """
+        Build vector query that incorporates conversation history context
+
+        Analyzes the last 10 messages to extract:
+        - Main ingredients mentioned
+        - Dietary preferences/allergies
+        - Time constraints (quick, under X min)
+        - Difficulty preferences
+        - Meal types (breakfast, dessert, etc.)
+        - Cuisine preferences
+
+        Examples:
+            - Previous: "pasta recipes", Current: "I am vegetarian"
+            - Result: "pasta recipes" (preserve original, filter via SQL for vegetarian)
+            - Previous: "carrot recipes", Current: "allergic to garlic"
+            - Result: "carrot recipes" (preserve original, filter via SQL for garlic-free)
+
+        For refinement queries (allergies, preferences), preserve the original recipe query
+        and apply constraints via SQL filtering instead of modifying the embedding search.
+        """
+        import re
+        from collections import Counter
+
+        context_entities = session_context.get("context_entities", {})
+        filters = session_context.get("filters", {})
+
+        # Get conversation history from session context
+        # This should contain last 10 messages
+        conversation_history = session_context.get("conversation_history", [])
+
+        # Extract context from conversation history
+        mentioned_ingredients = []
+        mentioned_allergies = set(session_context.get("excluded_ingredients", []))
+        mentioned_dietary = set(filters.get("tags", []))
+        time_constraints = []
+        difficulty_preferences = []
+        meal_types = []
+        cuisines = set(filters.get("cuisines", []))
+
+        # Patterns to extract from messages
+        time_patterns = {
+            r'\bquick\b': 'quick',
+            r'\bfast\b': 'quick',
+            r'\brapid\b': 'quick',
+            r'\bunder\s+(\d+)\s*min': lambda m: f"under {m.group(1)} min",
+            r'\blesst\s+than\s+(\d+)\s*min': lambda m: f"less than {m.group(1)} min",
+            r'\b(\d+)\s*minute': lambda m: f"{m.group(1)} minute",
+        }
+
+        difficulty_patterns = {
+            r'\beasy\b': 'easy',
+            r'\bsimple\b': 'easy',
+            r'\bmedium\b': 'medium',
+            r'\bhard\b': 'hard',
+            r'\bdifficult\b': 'hard',
+            r'\bcomplex\b': 'hard',
+        }
+
+        meal_type_patterns = {
+            r'\bbreakfast\b': 'breakfast',
+            r'\blunch\b': 'lunch',
+            r'\bdinner\b': 'dinner',
+            r'\bsupper\b': 'dinner',
+            r'\bdessert\b': 'dessert',
+            r'\bsnack\b': 'snack',
+            r'\bappetizer\b': 'appetizer',
+            r'\bmain course\b': 'main course',
+        }
+
+        dietary_preference_patterns = {
+            r'\bvegetarian\b': 'vegetarian',
+            r'\bvegan\b': 'vegan',
+            r'\bgluten.?free\b': 'gluten-free',
+            r'\bdairy.?free\b': 'dairy-free',
+            r'\bketo\b': 'keto',
+        }
+
+        # Parse conversation history
+        for msg in conversation_history:
+            if msg.get("role") == "user":
+                content = msg.get("content", "").lower()
+
+                # Extract ingredients (common cooking patterns)
+                # Patterns like "carrot recipes", "make from carrot", "with chicken"
+                ingredient_match = re.search(r'(?:recipe|make|cook|with|from|using|for)\s+([a-z]+(?:\s+[a-z]+)?)', content)
+                if ingredient_match:
+                    potential_ingredient = ingredient_match.group(1).strip()
+                    # Filter out non-ingredient words
+                    non_ingredient_words = {'recipe', 'recipes', 'make', 'cook', 'with', 'from', 'using', 'for', 'something', 'anything', 'dish', 'meal', 'lunch', 'dinner', 'breakfast'}
+                    if potential_ingredient and potential_ingredient not in non_ingredient_words:
+                        mentioned_ingredients.append(potential_ingredient)
+
+                # Check for "What can I make from X" pattern
+                make_from_match = re.search(r'what can i make from\s+([a-z]+(?:\s+[a-z]+)*)', content)
+                if make_from_match:
+                    mentioned_ingredients.append(make_from_match.group(1).strip())
+
+                # Extract time constraints
+                for pattern, replacement in time_patterns.items():
+                    match = re.search(pattern, content)
+                    if match:
+                        if callable(replacement):
+                            time_constraints.append(replacement(match))
+                        else:
+                            time_constraints.append(replacement)
+
+                # Extract difficulty preferences
+                for pattern, difficulty in difficulty_patterns.items():
+                    if re.search(pattern, content):
+                        difficulty_preferences.append(difficulty)
+
+                # Extract meal types
+                for pattern, meal_type in meal_type_patterns.items():
+                    if re.search(pattern, content):
+                        meal_types.append(meal_type)
+
+                # Extract dietary preferences
+                for pattern, dietary in dietary_preference_patterns.items():
+                    if re.search(pattern, content):
+                        mentioned_dietary.add(dietary)
+
+        # Check current query for new constraints
+        query_lower = query.lower()
+
+        # Check for new allergies in current query
+        if "allergic to" in query_lower or "allergy" in query_lower:
+            allergy_match = re.search(r"allergic to (\w+(?:\s+\w+)*)", query_lower)
+            if allergy_match:
+                mentioned_allergies.add(allergy_match.group(1))
+
+        # Check for "without", "no X" patterns
+        if "without" in query_lower or "no " in query_lower:
+            without_match = re.search(r"without (\w+)|no (\w+)", query_lower)
+            if without_match:
+                excluded = without_match.group(1) or without_match.group(2)
+                if excluded:
+                    mentioned_allergies.add(excluded)
+
+        # Check for new dietary preferences in current query
+        for pattern, dietary in dietary_preference_patterns.items():
+            if re.search(pattern, query_lower):
+                mentioned_dietary.add(dietary)
+
+        # Build contextual query
+        query_parts = []
+
+        # Add dietary preferences
+        if mentioned_dietary:
+            query_parts.extend(list(mentioned_dietary))
+
+        # Add meal type
+        if meal_types:
+            # Use the most recently mentioned meal type
+            query_parts.append(meal_types[-1])
+
+        # Add main ingredient (most frequently mentioned)
+        if mentioned_ingredients:
+            # Count ingredient frequency
+            ingredient_counter = Counter(mentioned_ingredients)
+            main_ingredient = ingredient_counter.most_common(1)[0][0]
+            query_parts.append(main_ingredient)
+
+        # Add cuisines
+        if cuisines:
+            query_parts.extend(list(cuisines))
+
+        # Add time constraint
+        if time_constraints:
+            query_parts.append(time_constraints[-1])
+
+        # Add difficulty preference
+        if difficulty_preferences:
+            query_parts.append(difficulty_preferences[-1])
+
+        # Add "recipes" at the end
+        query_parts.append("recipes")
+
+        # Build final query
+        if query_parts:
+            contextual_query = " ".join(query_parts)
+        else:
+            # Fallback to last query if available
+            last_query = context_entities.get("last_vector_query", "")
+            contextual_query = last_query if last_query else query
+
+        # Add allergies at the end
+        if mentioned_allergies:
+            allergy_list = list(mentioned_allergies)
+            contextual_query += f" without {allergy_list[0]}"
+            if len(allergy_list) > 1:
+                contextual_query += f" or {' or '.join(allergy_list[1:])}"
+
+        return contextual_query
+
     def decide_strategy(
         self,
         query: str,
@@ -142,13 +424,29 @@ class RetrievalStrategyDecider:
         parameters = nlid_result.get("parameters", {})
         filters = nlid_result.get("filters", {})
 
+        # Determine the actual vector query to use
+        # If this is a refinement of a previous search, preserve the original recipe query
+        is_refinement, original_vector_query = self._is_query_refinement(query, intent, session_context)
+        if is_refinement:
+            # For refinements, preserve the original query for embedding search
+            # Apply constraints via SQL filtering instead
+            if original_vector_query:
+                vector_query = original_vector_query
+            else:
+                # Fallback to contextual query if no original query found
+                vector_query = self._build_contextual_vector_query(query, session_context)
+        else:
+            # For new searches, use the contextual query (may include constraints)
+            vector_query = query
+
         # Check for direct recipe search
         if self._is_direct_recipe_search(query):
+            strategy = RetrievalStrategy.HYBRID_VECTOR_TO_SQL
             return RetrievalPlan(
-                strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
+                strategy=strategy,
                 reasoning="Direct recipe request - using semantic search with SQL filters",
-                vector_query=query,
-                sql_filters=self._build_sql_filters(parameters, filters, session_context),
+                vector_query=vector_query,
+                sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
                 top_k=20
             )
 
@@ -160,11 +458,12 @@ class RetrievalStrategyDecider:
         if structured_score >= 3 and fuzzy_score >= 2:
             # Both structured and fuzzy elements → Hybrid
             # Use vector first for candidate selection, SQL for hard constraints
+            strategy = RetrievalStrategy.HYBRID_VECTOR_TO_SQL
             return RetrievalPlan(
-                strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
+                strategy=strategy,
                 reasoning=f"Query has both structured (score:{structured_score}) and fuzzy (score:{fuzzy_score}) elements. Using vector search for relevance, SQL for constraints.",
-                vector_query=query,
-                sql_filters=self._build_sql_filters(parameters, filters, session_context),
+                vector_query=vector_query,
+                sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
                 top_k=20
             )
 
@@ -172,19 +471,21 @@ class RetrievalStrategyDecider:
             # Primarily structured → SQL-only (or SQL → Vector rerank)
             # If we have tight filters, SQL can efficiently narrow down
             if self._has_tight_filters(parameters, filters):
+                strategy = RetrievalStrategy.SQL_ONLY
                 return RetrievalPlan(
-                    strategy=RetrievalStrategy.SQL_ONLY,
+                    strategy=strategy,
                     reasoning=f"Query has tight structured filters (score:{structured_score}). SQL-only is sufficient.",
-                    sql_filters=self._build_sql_filters(parameters, filters, session_context),
+                    sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
                     top_k=20
                 )
             else:
                 # Has structure but filters are loose → Hybrid (SQL → Vector)
+                strategy = RetrievalStrategy.HYBRID_SQL_TO_VECTOR
                 return RetrievalPlan(
-                    strategy=RetrievalStrategy.HYBRID_SQL_TO_VECTOR,
+                    strategy=strategy,
                     reasoning=f"Query has structured elements (score:{structured_score}) but filters are loose. Using SQL to narrow, vector to re-rank.",
-                    vector_query=query,
-                    sql_filters=self._build_sql_filters(parameters, filters, session_context),
+                    vector_query=vector_query,
+                    sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
                     top_k=50,  # Get more candidates for re-ranking
                     use_reranking=True
                 )
@@ -194,18 +495,19 @@ class RetrievalStrategyDecider:
             return RetrievalPlan(
                 strategy=RetrievalStrategy.EMBEDDINGS_ONLY,
                 reasoning=f"Query is primarily fuzzy/semantic (score:{fuzzy_score}). Using embedding search for relevance.",
-                vector_query=query,
+                vector_query=vector_query,
                 sql_filters={},  # Minimal filtering
                 top_k=20
             )
 
         else:
             # Unclear → Default to Hybrid (safest approach)
+            strategy = RetrievalStrategy.HYBRID_VECTOR_TO_SQL
             return RetrievalPlan(
-                strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
+                strategy=strategy,
                 reasoning="Query intent is unclear. Using hybrid approach for best results.",
-                vector_query=query,
-                sql_filters=self._build_sql_filters(parameters, filters, session_context),
+                vector_query=vector_query,
+                sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
                 top_k=20
             )
 
@@ -317,18 +619,51 @@ class RetrievalStrategyDecider:
         self,
         parameters: Dict[str, Any],
         filters: Dict[str, Any],
-        session_context: Dict[str, Any]
+        session_context: Dict[str, Any],
+        strategy: RetrievalStrategy = None
     ) -> Dict[str, Any]:
         """
         Build SQL filters from parameters, filters, and session context
+
+        When using HYBRID_VECTOR_TO_SQL strategy, included_ingredients are excluded
+        from SQL filters because the embeddings already handle ingredient matching.
 
         Returns dictionary of filters for SQL generation
         """
         sql_filters = {}
 
-        # From parameters
+        # From parameters - handle both max_time and time_constraints
         if parameters.get("max_time"):
             sql_filters["max_time"] = parameters["max_time"]
+        elif parameters.get("time_constraints"):
+            # Convert time_constraints to max_time
+            time_constraints = parameters["time_constraints"]
+            if isinstance(time_constraints, list) and time_constraints:
+                # Extract first time constraint
+                constraint = time_constraints[0]
+                if isinstance(constraint, str):
+                    # Map common time constraints to minutes
+                    time_map = {
+                        "quick": 20,
+                        "short": 30,
+                        "medium": 45,
+                        "long": 90,
+                        "under 30 min": 30,
+                        "under 30min": 30,
+                        "under 15 min": 15,
+                        "under 15min": 15,
+                    }
+                    # Try direct mapping first
+                    sql_filters["max_time"] = time_map.get(constraint.lower(), 30)
+                elif isinstance(constraint, (int, float)):
+                    sql_filters["max_time"] = int(constraint)
+            elif isinstance(time_constraints, (int, float, str)):
+                # Single value
+                if isinstance(time_constraints, str):
+                    time_map = {"quick": 20, "short": 30, "medium": 45, "long": 90}
+                    sql_filters["max_time"] = time_map.get(time_constraints.lower(), 30)
+                else:
+                    sql_filters["max_time"] = int(time_constraints)
 
         if parameters.get("difficulty"):
             sql_filters["difficulty"] = parameters["difficulty"]
@@ -340,25 +675,35 @@ class RetrievalStrategyDecider:
         if filters.get("tags"):
             sql_filters["tags"] = filters["tags"]
 
-        if filters.get("include_ingredients"):
-            # Expand ingredient synonyms for better matching
-            ingredients = filters["include_ingredients"]
-            if isinstance(ingredients, list):
-                expanded = self._expand_ingredient_synonyms(ingredients)
-                sql_filters["included_ingredients"] = expanded
-            else:
-                sql_filters["included_ingredients"] = [ingredients]
+        # IMPORTANT: Skip included_ingredients for HYBRID_VECTOR_TO_SQL strategy
+        # because embeddings already handle ingredient matching semantically.
+        # Adding EXISTS clauses for ingredients would be redundant and too restrictive.
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[RETRIEVAL STRATEGY] Strategy: {strategy}, HYBRID_VECTOR_TO_SQL: {strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL}")
+        logger.info(f"[RETRIEVAL STRATEGY] include_ingredients in filters: {'include_ingredients' in filters}")
+        logger.info(f"[RETRIEVAL STRATEGY] included_ingredients in filters: {'included_ingredients' in filters}")
 
-        if filters.get("included_ingredients"):
-            # Expand ingredient synonyms for better matching
-            ingredients = filters["included_ingredients"]
-            if isinstance(ingredients, list):
-                expanded = self._expand_ingredient_synonyms(ingredients)
-                # Merge with any existing ingredients
-                existing = sql_filters.get("included_ingredients", [])
-                sql_filters["included_ingredients"] = list(set(existing + expanded))
-            else:
-                sql_filters["included_ingredients"] = [ingredients]
+        if strategy != RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
+            if filters.get("include_ingredients"):
+                # Expand ingredient synonyms for better matching
+                ingredients = filters["include_ingredients"]
+                if isinstance(ingredients, list):
+                    expanded = self._expand_ingredient_synonyms(ingredients)
+                    sql_filters["included_ingredients"] = expanded
+                else:
+                    sql_filters["included_ingredients"] = [ingredients]
+
+            if filters.get("included_ingredients"):
+                # Expand ingredient synonyms for better matching
+                ingredients = filters["included_ingredients"]
+                if isinstance(ingredients, list):
+                    expanded = self._expand_ingredient_synonyms(ingredients)
+                    # Merge with any existing ingredients
+                    existing = sql_filters.get("included_ingredients", [])
+                    sql_filters["included_ingredients"] = list(set(existing + expanded))
+                else:
+                    sql_filters["included_ingredients"] = [ingredients]
 
         if filters.get("excluded_ingredients"):
             sql_filters["excluded_ingredients"] = filters["excluded_ingredients"]
@@ -405,10 +750,12 @@ class RetrievalStrategyDecider:
             existing = sql_filters.get("excluded_ingredients", [])
             sql_filters["excluded_ingredients"] = list(set(existing + session_excluded))
 
-        # Session included ingredients
-        session_included = session_context.get("included_ingredients", [])
-        if session_included:
-            sql_filters["included_ingredients"] = session_included
+        # Session included ingredients - skip for HYBRID_VECTOR_TO_SQL
+        # because embeddings already handle semantic ingredient matching
+        if strategy != RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
+            session_included = session_context.get("included_ingredients", [])
+            if session_included:
+                sql_filters["included_ingredients"] = session_included
 
         return sql_filters
 

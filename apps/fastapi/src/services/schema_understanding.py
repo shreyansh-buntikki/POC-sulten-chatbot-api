@@ -5,12 +5,50 @@ Optimized to inject only relevant tables based on intent
 """
 from typing import Dict, Any, List, Optional, Set
 from dataclasses import dataclass
+import time
+import hashlib
+import json
 
 # Import auto-generated schema data
 try:
     from schema_profiler_data import SCHEMA_DATA
 except ImportError:
     SCHEMA_DATA = {}
+
+
+# =====================================================
+# Schema Cache with TTL
+# =====================================================
+_SCHEMA_CACHE: Dict[str, Dict[str, Any]] = {}
+_SCHEMA_CACHE_TTL = 3600  # 1 hour TTL (schema rarely changes)
+
+
+def _get_schema_cache_key(intent: str, table_names: List[str]) -> str:
+    """Generate cache key for schema"""
+    cache_data = {
+        "intent": intent,
+        "tables": sorted(list(table_names))
+    }
+    return hashlib.md5(json.dumps(cache_data, sort_keys=True).encode()).hexdigest()
+
+
+def _get_cached_schema(cache_key: str) -> Optional["RelevantSchema"]:
+    """Get cached schema if valid"""
+    if cache_key in _SCHEMA_CACHE:
+        cached = _SCHEMA_CACHE[cache_key]
+        if time.time() - cached["timestamp"] < _SCHEMA_CACHE_TTL:
+            return cached["schema"]
+        else:
+            del _SCHEMA_CACHE[cache_key]
+    return None
+
+
+def _set_cached_schema(cache_key: str, schema: "RelevantSchema") -> None:
+    """Cache a schema"""
+    _SCHEMA_CACHE[cache_key] = {
+        "schema": schema,
+        "timestamp": time.time()
+    }
 
 
 @dataclass
@@ -120,7 +158,7 @@ class SchemaUnderstandingService:
         session_context: Dict[str, Any]
     ) -> RelevantSchema:
         """
-        Get schema relevant to the specific query
+        Get schema relevant to the specific query (with caching)
 
         Args:
             intent: Detected intent type
@@ -130,7 +168,7 @@ class SchemaUnderstandingService:
         Returns:
             RelevantSchema with optimized table set
         """
-        # Start with intent-based tables
+        # Determine required tables first (for cache key)
         table_names = set(self.INTENT_TABLE_MAP.get(intent, []))
 
         # Add tables based on filters
@@ -156,6 +194,12 @@ class SchemaUnderstandingService:
             if intent == "recipe_search":
                 table_names.update(["bundle_recipe", "bundle"])
 
+        # Check cache first
+        cache_key = _get_schema_cache_key(intent, list(table_names))
+        cached_schema = _get_cached_schema(cache_key)
+        if cached_schema:
+            return cached_schema
+
         # Build table schemas
         tables = []
         for table_name in table_names:
@@ -168,11 +212,16 @@ class SchemaUnderstandingService:
         # Filter business rules based on relevance
         business_rules = self._filter_business_rules(intent, sql_filters, session_context)
 
-        return RelevantSchema(
+        schema = RelevantSchema(
             tables=tables,
             relationships=relationships,
             business_rules=business_rules
         )
+
+        # Cache the result
+        _set_cached_schema(cache_key, schema)
+
+        return schema
 
     def _build_table_schema(self, table_name: str) -> TableSchema:
         """Build TableSchema from schema data"""

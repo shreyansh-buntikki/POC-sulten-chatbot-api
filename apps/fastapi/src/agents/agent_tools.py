@@ -11,7 +11,7 @@ from models import (
     Recipe, Ingredient, RecipeIngredient, Seasonality,
     SeasonalityTranslation, SeasonalityTypeEnum, Tag,
     RecipeTagsTag, RecipeSeasonality, UserLikesRecipe,
-    IngredientMacros, IngredientMicros, MeasuringUnit
+    IngredientMacros, IngredientMicros, MeasuringUnit, IngredientPricing, Country, Currency
 )
 
 
@@ -42,7 +42,6 @@ def search_recipes_by_embedding(
     # Debug logging
     import logging
     logger = logging.getLogger(__name__)
-    logger.warning(f"[AGENT_TOOLS] search_recipes_by_embedding called - query={query_text[:30]}, language_id={language_id}, threshold={threshold}")
 
     from apps.fastapi.src.services.embedding_service import EmbeddingService
 
@@ -55,9 +54,6 @@ def search_recipes_by_embedding(
     )
 
     logger.warning(f"[AGENT_TOOLS] search_recipes_by_embedding returned {len(results)} results")
-    for i, (recipe, score) in enumerate(results[:5]):
-        logger.warning(f"[AGENT_TOOLS]   Result {i+1}: {recipe.name} (languageId={recipe.languageId}, score={score:.3f})")
-
     return results
 
 
@@ -550,3 +546,213 @@ def search_similar_ingredients(
         }
         for ingr, score in results
     ]
+
+
+# =====================================================
+# Ingredient Pricing Tools
+# =====================================================
+
+def get_ingredient_pricing(
+    db: Session,
+    ingredient_name: str,
+    country_code: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Get pricing information for an ingredient.
+
+    Args:
+        db: Database session
+        ingredient_name: Name of the ingredient
+        country_code: Optional country code (e.g., 'US', 'NO', 'IN', 'IND')
+
+    Returns:
+        Dictionary with pricing info or None if no pricing data found
+    """
+    # Find ingredient by name - prioritize exact matches, then prefix matches, then contains
+    # This prevents "carrot" from matching "rainbow carrots" first
+    ingredient = None
+
+    # Try exact match first (case-insensitive)
+    ingredient = db.query(Ingredient).filter(
+        func.lower(Ingredient.name) == func.lower(ingredient_name)
+    ).first()
+
+    # If no exact match, try prefix match (e.g., "carrot" matches "carrots" but not "rainbow carrots")
+    # Order by name length to prefer shorter/more common names
+    if not ingredient:
+        ingredient = db.query(Ingredient).filter(
+            Ingredient.name.ilike(f"{ingredient_name}%")
+        ).order_by(func.length(Ingredient.name).asc()).first()
+
+    # If no prefix match, try contains match as last resort
+    # Order by name length and similarity to prefer closer matches
+    if not ingredient:
+        ingredient = db.query(Ingredient).filter(
+            Ingredient.name.ilike(f"%{ingredient_name}%")
+        ).order_by(
+            func.length(Ingredient.name).asc(),
+            Ingredient.name.asc()
+        ).first()
+
+    if not ingredient:
+        return None
+
+    # Build query for pricing
+    pricing_query = db.query(IngredientPricing, Country, Currency).join(
+        Country, IngredientPricing.countryId == Country.id
+    ).join(
+        Currency, IngredientPricing.currencyId == Currency.id
+    ).filter(
+        IngredientPricing.ingredientId == ingredient.id
+    )
+
+    # Filter by country if specified - match exact code or partial (e.g., "India" -> "IND")
+    if country_code:
+        # Try exact match first, then partial match
+        pricing_query = pricing_query.filter(
+            (Country.code.ilike(country_code)) |
+            (Country.code.ilike(f"%{country_code}%"))
+        )
+
+    # Get all pricing records
+    pricing_records = pricing_query.all()
+
+    # Return None instead of empty dict to trigger LLM fallback
+    if not pricing_records:
+        return None
+
+    pricing_list = []
+    for pricing, country, currency in pricing_records:
+        unit_name = None
+        if pricing.measuringUnitId:
+            # Get the unit name from translation table
+            unit_translation = db.execute(text("""
+                SELECT name FROM measuring_unit_translation
+                WHERE "measuringUnitId" = :unit_id
+                ORDER BY CASE WHEN "languageId" = 'en' THEN 0 ELSE 1 END
+                LIMIT 1
+            """), {"unit_id": str(pricing.measuringUnitId)}).fetchone()
+
+            if unit_translation and unit_translation[0]:
+                unit_name = unit_translation[0]
+            else:
+                # Fallback to unit ID if no translation found
+                unit = db.query(MeasuringUnit).filter(MeasuringUnit.id == pricing.measuringUnitId).first()
+                if unit:
+                    # Try to get a readable name from the unit itself
+                    unit_name = str(unit.id).split('-')[-1] if '-' in str(unit.id) else str(unit.id)
+
+        pricing_list.append({
+            "country": country.code,
+            "country_name": country.name,
+            "currency": currency.code,
+            "currency_symbol": currency.symbol,
+            "price_per_unit": float(pricing.pricePerUnit),
+            "quantity": pricing.quantity,
+            "unit": unit_name or "unit",
+            "total_price": float(pricing.pricePerUnit * pricing.quantity) if pricing.quantity else float(pricing.pricePerUnit)
+        })
+
+    return {
+        "ingredient_id": str(ingredient.id),
+        "name": ingredient.name,
+        "pricing": pricing_list
+    }
+
+
+def get_recipe_cost(
+    db: Session,
+    recipe_id: str,
+    country_code: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Calculate the cost of a recipe based on ingredient prices.
+
+    Args:
+        db: Database session
+        recipe_id: Recipe UUID
+        country_code: Optional country code for pricing (e.g., 'US', 'NO', 'IN')
+
+    Returns:
+        Dictionary with cost breakdown or None
+    """
+    # Get recipe
+    recipe = db.query(Recipe).filter(Recipe.id == recipe_id).first()
+    if not recipe:
+        return None
+
+    # Get recipe ingredients
+    ingredients = db.query(RecipeIngredient).filter(
+        RecipeIngredient.recipeId == recipe_id,
+        RecipeIngredient.deletedAt == None
+    ).all()
+
+    if not ingredients:
+        return None
+
+    total_cost = 0
+    ingredient_costs = []
+
+    for ri in ingredients:
+        if not ri.ingredientId:
+            continue
+
+        ingredient = db.query(Ingredient).filter(Ingredient.id == ri.ingredientId).first()
+        if not ingredient:
+            continue
+
+        # Get pricing for this ingredient
+        pricing_query = db.query(IngredientPricing, Currency).join(
+            Currency, IngredientPricing.currencyId == Currency.id
+        ).join(
+            Country, IngredientPricing.countryId == Country.id
+        ).filter(
+            IngredientPricing.ingredientId == ri.ingredientId
+        )
+
+        # Filter by country if specified
+        if country_code:
+            pricing_query = pricing_query.filter(Country.code.ilike(f"%{country_code}%"))
+
+        # Get first matching price
+        pricing_result = pricing_query.first()
+
+        if pricing_result:
+            pricing, currency = pricing_result
+            # Calculate cost: price per unit * (recipe amount / pricing quantity)
+            recipe_quantity = ri.amount or 1
+            pricing_quantity = pricing.quantity or 1
+            cost_per_base_unit = float(pricing.pricePerUnit)
+            cost = cost_per_base_unit * (recipe_quantity / pricing_quantity)
+
+            ingredient_costs.append({
+                "ingredient": ingredient.name,
+                "amount": recipe_quantity,
+                "cost": round(cost, 2),
+                "currency": currency.code,
+                "currency_symbol": currency.symbol
+            })
+
+            total_cost += cost
+        else:
+            ingredient_costs.append({
+                "ingredient": ingredient.name,
+                "amount": ri.amount,
+                "cost": None,
+                "note": "No pricing data available"
+            })
+
+    # Get currency for total (use first available)
+    currency_code = ingredient_costs[0].get("currency") if ingredient_costs else "USD"
+    currency_symbol = ingredient_costs[0].get("currency_symbol") if ingredient_costs else "$"
+
+    return {
+        "recipe_id": str(recipe.id),
+        "recipe_name": recipe.name,
+        "total_cost": round(total_cost, 2) if total_cost > 0 else None,
+        "currency": currency_code,
+        "currency_symbol": currency_symbol,
+        "ingredient_costs": ingredient_costs,
+        "servings": recipe.servings or 1,
+        "cost_per_serving": round(total_cost / (recipe.servings or 1), 2) if total_cost > 0 else None
+    }

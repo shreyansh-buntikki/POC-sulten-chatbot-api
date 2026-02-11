@@ -11,17 +11,19 @@ from starlette.middleware.cors import CORSMiddleware
 BASE_DIR = str(Path(__file__).resolve().parent.parent.parent)
 sys.path.append(BASE_DIR)
 
-# Enable OpenAI Agents SDK tracing
-try:
-    from agents import set_tracing_export_api_key
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-    if openai_api_key:
-        set_tracing_export_api_key(openai_api_key)
-        print("✅ OpenAI Agents SDK tracing enabled")
-except ImportError:
-    print("⚠️  OpenAI Agents SDK not available, tracing disabled")
-except Exception as e:
-    print(f"⚠️  Failed to enable SDK tracing: {e}")
+# OpenAI Agents SDK tracing DISABLED for performance
+# Tracing adds 2-3 seconds per call. Enable only for debugging.
+# To enable: uncomment the code below
+# try:
+#     from agents import set_tracing_export_api_key
+#     openai_api_key = os.getenv('OPENAI_API_KEY')
+#     if openai_api_key:
+#         set_tracing_export_api_key(openai_api_key)
+#         print("✅ OpenAI Agents SDK tracing enabled")
+# except ImportError:
+#     print("⚠️  OpenAI Agents SDK not available, tracing disabled")
+# except Exception as e:
+#     print(f"⚠️  Failed to enable SDK tracing: {e}")
 
 
 from apps.fastapi import logger

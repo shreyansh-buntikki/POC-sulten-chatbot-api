@@ -7,6 +7,9 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class SkillLevel(str, Enum):
@@ -35,6 +38,8 @@ class ContextEntities:
     last_referenced_recipe_name: Optional[str] = None
     last_ingredient_list: List[str] = field(default_factory=list)
     active_timers: List[Dict[str, Any]] = field(default_factory=list)  # [{"recipe": "X", "time": 300, "started_at": ...}]
+    last_vector_query: Optional[str] = None  # Last search query for embedding search context
+    last_search_filters: Optional[Dict[str, Any]] = None  # Last search filters for context
 
 
 @dataclass
@@ -158,6 +163,7 @@ class SessionMemoryManager:
     Manages session state storage and retrieval
 
     Can be backed by Redis or in-memory cache.
+    For existing sessions, loads conversation history from the database.
     """
 
     def __init__(self, use_redis: bool = False, redis_url: Optional[str] = None):
@@ -187,28 +193,99 @@ class SessionMemoryManager:
         self,
         session_id: str,
         user_uid: Optional[str] = None,
-        language: str = "en"
+        language: str = "en",
+        conversation_store: Optional[Any] = None
     ) -> SessionState:
         """
         Get existing session or create new one
+
+        For existing sessions in the database (via conversation_store),
+        loads the conversation history and reconstructs the session state.
 
         Args:
             session_id: Session identifier
             user_uid: Optional user identifier
             language: Language code (from header or default)
+            conversation_store: Optional ConversationStore for loading history from DB
 
         Returns:
-            SessionState object
+            SessionState object with conversation history loaded
         """
-        # Try to get existing session
-        session = self.get_session(session_id)
-        if session:
-            # Update user_uid if provided and session was anonymous
-            if user_uid and not session.user_uid:
-                session.user_uid = user_uid
+        # Try to get existing session from cache (this preserves context_entities)
+        cached_session = self.get_session(session_id)
+        if cached_session:
+            # Update user_uid if provided (overwrite existing value)
+            if user_uid:
+                cached_session.user_uid = user_uid
+            # If we have context_entities, preserve them
+            if hasattr(cached_session, 'context_entities') and cached_session.context_entities:
+                # Keep the existing context and just update conversation history
+                existing_context = cached_session.context_entities
+                # Create a new session but preserve context
+                session = SessionState(
+                    session_id=session_id,
+                    user_uid=user_uid or cached_session.user_uid,
+                    language=language or cached_session.language
+                )
+                # Restore the preserved context
+                session.context_entities = existing_context
+                session.last_intent = cached_session.last_intent
+                session.turn_count = cached_session.turn_count
+            else:
+                session = cached_session
+
+            # Update conversation history from database
+            messages = conversation_store.get_messages(session_id, limit=10) if conversation_store else []
+            session.conversation_history.clear()
+            for msg in messages:
+                session.conversation_history.append({
+                    "role": msg.role,
+                    "content": msg.content,
+                    "timestamp": msg.created_at.isoformat() if msg.created_at else None,
+                    "meta": msg.meta  # Include metadata which contains vector_query info
+                })
+
+            # Save back to cache
+            self.save_session(session)
             return session
 
+        # Check if session exists in the database and load history
+        if conversation_store:
+            from apps.fastapi import logger
+            db_session = conversation_store.get_session(session_id)
+            if db_session:
+                logger.info(f"[SESSION MEMORY] Loading existing session {session_id} from database with conversation history")
+                # Load conversation history from database
+                messages = conversation_store.get_messages(session_id, limit=10)
+
+                # Create session state with loaded history
+                session = SessionState(
+                    session_id=session_id,
+                    user_uid=user_uid or db_session.user_uid,
+                    language=language
+                )
+
+                # Populate conversation history from database
+                for msg in messages:
+                    session.conversation_history.append({
+                        "role": msg.role,
+                        "content": msg.content,
+                        "timestamp": msg.created_at.isoformat() if msg.created_at else None
+                    })
+
+                # Try to extract context from previous turns by analyzing messages
+                # This is a simple approach - for production, you might want to store
+                # the extracted context in the session metadata
+                session = self._extract_context_from_conversation(session, messages)
+
+                # Cache the session
+                self.save_session(session)
+                logger.info(f"[SESSION MEMORY] Loaded {len(messages)} messages from database for session {session_id}")
+                return session
+
         # Create new session
+        from apps.fastapi import logger
+        logger.info(f"[SESSION MEMORY] Creating new session {session_id}")
         session = SessionState(
             session_id=session_id,
             user_uid=user_uid,
@@ -217,17 +294,105 @@ class SessionMemoryManager:
         self.save_session(session)
         return session
 
+    def _extract_context_from_conversation(
+        self,
+        session: SessionState,
+        messages: List[Any]
+    ) -> SessionState:
+        """
+        Extract context from previous conversation messages.
+
+        This is a simple heuristic-based approach. It looks for patterns
+        in the conversation to extract things like excluded ingredients
+        (allergies), included ingredients, and other preferences.
+
+        Args:
+            session: SessionState to update
+            messages: List of ChatMessage objects from database
+
+        Returns:
+            Updated SessionState
+        """
+        # Simple keyword-based extraction
+        # In a production system, you might want to use the LLM to extract
+        # this context, or store it in the session metadata
+
+        for msg in messages:
+            content = msg.content.lower()
+            role = msg.role
+
+            # Only extract from user messages
+            if role != "user":
+                continue
+
+            # Extract recipe search context from conversation
+            # Look for recipe-related queries
+            recipe_keywords = [
+                "recipes", "recipe", "cook", "cooking", "make", "prepare",
+                "suggest", "find", "show me", "what is", "how to make"
+            ]
+
+            # Check if this is a recipe search query
+            is_recipe_search = any(keyword in content for keyword in recipe_keywords)
+
+            if is_recipe_search:
+                # Try to extract main ingredient/dish from the query
+                # Simple approach: look for common ingredients/dishes
+                common_ingredients = [
+                    "pasta", "rice", "chicken", "beef", "fish", "potato", "tomato",
+                    "onion", "garlic", "chole", "chickpeas", "dal", "curry",
+                    "pizza", "burger", "salad", "soup", "bread", "egg"
+                ]
+
+                for ingredient in common_ingredients:
+                    if ingredient in content:
+                        # Set this as the last vector query for refinement
+                        session.context_entities.last_vector_query = ingredient
+                        break
+
+            # Look for allergy patterns
+            # This is a simple regex-based approach
+            import re
+
+            # "allergic to X", "I'm allergic to X", "allergy: X"
+            allergy_patterns = [
+                r"allergic to (\w+(?:\s+\w+)*)",
+                r"allergy[:\s]+(\w+(?:\s+\w+)*)",
+                r"can't have (\w+(?:\s+\w+)*)",
+                r"cannot have (\w+(?:\s+\w+)*)",
+                r"no (\w+(?:\s+\w+)*)(?:\s+please)?",
+            ]
+
+            for pattern in allergy_patterns:
+                matches = re.finditer(pattern, content)
+                for match in matches:
+                    ingredient = match.group(1).strip().lower()
+                    if ingredient and ingredient not in ["no", "not", "dont", "don't"]:
+                        if ingredient not in session.excluded_ingredients:
+                            session.excluded_ingredients.append(ingredient)
+
+        return session
+
     def get_session(self, session_id: str) -> Optional[SessionState]:
         """Get session by ID"""
+        # Check cache first
+        cached_session = self._memory_cache.get(session_id)
+        if cached_session:
+            logger.info(f"[SESSION LOAD] Found session {session_id} in cache with context: {cached_session.context_entities}")
+
         if self.use_redis and self.redis_client:
             try:
                 data = self.redis_client.get(f"session:{session_id}")
                 if data:
-                    return SessionState.from_dict(json.loads(data))
+                    session_dict = json.loads(data)
+                    logger.info(f"[SESSION LOAD] Raw session dict from Redis: {session_dict.get('context_entities', {})}")
+                    loaded_session = SessionState.from_dict(session_dict)
+                    logger.info(f"[SESSION LOAD] Loaded session {session_id} from Redis with context: {loaded_session.context_entities}")
+                    return loaded_session
             except Exception as e:
                 print(f"Redis get failed: {e}")
 
-        return self._memory_cache.get(session_id)
+        return cached_session
 
     def save_session(self, session: SessionState, ttl: int = 3600):
         """
@@ -238,6 +403,10 @@ class SessionMemoryManager:
             ttl: Time to live in seconds (default 1 hour)
         """
         session.update_timestamp()
+
+        # Debug logging
+        logger.info(f"[SESSION SAVE] Saving session {session.session_id} with context_entities: {session.context_entities}")
+        logger.info(f"[SESSION SAVE] last_vector_query: {session.context_entities.last_vector_query}")
 
         if self.use_redis and self.redis_client:
             try:
@@ -370,6 +539,8 @@ class SessionMemoryManager:
                 "last_referenced_recipe_name": session.context_entities.last_referenced_recipe_name,
                 "last_ingredient_list": session.context_entities.last_ingredient_list,
                 "active_timers": session.context_entities.active_timers,
+                "last_vector_query": session.context_entities.last_vector_query,
+                "last_search_filters": session.context_entities.last_search_filters,
             },
         }
 
@@ -396,3 +567,37 @@ class SessionMemoryManager:
             session.turn_count = 0
             session.last_intent = None
             self.save_session(session)
+
+    def update_search_context(
+        self,
+        session: SessionState,
+        query: str,
+        vector_query: str,
+        filters: Dict[str, Any],
+        intent: str
+    ) -> SessionState:
+        """
+        Update session with the last successful search context
+
+        This enables cross-turn context awareness where follow-up queries
+        (like "I am allergic to tomato") can reference the previous search.
+
+        Args:
+            session: Current session state
+            query: Original user query
+            vector_query: The query used for embedding search
+            filters: SQL filters applied to the search
+            intent: The detected intent (recipe_search, etc.)
+
+        Returns:
+            Updated session state
+        """
+        # Only update for successful recipe searches
+        # This ensures we track meaningful searches, not failed ones
+        if intent == "recipe_search" and filters:
+            session.context_entities.last_vector_query = vector_query
+            session.context_entities.last_search_filters = filters
+            session.last_intent = intent
+            self.save_session(session)
+
+        return session

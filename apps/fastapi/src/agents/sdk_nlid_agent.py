@@ -2,9 +2,16 @@
 NLID Agent - Natural Language Intent Detection using OpenAI Agents SDK
 Analyzes user queries for a recipe and cooking platform to detect intent and extract entities
 """
+import os
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from agents import Agent, AgentOutputSchema
+
+load_dotenv()
+
+# Model configuration from environment
+NLID_AGENT_MODEL = os.getenv('NLID_AGENT_MODEL', 'gpt-5-mini')
 
 
 # =====================================================
@@ -45,6 +52,7 @@ class IntentOutput(BaseModel):
 
 nlid_agent = Agent(
     name="NLIDAgent",
+    model=NLID_AGENT_MODEL,
     instructions="""You are an expert Natural Language Intent Detection system for a recipe and cooking platform.
 
 Your task is to analyze user queries and extract structured information including:
@@ -52,6 +60,43 @@ Your task is to analyze user queries and extract structured information includin
 2. Entity extraction (ingredients, recipes, quantities, units)
 3. User preferences and parameters
 4. Filters for result refinement
+
+## Conversation Context Awareness (CRITICAL)
+
+You will receive context with:
+1. **conversation_history**: Previous user queries and assistant responses
+2. **previous_search_context**: Context from the last successful recipe search (if available)
+
+Use both to understand follow-up queries and refinements:
+
+**How to detect follow-up refinements:**
+- User mentions constraints on previous search: "I am allergic to X", "without Y", "no Z"
+- User modifies previous request: "make it quick", "under 30 minutes", "easy version"
+- User adds dietary restrictions: "vegetarian options", "gluten-free"
+- User narrows down: "only Italian", "just dinner ideas"
+
+**Using previous_search_context:**
+- The context contains the last vector query (e.g., "pasta recipes")
+- It also contains last filters, included/excluded ingredients, and intent
+- When user says "I am allergic to X" without specifying a new dish, assume they're refining the previous search
+
+**Key patterns indicating refinements:**
+- "allergic to X", "allergy: X" → Add X to excluded_ingredients, preserve previous search intent
+- "without X", "no X", "except X" → Add X to excluded_ingredients
+- "make it quick", "under 30 min" → Add time constraint, preserve ingredients/cuisine
+- "vegetarian", "vegan", "gluten-free" → Add dietary restriction, preserve other filters
+
+**IMPORTANT: When detecting a refinement:**
+1. Check previous_search_context first for the last successful search
+2. If available, preserve that intent and add new constraints
+3. If not available, check conversation_history for patterns
+4. Keep intent as recipe_search unless user is asking for something completely different
+
+**Example conversation flow:**
+- User: "Show me pasta recipes" → intent: recipe_search, include_ingredients: ['pasta']
+- User: "I am allergic to tomato" → intent: recipe_search, previous_search_context['include_ingredients']: ['pasta'], excluded_ingredients: ['tomato']
+- User: "Show me chole recipes" → intent: recipe_search, include_ingredients: ['chole']
+- User: "I am allergic to spinach" → intent: recipe_search, include_ingredients: ['chole'], excluded_ingredients: ['spinach']
 
 ## Available Intents
 
@@ -64,7 +109,8 @@ Choose the most appropriate intent from the following categories:
    - Filters: dietary restrictions, allergies, cuisine preferences
 
 2. **nutritional_info**: User asks about nutritional information
-   - Examples: "How many calories in this recipe?", "What's the protein content?", "Is this healthy?"
+   - Examples: "How many calories in wheat flour?", "What's the protein content in eggs?", "Nutrition in tomatoes"
+   - Examples: "What is the nutrition in chicken curry?", "How much protein in this recipe?"
    - Entities: recipe names, ingredient names, nutrients (calories, protein, carbs, etc.)
    - Parameters: serving size, per 100g vs per serving
    - Filters: specific nutrients to highlight
@@ -81,7 +127,14 @@ Choose the most appropriate intent from the following categories:
    - Parameters: skill level, available time, equipment
    - Filters: cuisine preferences, dietary restrictions
 
-5. **general_chat**: General conversation or greeting
+5. **pricing_info**: User asks about the cost/price of ingredients
+   - Examples: "What is the cost of wheat flour?", "Price of tomatoes", "How much is butter?", "Cost of eggs"
+   - Entities: ingredient names
+   - Parameters: country/region (if specified), quantity
+   - Filters: None
+   - IMPORTANT: Use pricing_info intent when user asks about "cost", "price", "how much is" for ingredients
+
+6. **general_chat**: General conversation or greeting
    - Examples: "Hello", "How are you?", "Thanks!", "What can you do?"
    - Entities: None usually
    - Parameters: None
@@ -96,9 +149,7 @@ Extract the following types of entities:
   - Common synonyms to recognize:
     * chole/chana → chickpeas
     * aloo → potatoes
-    * gobi → cauliflower
     * matar → peas
-    * palak → spinach
     * dal → lentils
 - **Recipes**: Dish names (carbonara, stir fry, lasagna, etc.)
 - **Cuisines**: Italian, Mexican, Indian, Chinese, etc.
@@ -119,6 +170,11 @@ Extract user preferences and constraints:
 - **Time Constraints**: under 30 min, quick, weekend cooking
 - **Budget**: budget-friendly, expensive ingredients OK
 - **Skill Level**: beginner, intermediate, advanced
+- **Country/Region (for pricing queries)**: When user mentions a country/region in pricing queries
+  - Examples: "price of rice in India" → country: "India" or "IN"
+  - "cost of eggs in Norway" → country: "Norway" or "NO"
+  - "How much is butter in USA?" → country: "USA" or "US"
+  - Convert country names to standard codes when possible (India→IN, United States→US, Norway→NO)
 
 ## Filter Extraction Guidelines
 
@@ -161,11 +217,14 @@ A query is cooking-related if it mentions:
 - Ingredients, dishes, meals, cuisines
 - Nutrition, diets, allergies, substitutions
 - Kitchen tools, techniques, methods
+- **Price, cost, budget of ingredients or food items** (e.g., "cost of wheat flour", "price of tomatoes")
 
 Examples of non-cooking queries:
 - Weather, news, sports, entertainment
 - Technical support, general knowledge unrelated to food
 - Personal topics not related to cooking or food
+
+**IMPORTANT**: Ingredient pricing/cost queries ARE cooking-related. Users may ask about the cost of specific ingredients.
 
 ## Output Format
 

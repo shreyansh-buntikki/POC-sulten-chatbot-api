@@ -246,7 +246,6 @@ class EmbeddingService:
         # Debug logging
         import logging
         logger = logging.getLogger(__name__)
-        logger.warning(f"[EMBEDDING SEARCH] START - query_text={query_text[:50]}, language_id={language_id}, threshold={threshold}")
 
         # Generate embedding for query
         query_embedding = self._generate_embedding(query_text)
@@ -278,7 +277,6 @@ class EmbeddingService:
         else:
             logger.warning(f"[EMBEDDING SEARCH] NO language filter - language_id is None or empty!")
 
-        logger.warning(f"[EMBEDDING SEARCH] WHERE conditions: {where_conditions}")
 
         # Use cosine similarity search (1 - cosine_distance)
         sql_query = text(f"""

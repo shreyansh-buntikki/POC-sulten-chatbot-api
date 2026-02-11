@@ -2,9 +2,16 @@
 Recipe Retrieval Agent - Recipe search and recommendation using OpenAI Agents SDK
 Helps users find recipes based on their queries and preferences
 """
+import os
 from typing import Optional, List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from agents import Agent
+
+load_dotenv()
+
+# Model configuration from environment
+RECIPE_AGENT_MODEL = os.getenv('RECIPE_AGENT_MODEL', 'gpt-5-mini')
 
 
 # =====================================================
@@ -13,6 +20,7 @@ from agents import Agent
 
 recipe_agent = Agent(
     name="RecipeRetrievalAgent",
+    model=RECIPE_AGENT_MODEL,
     instructions="""You are a recipe search specialist helping users discover delicious recipes that match their needs.
 
 Your role is to find, filter, and present recipes in an appealing and helpful way.

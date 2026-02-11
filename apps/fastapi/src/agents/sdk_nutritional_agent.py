@@ -2,11 +2,18 @@
 Nutritional Agent - Provides nutritional information using OpenAI Agents SDK
 Handles questions about recipes, ingredients, substitutions, and nutritional content
 """
+import os
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from agents import Agent
 
 from apps.fastapi.src.agents.sdk_nutrition_tools import nutrition_tools
+
+load_dotenv()
+
+# Model configuration from environment
+NUTRITIONAL_AGENT_MODEL = os.getenv('NUTRITIONAL_AGENT_MODEL', 'gpt-5-mini')
 
 
 # =====================================================
@@ -15,6 +22,7 @@ from apps.fastapi.src.agents.sdk_nutrition_tools import nutrition_tools
 
 nutritional_agent = Agent(
     name="NutritionalAgent",
+    model=NUTRITIONAL_AGENT_MODEL,
     instructions="""You are a nutrition expert helping users understand the nutritional content of recipes and ingredients.
 
 Your role is to provide accurate, helpful nutritional information in an easy-to-understand format.

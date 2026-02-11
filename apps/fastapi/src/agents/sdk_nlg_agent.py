@@ -1,14 +1,20 @@
 """
 NLG Agent - Natural Language Generation using OpenAI Agents SDK
 Generates natural language responses for various scenarios
+
+IMPORTANT: The frontend renders recipe cards from metadata, NOT from the text response.
+The NLG agent should ONLY generate a brief 1-liner intro, NOT list recipes.
 """
 import os
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from agents import Agent
 
-# Configuration - Agent SDK uses default model from OpenAI
-# Model is configured via OPENAI_MODEL env var or uses SDK default
+load_dotenv()
+
+# Model configuration from environment
+NLG_AGENT_MODEL = os.getenv('NLG_AGENT_MODEL', 'gpt-5-mini')
 
 
 # =====================================================
@@ -17,116 +23,55 @@ from agents import Agent
 
 nlg_agent = Agent(
     name="NLGAgent",
+    model=NLG_AGENT_MODEL,
     instructions="""You are a natural language generation specialist for a recipe and cooking platform.
 
-Your role is to generate clear, helpful, and engaging responses based on structured information provided.
+CRITICAL: The frontend renders recipe cards from structured metadata. Your response should ONLY be a brief 1-liner introduction, NOT a full recipe listing.
 
 ## Response Scenarios
 
-### 1. Recipe Presentation
-When presenting recipe search results:
-- Start with a brief, friendly acknowledgment
-- List recipes with clear formatting (use bold for recipe names)
-- Include key details: time, difficulty, servings
-- Note premium recipes clearly
-- Add relevant context (liked recipes, seasonal)
-- Keep responses concise but informative
-- Use occasional food-related emoji (🍽️, 🥗, 🍳, ⏱️, 🔥)
+### 1. Recipe Results (Most Common)
+When recipe search results are available:
+- Generate ONLY a 1-liner intro saying what you found
+- DO NOT list recipes or include recipe details - the frontend handles that
+- Keep it under 20 words
+- Be friendly and concise
 
-Example format:
-```
-Great! Here are some recipe ideas for you:
-
-🍽️ **Chicken Stir Fry**
-⏱️ 25 min | 🔥 Easy | 👥 4 servings
-Quick and healthy with fresh vegetables
-
-🍽️ **Pasta Primavera**
-⏱️ 35 min | 🔥 Medium | 👥 4 servings
-Colorful spring vegetables in light sauce
-
-Would you like full details for any of these?
-```
+Examples:
+- "Great! I found 5 pasta recipes for you."
+- "I found 8 quick dinner recipes matching your search."
+- "Here are 3 vegetarian recipes with chickpeas."
+- "I found 6 Italian recipes under 30 minutes."
 
 ### 2. No Results
 When no recipes match:
 - Acknowledge what they were looking for
 - Suggest ways to broaden the search
 - Offer alternative search ideas
-- Be encouraging and helpful
+- Keep it to 2-3 sentences
 
 Example:
-```
-I couldn't find any recipes matching "vegan lobster bisque."
-
-A few suggestions:
-- Try removing some filters (vegan requirement)
-- Search for similar ingredients (lobster → mushrooms, cashews)
-- Browse our seafood or soup categories
-
-Would you like me to search for something different?
-```
+"I couldn't find any recipes matching 'vegan lobster bisque.' Try removing some filters or searching for similar ingredients like mushrooms or cashews."
 
 ### 3. Error Messages
 When there's a technical issue:
 - Apologize briefly
 - Reassure it's not their fault
-- Suggest trying again or a different approach
-- Keep it brief and friendly
+- Suggest trying again
 
 Example:
-```
-I apologize, but I encountered a technical issue while searching. This isn't related to your request - it's on our end.
+"I apologize, but I encountered a technical issue while searching. Please try again in a moment."
 
-Please try again in a moment, or search for something else in the meantime.
-```
-
-### 4. Nutritional Information
-When presenting nutrition data:
-- Provide context for numbers (not just raw values)
-- Highlight what's notable or beneficial
-- Note any concerns (high sodium, low protein)
-- Suggest modifications if appropriate
-- Be informative but not preachy
-
-## Tone and Style Guidelines
+## Tone and Style
 
 - **Friendly and warm** - Like a knowledgeable cooking friend
 - **Clear and concise** - Get to the point efficiently
-- **Helpful** - Always offer next steps or alternatives
-- **Accurate** - Base responses on the provided data
-- **Encouraging** - Make users feel confident in cooking
-- **Not overly formal** - Conversational but professional
+- **Single sentence** for recipe results (1-liner)
+- **No recipe listings** - frontend handles that from metadata
 
-## Formatting Rules
+Remember: Your goal is to provide a brief, friendly introduction. The frontend will display the actual recipe cards!""",
 
-- Use bold for recipe names: **Recipe Name**
-- Use emoji sparingly for visual hierarchy
-- Keep responses under 300 words when possible
-- Use bullet points or numbered lists for clarity
-- Include helpful tips when relevant
-
-## Input Format
-
-You'll receive structured data about:
-- Query details (what user asked for)
-- Available recipes (names, times, difficulty, access level)
-- User context (liked recipes, preferences)
-- Any errors or issues
-
-Generate appropriate responses based on this context.
-
-## Important Notes
-
-- Always base your response on the provided data
-- Don't make up recipe details not in the input
-- Be honest when information is limited
-- Respect access levels (note premium content appropriately)
-- Consider dietary restrictions mentioned
-
-Remember: Your goal is to help users feel supported and excited about cooking!""",
-
-    handoff_description="Specialist for generating natural language responses from structured data",
+    handoff_description="Specialist for generating brief natural language responses from structured data",
 )
 
 
@@ -140,7 +85,10 @@ async def generate_recipe_response(
     user_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
-    Generate a response presenting recipe search results.
+    Generate a brief 1-liner intro for recipe search results.
+
+    IMPORTANT: The frontend renders recipe cards from metadata.
+    This function should ONLY generate a 1-liner intro, NOT list recipes.
 
     Args:
         query: Original user query
@@ -148,36 +96,25 @@ async def generate_recipe_response(
         user_context: Optional user context (liked recipes, preferences)
 
     Returns:
-        Natural language response
+        Brief 1-liner natural language response
     """
     from agents import Runner
 
-    # Build recipe summaries
-    recipe_summaries = []
-    for recipe in recipes:
-        access_note = ""
-        if recipe.get("access_level") == "name_only":
-            access_note = " (Premium recipe - upgrade for full details)"
-
-        summary = f"- **{recipe['name']}**{access_note}\n"
-        if recipe.get("ingress"):
-            summary += f"  {recipe['ingress']}\n"
-        summary += f"  Time: {recipe.get('total_time', 'N/A')} min | Difficulty: {recipe.get('difficulty', 'N/A')}\n"
-        if recipe.get("servings"):
-            summary += f"  Servings: {recipe['servings']}\n"
-        if recipe.get("is_liked"):
-            summary += "  ⭐ You liked this recipe"
-
-        recipe_summaries.append(summary)
-
+    # Build a simple prompt with just the count and query context
+    # NO recipe details - frontend handles rendering
     prompt = f"""User query: "{query}"
 
-Available recipes ({len(recipes)}):
-{chr(10).join(recipe_summaries)}
+Found {len(recipes)} recipe(s) matching their search.
 
-{f'User context: Liked some recipes in previous searches' if user_context and user_context.get('has_liked_recipes') else ''}
+Generate a brief 1-liner intro (under 20 words) saying what you found.
+DO NOT list recipes or include recipe details - the frontend will display recipe cards from metadata.
 
-Please present these recipe options to the user in a helpful, engaging way."""
+Examples:
+- "Great! I found {len(recipes)} recipe(s) for you."
+- "I found {len(recipes)} recipes matching your search."
+- "Here are {len(recipes)} recipes for {query[:30]}..."
+
+Keep it friendly and concise."""
 
     result = await Runner.run(nlg_agent, prompt)
     return result.final_output

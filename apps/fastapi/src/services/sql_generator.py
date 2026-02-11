@@ -3,14 +3,22 @@ SQL Generation and Validation Service
 Generates SQL queries based on natural language and schema
 Validates generated SQL before execution
 """
+import os
 import re
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
 
+from apps.fastapi import logger
 from apps.fastapi.src.services.schema_understanding import get_schema_service, RelevantSchema
+
+load_dotenv()
+
+# Model configuration from environment
+SQL_GENERATOR_MODEL = os.getenv('SQL_GENERATOR_MODEL', 'gpt-5-mini')
 
 
 @dataclass
@@ -124,6 +132,17 @@ class SQLValidator:
         if "--" in sanitized_sql or "/*" in sanitized_sql:
             errors.append("SQL comments detected (potential injection)")
 
+        # Check 7: Single-quoted identifiers (syntax error)
+        # Pattern: FROM 'tablename' or JOIN 'tablename' causes syntax error
+        # Single quotes are for string literals, not table identifiers
+        single_quoted_from = re.search(r"\bFROM\s+'[^']+'(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)?(?!\s+AS)", sanitized_sql, re.IGNORECASE)
+        if single_quoted_from:
+            errors.append("Single-quoted table name after FROM (use double quotes or no quotes for lowercase tables)")
+
+        single_quoted_join = re.search(r"\b(?:LEFT|RIGHT|INNER|FULL|CROSS)\s+JOIN\s+'[^']+'(?:\s+[a-zA-Z_][a-zA-Z0-9_]*)?", sanitized_sql, re.IGNORECASE)
+        if single_quoted_join:
+            errors.append("Single-quoted table name after JOIN (use double quotes or no quotes for lowercase tables)")
+
         return ValidationResult(
             is_valid=len(errors) == 0,
             errors=errors,
@@ -203,9 +222,18 @@ class SQLGenerator:
             query, nlid_result, sql_filters, session_context, candidate_ids, relevant_schema
         )
 
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # DEBUG: Log the sql_filters to verify ingredients are excluded
+        logger.info(f"[SQL GENERATOR] sql_filters keys: {list(sql_filters.keys())}")
+        logger.info(f"[SQL GENERATOR] included_ingredients in filters: {'included_ingredients' in sql_filters}")
+        if 'included_ingredients' in sql_filters:
+            logger.info(f"[SQL GENERATOR] included_ingredients value: {sql_filters['included_ingredients']}")
+
         # Generate SQL using LLM
         response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=SQL_GENERATOR_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -217,7 +245,7 @@ class SQLGenerator:
                 }
             ],
             temperature=0.1,  # Low temperature for consistent SQL
-            max_tokens=800
+            max_completion_tokens=800  # GPT-5+ uses max_completion_tokens
         )
 
         generated_text = response.choices[0].message.content
@@ -225,8 +253,17 @@ class SQLGenerator:
         # Extract SQL from response
         sql = self._extract_sql_from_response(generated_text)
 
+        # DEBUG: Log generated SQL before substitution
+        logger.info(f"[SQL GENERATOR] Generated SQL (before substitution): {sql[:300]}...")
+
+        # Fix common SQL syntax errors (e.g., single-quoted table names)
+        sql = self._fix_common_sql_errors(sql)
+
         # Substitute placeholders with actual values
         sql = self._substitute_placeholders(sql, candidate_ids, session_context, sql_filters)
+
+        # DEBUG: Log final SQL after substitution
+        logger.info(f"[SQL GENERATOR] Final SQL (after substitution): {sql[:300]}...")
 
         # Validate SQL
         validation = self.validator.validate(sql, relevant_schema)
@@ -253,129 +290,59 @@ class SQLGenerator:
         )
 
     def _get_system_prompt(self) -> str:
-        """Get system prompt for SQL generation"""
-        return """You are a SQL expert for a recipe and cooking platform database.
+        """Get system prompt for SQL generation - optimized for conciseness and speed"""
+        return """You are a PostgreSQL expert for a recipe database. Generate queries based on user request and schema.
 
-Generate PostgreSQL SQL queries based on the user's request and provided schema.
+CRITICAL RULES:
+1. Column names: Use double quotes for mixed-case columns: r."id", r."name", r."userUid", r."languageId", r."deletedAt", r."status", r."prepTime", r."cookTime"
+2. Table names: NEVER use quotes around lowercase table names. Use "bundle" or "recipe" (with double quotes) only if needed. NEVER use single quotes for tables.
+3. String literals: Use single quotes ONLY for string values: 'published', 'en', :language_id
+4. WRONG: LEFT JOIN 'bundle' b  ← This uses single quotes (string literal), causes syntax error
+5. CORRECT: LEFT JOIN "bundle" b  OR  LEFT JOIN bundle b  ← Double quotes or no quotes for lowercase tables
+6. ALWAYS include: r."deletedAt" IS NULL AND r."status" = 'published'
+7. Access control: r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL
+8. ALWAYS add LIMIT clause (default 20)
+9. When candidate_ids provided: Use WHERE r."id" IN (:recipe_ids) - NO ingredient EXISTS needed
+10. For allergies (exclude ingredients): NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%allergen%')
+11. For included ingredients: EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%ingredient%')
+12. For tags (vegetarian, vegan, etc.): EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name = 'tag_name')
+13. When filtering by multiple tags, use OR within EXISTS: EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name = 'vegetarian' OR t.name = 'vegan'))
+14. Return ONLY SQL in ```sql blocks, no explanations
+15. IMPORTANT: Use :placeholder format for ALL parameters (e.g., :max_time, :user_uid, :language_id) - NOT %(max_time)s format
 
-IMPORTANT RULES:
-1. ALWAYS include LIMIT clause (default 20, max 100)
-2. Use table JOINs for related data
-3. Access Control: ALLOW bundle recipes (private=true but in bundle_recipe table), exclude other private recipes
-4. Use ILIKE for case-insensitive string matching
-5. Use parameterized patterns (do not hardcode values)
-6. Return ONLY the SQL query, no explanations
-7. Use proper PostgreSQL syntax
+QUOTING CHEATSHEET:
+- Mixed-case columns: r."id", r."name", r."userUid"  ← double quotes
+- Lowercase tables: recipe, ingredient, bundle_recipe, tag, recipe_tags_tag  ← no quotes needed
+- Mixed-case tables: "bundle", "recipe"  ← double quotes if mixed case
+- String values: 'published', 'en', 'easy', 'vegetarian'  ← single quotes
+- NEVER single quotes for identifiers: 'bundle' is WRONG
 
-CRITICAL: Column names are case-sensitive in PostgreSQL. You MUST use double quotes for column names that contain mixed case:
-- "prepTime" (not prepTime or preptime)
-- "cookTime" (not cookTime or cooktime)
-- "createdAt" (not createdAt or createdat)
-- "updatedAt" (not updatedAt or updatedat)
-- "deletedAt" (not deletedAt or deletedat)
-- "publishedAt" (not publishedAt or publishedat)
-- "userUid" (not userUid or useruid)
-- "languageId" (not languageId or languageid)
-- "recipeId" (not recipeId or recipeid)
-
-CRITICAL JOIN RULE: In ALL JOIN conditions, you MUST quote EVERY column name from BOTH tables:
-- WRONG: LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr.userUid = '...'
-- CORRECT: LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = '...'
-
-When in doubt, use double quotes around ALL column names: r."name", r."id", ulr."userUid", etc.
-
-ACCESS CONTROL PATTERN (CRITICAL - Bundle recipes must be included):
+STANDARD QUERY TEMPLATE:
 ```sql
-LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
-LEFT JOIN bundle b ON br."bundleId" = b."id"
-LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
-WHERE r."deletedAt" IS NULL
-  AND r."status" = 'published'  -- ONLY return published recipes, never draft
-  AND (
-    -- Public recipes (not private)
-    r."private" = false
-    -- OR user created this recipe
-    OR r."userUid" = :user_uid
-    -- OR recipe is in a bundle owned by user (b."userUid" = :user_uid)
-    -- OR recipe is in a bundle (show name even if not owned - access level handled in app)
-    OR br."bundleId" IS NOT NULL
-  )
-```
-
-INGREDIENT FILTERING (CRITICAL):
-When candidate_ids are provided (from semantic embedding search), DO NOT add ingredient EXISTS clauses.
-The semantic search already found relevant recipes - adding ingredient filtering would be redundant.
-
-ONLY use ingredient EXISTS clauses when:
-- No candidate_ids are provided (pure SQL search)
-- Filtering by excluded_ingredients (allergies)
-
-IMPORTANT: Synonyms are alternative names for the SAME ingredient. Use OR, not AND:
-- WRONG: EXISTS (... ILIKE '%chole%') AND EXISTS (... ILIKE '%chickpeas%')
-- CORRECT: EXISTS (... WHERE i."name" ILIKE '%chole%' OR i."name" ILIKE '%chickpeas%')
-
-EXAMPLE: When candidate_ids are provided (from semantic search), DO NOT add ingredient EXISTS:
-```sql
-SELECT r."id", r."name", r."slug", r."ingress", r."image"
+SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
 FROM recipe r
 LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
-LEFT JOIN bundle b ON br."bundleId" = b."id"
+LEFT JOIN "bundle" b ON br."bundleId" = b."id"
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
-WHERE r."deletedAt" IS NULL
-  AND r."status" = 'published'
-  AND r."languageId" = :language_id
-  AND (
-    r."private" = false
-    OR r."userUid" = :user_uid
-    OR br."bundleId" IS NOT NULL
-  )
-  AND r."id" IN (:recipe_ids)  -- Only these semantic matches, NO ingredient EXISTS needed!
-LIMIT 20;
+WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
+  AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
+LIMIT 20
 ```
 
-Pattern for single ingredient or its synonyms:
+TAG FILTERING TEMPLATE (for vegetarian, vegan, etc.):
 ```sql
-JOIN recipe_ingredient ri ON r."id" = ri."recipeId" AND ri."deletedAt" IS NULL
-JOIN ingredient i ON ri."ingredientId" = i."id"
-WHERE i."name" ILIKE '%ingredient_name%'
+SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
+FROM recipe r
+LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
+LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
+WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
+  AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
+  AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name = 'vegetarian')
+LIMIT 20
 ```
 
-For ingredient with synonyms (use OR within a single EXISTS):
-```sql
-WHERE EXISTS (
-  SELECT 1 FROM recipe_ingredient ri
-  JOIN ingredient i ON ri."ingredientId" = i."id"
-  WHERE ri."recipeId" = r."id"
-    AND (i."name" ILIKE '%chole%' OR i."name" ILIKE '%chickpeas%' OR i."name" ILIKE '%garbanzo beans%')
-)
-```
-
-For DIFFERENT ingredients (must have ALL present), use multiple EXISTS with AND:
-```sql
-WHERE EXISTS (
-  SELECT 1 FROM recipe_ingredient ri1 JOIN ingredient i1 ON ri1."ingredientId" = i1."id"
-  WHERE ri1."recipeId" = r."id" AND i1."name" ILIKE '%ingredient1%'
-)
-AND EXISTS (
-  SELECT 1 FROM recipe_ingredient ri2 JOIN ingredient i2 ON ri2."ingredientId" = i2."id"
-  WHERE ri2."recipeId" = r."id" AND i2."name" ILIKE '%ingredient2%'
-)
-```
-
-OTHER COMMON PATTERNS:
-- Time filter: (r."prepTime" + r."cookTime") <= :max_time
-- Language filter (CRITICAL): r."languageId" = :language_id -- MUST match the header value exactly
-- Status filter (CRITICAL): r."status" = 'published' -- NEVER return draft recipes
-- Ingredient exclusion: NOT EXISTS (SELECT 1 FROM recipe_ingredient ri2 JOIN ingredient i2 ON ri2."ingredientId" = i2."id" WHERE ri2."recipeId" = r."id" AND i2."name" ILIKE '%peanut%')
-- Tag filter: JOIN recipe_tags_tag rtt ON r."id" = rtt."recipeId" JOIN tag t ON rtt."tagId" = t."id" WHERE t."name" IN (:tags)
-
-MANDATORY FILTERS (ALWAYS INCLUDE IN EVERY QUERY):
-1. r."deletedAt" IS NULL
-2. r."status" = 'published' (ONLY published recipes, NEVER draft)
-3. Access control pattern as shown above
-4. Language filter when :language_id is provided
-
-Return the SQL query only, wrapped in ```sql ... ``` markdown blocks."""
+Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
     def _build_generation_prompt(
         self,
@@ -420,6 +387,7 @@ Return the SQL query only, wrapped in ```sql ... ``` markdown blocks."""
             ingredients = sql_filters['included_ingredients']
             parts.append(f"- Include ingredients: {', '.join(ingredients)}")
             parts.append(f"  CRITICAL: These are SYNONYMS (alternative names for the same ingredient).")
+            parts.append(f"  Use EXISTS to find recipes that CONTAIN these ingredients")
 
             # Only add EXISTS clause instruction if we DON'T have candidate_ids
             # When candidate_ids are provided, the semantic search already found relevant recipes
@@ -432,8 +400,10 @@ Return the SQL query only, wrapped in ```sql ... ``` markdown blocks."""
                     example = f"  Use EXISTS clause: EXISTS (... WHERE i.\"name\" ILIKE '%{ingredients[0]}%')"
                 parts.append(example)
                 parts.append(f"  DO NOT use multiple EXISTS with AND - that requires ALL ingredients to be present!")
+                parts.append(f"  DO NOT use NOT EXISTS - that would exclude recipes with these ingredients!")
             else:
                 parts.append(f"  NOTE: Ingredient EXISTS clause NOT needed - candidate_ids already filtered by semantic search")
+                parts.append(f"  DO NOT add ingredient filtering when candidate_ids are provided")
 
         if session_context.get("language"):
             language = session_context['language']
@@ -460,6 +430,65 @@ Return the SQL query only, wrapped in ```sql ... ``` markdown blocks."""
 
         return "\n".join(parts)
 
+    def _fix_common_sql_errors(self, sql: str) -> str:
+        """
+        Fix common SQL syntax errors generated by LLM
+        This is a safety net to handle cases where the LLM generates incorrect SQL
+        """
+        import re
+        import logging
+        logger = logging.getLogger(__name__)
+
+        original_sql = sql
+
+        # Fix 1: Single-quoted table names in JOIN/FROM clauses
+        # Pattern: FROM 'table_name' or JOIN 'table_name' -> FROM "table_name" or JOIN "table_name"
+        # This is a common error where LLM uses single quotes for table identifiers
+        # We need to be careful not to affect string literals in WHERE clauses
+        def fix_single_quoted_table(match):
+            quote_type = match.group(1)  # FROM or JOIN type
+            table_name = match.group(2)  # table name
+            alias = match.group(3) if match.group(3) else ""  # optional alias
+            # Convert single quotes to double quotes for table identifier
+            return f'{quote_type} "{table_name}"{alias}'
+
+        # Match FROM 'tablename' or FROM 'tablename' alias or JOIN 'tablename' alias
+        # Negative lookahead to avoid matching string literals in expressions
+        sql = re.sub(
+            r'\b(FROM|JOIN)\s+\'([a-zA-Z_][a-zA-Z0-9_]*)\'(\s+[a-zA-Z_][a-zA-Z0-9_]*)?(?!\s*AS)',
+            fix_single_quoted_table,
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # Fix 2: Single-quoted table names in LEFT/RIGHT/INNER JOIN
+        # Pattern: LEFT JOIN 'table' alias -> LEFT JOIN "table" alias
+        def fix_join_single_quotes(match):
+            join_type = match.group(1)  # LEFT, RIGHT, INNER, etc.
+            table_name = match.group(2)  # table name
+            alias = match.group(3) if match.group(3) else ""  # optional alias
+            return f'{join_type} "{table_name}"{alias}'
+
+        sql = re.sub(
+            r'\b(LEFT|RIGHT|INNER|FULL|CROSS)\s+JOIN\s+\'([a-zA-Z_][a-zA-Z0-9_]*)\'(\s+[a-zA-Z_][a-zA-Z0-9_]*)?',
+            fix_join_single_quotes,
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # Fix 3: Remove any trailing semicolon before LIMIT (LLM sometimes adds this)
+        sql = re.sub(r';\s*LIMIT', '\nLIMIT', sql, flags=re.IGNORECASE)
+
+        # Fix 4: Ensure LIMIT is on its own line for readability (optional)
+        # sql = re.sub(r'(\S)\s+LIMIT', r'\1\nLIMIT', sql, flags=re.IGNORECASE)
+
+        if sql != original_sql:
+            logger.info(f"[SQL FIXER] Applied fixes to SQL syntax")
+            logger.debug(f"[SQL FIXER] Before: {original_sql[:200]}...")
+            logger.debug(f"[SQL FIXER] After: {sql[:200]}...")
+
+        return sql
+
     def _substitute_placeholders(
         self,
         sql: str,
@@ -469,30 +498,74 @@ Return the SQL query only, wrapped in ```sql ... ``` markdown blocks."""
     ) -> str:
         """Substitute placeholders in SQL with actual values"""
         import re
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Debug: Log original SQL before substitution
+        logger.debug(f"[SQL SUBSTITUTION] Before: {sql[:200]}...")
+        logger.debug(f"[SQL SUBSTITUTION] max_time in filters: {'max_time' in sql_filters}")
+        if 'max_time' in sql_filters:
+            logger.debug(f"[SQL SUBSTITUTION] max_time value: {sql_filters['max_time']}")
 
         # Substitute :recipe_ids placeholder
         if candidate_ids and ":recipe_ids" in sql:
             formatted_ids = ", ".join(f"'{cid}'" for cid in candidate_ids)
             sql = re.sub(r":recipe_ids\b", formatted_ids, sql)
 
-        # Substitute :user_uid placeholder
+        # Substitute :user_uid placeholder (or %(user_uid)s fallback)
         user_uid = session_context.get("user_uid")
-        if user_uid and ":user_uid" in sql:
-            sql = re.sub(r":user_uid\b", f"'{user_uid}'", sql)
+        if user_uid:
+            if ":user_uid" in sql:
+                sql = re.sub(r":user_uid\b", f"'{user_uid}'", sql)
+            elif "%(user_uid)" in sql:
+                sql = re.sub(r"%\(user_uid\)s?", f"'{user_uid}'", sql)
 
-        # Substitute :max_time placeholder
+        # Substitute :max_time placeholder (or %(max_time)s fallback)
         max_time = sql_filters.get("max_time")
-        if max_time and ":max_time" in sql:
-            # Handle string values like "short", "quick" - convert to minutes
-            if isinstance(max_time, str):
-                time_map = {"quick": 20, "short": 30, "medium": 45, "long": 90}
-                max_time = time_map.get(max_time.lower(), 30)
-            sql = re.sub(r":max_time\b", str(max_time), sql)
+        # Handle None case by using a very large default value (effectively no limit)
+        # This is simpler than removing the entire AND clause
+        actual_max_time = max_time if max_time else 999999
 
-        # Substitute :language_id placeholder
+        # Handle string values like "short", "quick" - convert to minutes
+        if isinstance(actual_max_time, str):
+            time_map = {"quick": 20, "short": 30, "medium": 45, "long": 90}
+            actual_max_time = time_map.get(actual_max_time.lower(), 30)
+
+        # Try :max_time format first
+        if ":max_time" in sql:
+            sql = re.sub(r":max_time\b", str(actual_max_time), sql)
+        # Fallback for %(max_time)s format (LLM sometimes generates this)
+        # Note: No \b at end since ) is not a word character
+        elif "%(max_time)" in sql:
+            sql = re.sub(r"%\(max_time\)s?", str(actual_max_time), sql)
+
+        # Substitute :language_id placeholder (or %(language_id)s fallback)
         language = session_context.get("language")
-        if language and ":language_id" in sql:
-            sql = re.sub(r":language_id\b", f"'{language}'", sql)
+        if language:
+            if ":language_id" in sql:
+                sql = re.sub(r":language_id\b", f"'{language}'", sql)
+            elif "%(language_id)" in sql:
+                sql = re.sub(r"%\(language_id\)s?", f"'{language}'", sql)
+
+        # Handle difficulty parameter (optional)
+        # When None, substitute with all possible values (effectively no filter)
+        difficulty = sql_filters.get("difficulty")
+        if not difficulty:
+            # When no difficulty specified, use all values (no filter)
+            # The LLM may have generated: AND r."difficulty" IN ('easy', 'medium', 'hard')
+            # We can leave it as is since it's a complete list, or remove it entirely
+            # For simplicity, we leave it - it's harmless
+            pass
+        else:
+            # Convert to list if it's a single value
+            if isinstance(difficulty, str):
+                difficulty = [difficulty]
+            # Format as SQL IN clause values
+            difficulty_values = ", ".join(f"'{d}'" for d in difficulty)
+            if ":difficulty" in sql:
+                sql = re.sub(r":difficulty\b", difficulty_values, sql)
+            elif "%(difficulty)" in sql:
+                sql = re.sub(r"%\(difficulty\)s?", difficulty_values, sql)
 
         # Fix unquoted UUIDs in IN clauses (LLM sometimes forgets to quote them)
         # Pattern matches: r."id" IN (uuid1, uuid2, ...) where uuids are NOT quoted
@@ -612,13 +685,22 @@ class SQLExecutionService:
 
         Args:
             sql: SQL query to execute
-            params: Query parameters (for logging only, SQL is pre-parameterized)
+            params: Query parameters to substitute in the SQL
 
         Returns:
             Dictionary with results and metadata
         """
         try:
-            result = self.db.execute(text(sql))
+            if params:
+                # Substitute parameters using string formatting for compatibility
+                # This is safe because the SQL has been validated and sanitized
+                formatted_sql = sql
+                for key, value in params.items():
+                    formatted_sql = formatted_sql.replace(f":{key}", f"'{value}'")
+                result = self.db.execute(text(formatted_sql))
+            else:
+                result = self.db.execute(text(sql))
+
             rows = result.fetchall()
             columns = result.keys()
 
@@ -639,91 +721,3 @@ class SQLExecutionService:
                 "sql": sql
             }
 
-    def execute_with_fallback(
-        self,
-        sql_generation_result: SQLGenerationResult,
-        language_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Execute SQL with automatic fallback on error
-
-        Args:
-            sql_generation_result: Result from SQL generation stage
-            language_id: Optional language ID filter (e.g., 'en', 'no')
-
-        Returns:
-            Execution results or fallback results
-        """
-        import logging
-        logger = logging.getLogger(__name__)
-
-        if not sql_generation_result.is_safe:
-            # Return error result
-            logger.error(f"[SQL EXECUTOR] SQL validation failed - using fallback. language_id={language_id}")
-            return {
-                "success": False,
-                "error": "SQL validation failed",
-                "explanation": sql_generation_result.explanation,
-                "fallback_used": True
-            }
-
-        # Try executing generated SQL
-        logger.warning(f"[SQL EXECUTOR] Executing generated SQL... language_id={language_id}")
-        result = self.execute_sql(sql_generation_result.sql)
-
-        if not result["success"]:
-            # Log the failure
-            logger.error(f"[SQL EXECUTOR] ❌ SQL EXECUTION FAILED - switching to FALLBACK")
-            logger.error(f"[SQL EXECUTOR] Error: {result.get('error')}")
-            logger.error(f"[SQL EXECUTOR] Failed SQL (first 200 chars): {sql_generation_result.sql[:200]}")
-
-            # Fallback: simple SELECT with language filter
-            fallback_sql = self._generate_fallback_sql(language_id)
-            logger.warning(f"[SQL EXECUTOR] Using FALLBACK SQL... language_id={language_id}")
-            logger.warning(f"[SQL EXECUTOR] Fallback SQL (first 200 chars): {fallback_sql[:200]}")
-
-            fallback_result = self.execute_sql(fallback_sql)
-
-            if not fallback_result["success"]:
-                logger.error(f"[SQL EXECUTOR] ❌ FALLBACK SQL ALSO FAILED: {fallback_result.get('error')}")
-            else:
-                logger.warning(f"[SQL EXECUTOR] ✓ Fallback SQL succeeded - returned {fallback_result.get('row_count', 0)} rows")
-
-            return {
-                **fallback_result,
-                "original_error": result["error"],
-                "fallback_used": True,
-                "explanation": f"Original query failed, using fallback. {sql_generation_result.explanation}"
-            }
-
-        logger.warning(f"[SQL EXECUTOR] ✓ Generated SQL succeeded - returned {result.get('row_count', 0)} rows")
-        result["explanation"] = sql_generation_result.explanation
-        result["fallback_used"] = False
-
-        return result
-
-    def _generate_fallback_sql(self, language_id: Optional[str] = None) -> str:
-        """Generate safe fallback SQL query"""
-        # Build WHERE clause conditions
-        where_conditions = [
-            'r."deletedAt" IS NULL',
-            'r."status" = \'published\'',
-            '(r."private" = false OR br."bundleId" IS NOT NULL)',
-            'r.embedding IS NOT NULL'
-        ]
-
-        # Add language filter if provided
-        if language_id:
-            where_conditions.insert(1, f'r."languageId" = \'{language_id}\'')
-
-        where_clause = '\n  AND '.join(where_conditions)
-
-        return f"""
-        SELECT DISTINCT r."id", r."name", r."ingress", r."difficulty",
-               (r."prepTime" + r."cookTime") as total_time,
-               r."image", r."servings"
-        FROM recipe r
-        LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
-        WHERE {where_clause}
-        LIMIT 20
-        """

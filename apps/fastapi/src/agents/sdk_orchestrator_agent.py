@@ -2,9 +2,17 @@
 Orchestrator Agent - Main coordinator using OpenAI Agents SDK with handoffs
 Routes user queries to the appropriate specialist agent or handles directly
 """
+import os
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from agents import Agent, InputGuardrail, GuardrailFunctionOutput, Runner, AgentOutputSchema
+
+load_dotenv()
+
+# Model configuration from environment
+ORCHESTRATOR_AGENT_MODEL = os.getenv('ORCHESTRATOR_AGENT_MODEL', 'gpt-5-mini')
+COOKING_GUARDRAIL_MODEL = os.getenv('COOKING_GUARDRAIL_MODEL', 'gpt-5-mini')
 
 # Import specialist agents
 from apps.fastapi.src.agents.sdk_nlid_agent import nlid_agent, IntentOutput
@@ -32,6 +40,7 @@ class CookingRelatedOutput(BaseModel):
 
 cooking_guardrail_agent = Agent(
     name="CookingGuardrail",
+    model=COOKING_GUARDRAIL_MODEL,
     instructions="""You are a guardrail that checks if a user query is related to cooking, recipes, food, or kitchen activities.
 
 A query is cooking-related if it mentions:
@@ -40,6 +49,7 @@ A query is cooking-related if it mentions:
 - Nutrition, diets, allergies, substitutions
 - Kitchen tools, techniques, methods
 - Meal planning, food preparation
+- **Price, cost, budget of ingredients or food items** (e.g., "cost of wheat flour", "price of tomatoes")
 
 Examples of cooking-related queries:
 - "Find chicken recipes"
@@ -47,6 +57,8 @@ Examples of cooking-related queries:
 - "What's for dinner?"
 - "Is this healthy?"
 - "Substitute for eggs"
+- "What is the cost of wheat flour?"
+- "Price of tomatoes"
 
 Examples of NON-cooking queries:
 - "What's the weather?"
@@ -88,6 +100,7 @@ async def cooking_guardrail(ctx, agent, input_data):
 
 orchestrator_agent = Agent(
     name="OrchestratorAgent",
+    model=ORCHESTRATOR_AGENT_MODEL,
     instructions="""You are the main cooking assistant coordinator for a recipe and food platform.
 
 Your role is to help users with their cooking-related questions by either:
