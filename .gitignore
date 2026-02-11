@@ -13,10 +13,11 @@ __pycache__/
 .vscode/
 .claudeignore
 SONARQUBE_README.MD
-AGENTS.md
+AGENTS.mds
 sonar-project.properties
 **/__pycache__/
 **/*.pyc
 documents
 logs/
 extras
+db_backup.sql
