@@ -302,9 +302,11 @@ CRITICAL RULES:
 6. ALWAYS include: r."deletedAt" IS NULL AND r."status" = 'published'
 7. Access control: r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL
 8. ALWAYS add LIMIT clause (default 20)
-9. When candidate_ids provided: Use WHERE r."id" IN (:recipe_ids) - NO ingredient EXISTS needed
+9. CRITICAL: When candidate_ids placeholder (:recipe_ids) is present:
+   - DO NOT add included_ingredients EXISTS clauses (embedding search already handled ingredient matching semantically)
+   - BUT: ALWAYS add excluded_ingredients (allergies) NOT EXISTS clauses, even with candidate_ids! This filters out allergens from the embedding results.
 10. For allergies (exclude ingredients): NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%allergen%')
-11. For included ingredients: EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%ingredient%')
+11. For included ingredients (ONLY when NO candidate_ids): EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%ingredient%')
 12. For tags (vegetarian, vegan, etc.): EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name = 'tag_name')
 13. When filtering by multiple tags, use OR within EXISTS: EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name = 'vegetarian' OR t.name = 'vegan'))
 14. Return ONLY SQL in ```sql blocks, no explanations
@@ -383,27 +385,31 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         if sql_filters.get("excluded_ingredients"):
             parts.append(f"- Exclude ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
 
-        if sql_filters.get("included_ingredients"):
+        # IMPORTANT: Only show included_ingredients if we DON'T have candidate_ids
+        # When candidate_ids are provided, embedding search already handled ingredient matching semantically
+        if not candidate_ids and sql_filters.get("included_ingredients"):
             ingredients = sql_filters['included_ingredients']
             parts.append(f"- Include ingredients: {', '.join(ingredients)}")
             parts.append(f"  CRITICAL: These are SYNONYMS (alternative names for the same ingredient).")
             parts.append(f"  Use EXISTS to find recipes that CONTAIN these ingredients")
 
-            # Only add EXISTS clause instruction if we DON'T have candidate_ids
-            # When candidate_ids are provided, the semantic search already found relevant recipes
-            # Adding EXISTS clause would be redundant and too restrictive
-            if not candidate_ids:
-                # Build example with available ingredients (handle single ingredient case)
-                if len(ingredients) >= 2:
-                    example = f"  Use OR within a single EXISTS clause: EXISTS (... WHERE i.\"name\" ILIKE '%{ingredients[0]}%' OR i.\"name\" ILIKE '%{ingredients[1]}%' ...)"
-                else:
-                    example = f"  Use EXISTS clause: EXISTS (... WHERE i.\"name\" ILIKE '%{ingredients[0]}%')"
-                parts.append(example)
-                parts.append(f"  DO NOT use multiple EXISTS with AND - that requires ALL ingredients to be present!")
-                parts.append(f"  DO NOT use NOT EXISTS - that would exclude recipes with these ingredients!")
+            # Build example with available ingredients (handle single ingredient case)
+            if len(ingredients) >= 2:
+                example = f"  Use OR within a single EXISTS clause: EXISTS (... WHERE i.\"name\" ILIKE '%{ingredients[0]}%' OR i.\"name\" ILIKE '%{ingredients[1]}%' ...)"
             else:
-                parts.append(f"  NOTE: Ingredient EXISTS clause NOT needed - candidate_ids already filtered by semantic search")
-                parts.append(f"  DO NOT add ingredient filtering when candidate_ids are provided")
+                example = f"  Use EXISTS clause: EXISTS (... WHERE i.\"name\" ILIKE '%{ingredients[0]}%')"
+            parts.append(example)
+            parts.append(f"  DO NOT use multiple EXISTS with AND - that requires ALL ingredients to be present!")
+            parts.append(f"  DO NOT use NOT EXISTS - that would exclude recipes with these ingredients!")
+        elif candidate_ids and sql_filters.get("included_ingredients"):
+            # candidate_ids present but included_ingredients in filters - log warning
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"[SQL GENERATOR] candidate_ids present but included_ingredients in filters - will ignore included_ingredients")
+            parts.append(f"  NOTE: included_ingredients ignored - candidate_ids provided, embedding search already handled ingredient matching")
+        elif not candidate_ids and not sql_filters.get("included_ingredients"):
+            # No candidate_ids and no included_ingredients - standalone search with no ingredients
+            pass  # No special instructions needed
 
         if session_context.get("language"):
             language = session_context['language']
@@ -422,7 +428,16 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             parts.append(f"- ONLY these recipe IDs: {', '.join(candidate_ids[:10])}")
             parts.append(f"- CRITICAL: Use WHERE r.\"id\" IN (:recipe_ids) placeholder (with parentheses)")
             parts.append(f"- The (:recipe_ids) placeholder will be automatically replaced with ('uuid1', 'uuid2', ...)")
-            parts.append(f"- DO NOT manually list UUIDs - use the placeholder!")
+
+        # Add excluded ingredients (allergies) - ALWAYS apply even with candidate_ids
+        if sql_filters.get("excluded_ingredients"):
+            if candidate_ids:
+                parts.append(f"\n## Allergy Exclusion (CRITICAL)")
+                parts.append(f"- EXCLUDE recipes containing these ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
+                parts.append(f"- Add NOT EXISTS clause for EACH excluded ingredient")
+                parts.append(f"- Example for garlic: AND NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri.\"ingredientId\" = i.\"id\" WHERE ri.\"recipeId\" = r.\"id\" AND i.\"name\" ILIKE '%garlic%')")
+            else:
+                parts.append(f"- Exclude ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
 
         parts.append("\n## Task")
         parts.append("Generate a PostgreSQL SELECT query to retrieve recipes matching the criteria above.")

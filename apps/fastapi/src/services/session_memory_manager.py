@@ -11,6 +11,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Module-level cache for session state persistence across requests
+# This ensures context is preserved when SessionMemoryManager is instantiated multiple times
+_MODULE_MEMORY_CACHE: Dict[str, Any] = {}  # Will hold SessionState objects
+
 
 class SkillLevel(str, Enum):
     """User skill level"""
@@ -175,7 +179,9 @@ class SessionMemoryManager:
             redis_url: Redis connection URL (required if use_redis=True)
         """
         self.use_redis = use_redis
-        self._memory_cache: Dict[str, SessionState] = {}  # In-memory fallback
+        # Use module-level cache for persistence across all instances
+        # This is critical because each API request creates a new SessionMemoryManager instance
+        self._memory_cache = _MODULE_MEMORY_CACHE
 
         if use_redis and redis_url:
             try:
@@ -214,44 +220,40 @@ class SessionMemoryManager:
         # Try to get existing session from cache (this preserves context_entities)
         cached_session = self.get_session(session_id)
         if cached_session:
+            logger.info(f"[SESSION CACHE] Loading from cache with context: {cached_session.context_entities}")
+            logger.info(f"[SESSION CACHE] last_vector_query from cache: {cached_session.context_entities.last_vector_query}")
+
             # Update user_uid if provided (overwrite existing value)
             if user_uid:
                 cached_session.user_uid = user_uid
-            # If we have context_entities, preserve them
-            if hasattr(cached_session, 'context_entities') and cached_session.context_entities:
-                # Keep the existing context and just update conversation history
-                existing_context = cached_session.context_entities
-                # Create a new session but preserve context
-                session = SessionState(
-                    session_id=session_id,
-                    user_uid=user_uid or cached_session.user_uid,
-                    language=language or cached_session.language
-                )
-                # Restore the preserved context
-                session.context_entities = existing_context
-                session.last_intent = cached_session.last_intent
-                session.turn_count = cached_session.turn_count
-            else:
-                session = cached_session
 
             # Update conversation history from database
             messages = conversation_store.get_messages(session_id, limit=10) if conversation_store else []
-            session.conversation_history.clear()
+            cached_session.conversation_history.clear()
+
+            has_metadata = False
             for msg in messages:
-                session.conversation_history.append({
+                cached_session.conversation_history.append({
                     "role": msg.role,
                     "content": msg.content,
                     "timestamp": msg.created_at.isoformat() if msg.created_at else None,
                     "meta": msg.meta  # Include metadata which contains vector_query info
                 })
+                if msg.meta:
+                    has_metadata = True
+
+            # If conversation history has metadata but cached context is empty, restore it
+            if has_metadata and not cached_session.context_entities.last_vector_query:
+                logger.info(f"[SESSION CACHE] Has metadata but empty context - running extraction")
+                logger.info(f"[SESSION CACHE] Number of messages with metadata: {sum(1 for msg in messages if msg.meta)}")
+                cached_session = self._extract_context_from_conversation(cached_session, messages)
 
             # Save back to cache
-            self.save_session(session)
-            return session
+            self.save_session(cached_session)
+            return cached_session
 
         # Check if session exists in the database and load history
         if conversation_store:
-            from apps.fastapi import logger
             db_session = conversation_store.get_session(session_id)
             if db_session:
                 logger.info(f"[SESSION MEMORY] Loading existing session {session_id} from database with conversation history")
@@ -284,7 +286,6 @@ class SessionMemoryManager:
                 return session
 
         # Create new session
-        from apps.fastapi import logger
         logger.info(f"[SESSION MEMORY] Creating new session {session_id}")
         session = SessionState(
             session_id=session_id,
@@ -302,9 +303,8 @@ class SessionMemoryManager:
         """
         Extract context from previous conversation messages.
 
-        This is a simple heuristic-based approach. It looks for patterns
-        in the conversation to extract things like excluded ingredients
-        (allergies), included ingredients, and other preferences.
+        This first tries to restore context from message metadata (meta field).
+        If metadata is not available, falls back to keyword-based extraction.
 
         Args:
             session: SessionState to update
@@ -313,63 +313,132 @@ class SessionMemoryManager:
         Returns:
             Updated SessionState
         """
-        # Simple keyword-based extraction
-        # In a production system, you might want to use the LLM to extract
-        # this context, or store it in the session metadata
+        logger.info(f"[CONTEXT EXTRACT] Starting extraction from {len(messages)} messages")
+        logger.info(f"[CONTEXT EXTRACT] Current last_vector_query: {session.context_entities.last_vector_query}")
 
-        for msg in messages:
-            content = msg.content.lower()
-            role = msg.role
+        # First pass: Try to restore context from message metadata
+        # The meta field contains vector_query, intent, and other search context
+        for msg in reversed(messages):  # Start from most recent
+            # Check if metadata is available
+            if hasattr(msg, 'meta') and msg.meta:
+                meta = msg.meta
+                # Handle both direct metadata and nested metadata structure
+                if isinstance(meta, dict):
+                    # Check for direct fields
+                    vector_query = meta.get('vector_query')
+                    intent = meta.get('intent')
+                    filters = meta.get('filters')
 
-            # Only extract from user messages
-            if role != "user":
-                continue
+                    # Also check for nested metadata (some responses have nested structure)
+                    if not vector_query and 'metadata' in meta:
+                        nested_meta = meta.get('metadata', {})
+                        vector_query = nested_meta.get('vector_query')
+                        intent = nested_meta.get('intent')
+                        filters = nested_meta.get('filters')
 
-            # Extract recipe search context from conversation
-            # Look for recipe-related queries
-            recipe_keywords = [
-                "recipes", "recipe", "cook", "cooking", "make", "prepare",
-                "suggest", "find", "show me", "what is", "how to make"
-            ]
+                    # Restore last_vector_query if found
+                    if vector_query and not session.context_entities.last_vector_query:
+                        session.context_entities.last_vector_query = vector_query
+                        logger.info(f"[CONTEXT RESTORE] Restored last_vector_query from metadata: {vector_query}")
 
-            # Check if this is a recipe search query
-            is_recipe_search = any(keyword in content for keyword in recipe_keywords)
+                    # Restore last_intent if found
+                    if intent and intent == "recipe_search" and not session.last_intent:
+                        session.last_intent = intent
+                        logger.info(f"[CONTEXT RESTORE] Restored last_intent from metadata: {intent}")
 
-            if is_recipe_search:
-                # Try to extract main ingredient/dish from the query
-                # Simple approach: look for common ingredients/dishes
-                common_ingredients = [
-                    "pasta", "rice", "chicken", "beef", "fish", "potato", "tomato",
-                    "onion", "garlic", "chole", "chickpeas", "dal", "curry",
-                    "pizza", "burger", "salad", "soup", "bread", "egg"
-                ]
+                    # Restore filters if found
+                    if filters and isinstance(filters, dict):
+                        if not session.context_entities.last_search_filters:
+                            session.context_entities.last_search_filters = filters
+                            logger.info(f"[CONTEXT RESTORE] Restored filters from metadata: {list(filters.keys())}")
 
-                for ingredient in common_ingredients:
-                    if ingredient in content:
-                        # Set this as the last vector query for refinement
-                        session.context_entities.last_vector_query = ingredient
-                        break
+                        # Restore excluded ingredients (allergies)
+                        excluded_ingredients = filters.get('excluded_ingredients', [])
+                        if excluded_ingredients:
+                            for ingredient in excluded_ingredients:
+                                if ingredient and ingredient not in session.excluded_ingredients:
+                                    session.excluded_ingredients.append(ingredient)
 
-            # Look for allergy patterns
-            # This is a simple regex-based approach
+                        # Restore included ingredients (preferences)
+                        included_ingredients = filters.get('included_ingredients', [])
+                        if included_ingredients:
+                            for ingredient in included_ingredients:
+                                if ingredient and ingredient not in session.included_ingredients:
+                                    session.included_ingredients.append(ingredient)
+
+                        # Restore dietary tags
+                        tags = filters.get('tags', [])
+                        if tags and tags not in session.filters.tags:
+                            session.filters.tags.extend(tags)
+
+                        # Restore cuisines
+                        cuisines = filters.get('cuisines', [])
+                        if cuisines:
+                            for cuisine in cuisines:
+                                if cuisine and cuisine not in session.filters.cuisines:
+                                    session.filters.cuisines.append(cuisine)
+
+                # Break after finding the most recent assistant message with metadata
+                # (Assistant messages typically have the most complete metadata)
+                if msg.role == "assistant" and session.context_entities.last_vector_query:
+                    break
+
+        # Second pass: If no metadata found, use keyword-based extraction as fallback
+        # This maintains backward compatibility with older messages that don't have metadata
+        if not session.context_entities.last_vector_query:
             import re
 
-            # "allergic to X", "I'm allergic to X", "allergy: X"
-            allergy_patterns = [
-                r"allergic to (\w+(?:\s+\w+)*)",
-                r"allergy[:\s]+(\w+(?:\s+\w+)*)",
-                r"can't have (\w+(?:\s+\w+)*)",
-                r"cannot have (\w+(?:\s+\w+)*)",
-                r"no (\w+(?:\s+\w+)*)(?:\s+please)?",
-            ]
+            for msg in messages:
+                content = msg.content.lower()
+                role = msg.role
 
-            for pattern in allergy_patterns:
-                matches = re.finditer(pattern, content)
-                for match in matches:
-                    ingredient = match.group(1).strip().lower()
-                    if ingredient and ingredient not in ["no", "not", "dont", "don't"]:
-                        if ingredient not in session.excluded_ingredients:
-                            session.excluded_ingredients.append(ingredient)
+                # Only extract from user messages for keyword fallback
+                if role != "user":
+                    continue
+
+                # Extract recipe search context from conversation
+                # Look for recipe-related queries
+                recipe_keywords = [
+                    "recipes", "recipe", "cook", "cooking", "make", "prepare",
+                    "suggest", "find", "show me", "what is", "how to make"
+                ]
+
+                # Check if this is a recipe search query
+                is_recipe_search = any(keyword in content for keyword in recipe_keywords)
+
+                if is_recipe_search:
+                    # Try to extract main ingredient/dish from the query
+                    # Simple approach: look for common ingredients/dishes
+                    common_ingredients = [
+                        "pasta", "rice", "chicken", "beef", "fish", "potato", "tomato",
+                        "onion", "garlic", "chole", "chickpeas", "dal", "curry",
+                        "pizza", "burger", "salad", "soup", "bread", "egg"
+                    ]
+
+                    for ingredient in common_ingredients:
+                        if ingredient in content:
+                            # Set this as the last vector query for refinement
+                            session.context_entities.last_vector_query = ingredient
+                            break
+
+                # Look for allergy patterns
+                # This is a simple regex-based approach
+                # "allergic to X", "I'm allergic to X", "allergy: X"
+                allergy_patterns = [
+                    r"allergic to (\w+(?:\s+\w+)*)",
+                    r"allergy[:\s]+(\w+(?:\s+\w+)*)",
+                    r"can't have (\w+(?:\s+\w+)*)",
+                    r"cannot have (\w+(?:\s+\w+)*)",
+                    r"no (\w+(?:\s+\w+)*)(?:\s+please)?",
+                ]
+
+                for pattern in allergy_patterns:
+                    matches = re.finditer(pattern, content)
+                    for match in matches:
+                        ingredient = match.group(1).strip().lower()
+                        if ingredient and ingredient not in ["no", "not", "dont", "don't"]:
+                            if ingredient not in session.excluded_ingredients:
+                                session.excluded_ingredients.append(ingredient)
 
         return session
 
@@ -419,6 +488,15 @@ class SessionMemoryManager:
                 print(f"Redis save failed: {e}")
 
         self._memory_cache[session.session_id] = session
+
+        # Cleanup old sessions from cache periodically (simple LRU-style cleanup)
+        # Keep cache size manageable
+        if len(self._memory_cache) > 1000:
+            # Remove oldest 100 entries when cache gets too large
+            keys_to_remove = list(self._memory_cache.keys())[:100]
+            for key in keys_to_remove:
+                del self._memory_cache[key]
+            logger.info(f"[SESSION CACHE] Cleaned up {len(keys_to_remove)} old sessions from cache")
 
     def delete_session(self, session_id: str):
         """Delete session"""
