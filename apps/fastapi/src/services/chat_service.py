@@ -322,6 +322,18 @@ class ChatService:
                     for r in recipes
                 ]
 
+            # Add search context to assistant metadata for future refinements
+            # This ensures the vector_query is persisted across requests
+            # Note: pipeline_metadata is at root level of result, not nested under metadata
+            pipeline_metadata = result.get("pipeline_metadata", {})
+            if pipeline_metadata and pipeline_metadata.get("vector_query"):
+                # Merge pipeline metadata into assistant metadata
+                assistant_metadata.update({
+                    "vector_query": pipeline_metadata.get("vector_query"),
+                    "intent": pipeline_metadata.get("intent"),
+                    "filters": pipeline_metadata.get("filters", {})
+                })
+
             assistant_msg = self.conversation_store.add_message(
                 session.id,
                 "assistant",

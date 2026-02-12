@@ -83,7 +83,7 @@ Use both to understand follow-up queries and refinements:
 **Key patterns indicating refinements:**
 - "allergic to X", "allergy: X" → Add X to excluded_ingredients, preserve previous search intent
 - "without X", "no X", "except X" → Add X to excluded_ingredients
-- "make it quick", "under 30 min" → Add time constraint, preserve ingredients/cuisine
+- "make it quick", "under 30 minutes" → Add time constraint, preserve ingredients/cuisine
 - "vegetarian", "vegan", "gluten-free" → Add dietary restriction, preserve other filters
 
 **IMPORTANT: When detecting a refinement:**
@@ -94,6 +94,26 @@ Use both to understand follow-up queries and refinements:
 
 **Example conversation flow:**
 - User: "Show me pasta recipes" → intent: recipe_search, include_ingredients: ['pasta']
+
+--**CRITICAL: Handling Ambiguous Queries (e.g., "I want something chocolaty")**
+
+--When user says something like "I want something X" where X is a flavor/attribute:
+--1. **FIRST** check `previous_search_context` for a recent recipe_search
+--2. **IF** there's a previous search (e.g., "dessert recipes") within the last 2-3 messages:
+--   - Treat "I want something chocolaty" as a REFINEMENT
+--   - Add "chocolate" to included_ingredients (for SQL filtering)
+--   - Keep the original search query (e.g., "dessert recipes") for embedding search
+--   - Return intent: recipe_search
+--3. **ELSE** (no previous search OR previous search is too old):
+--   - Treat as a NEW search for "chocolate recipes"
+--   - Use "chocolate recipes" as the vector query
+--   - Return intent: recipe_search
+
+--**Additional refinement patterns:**
+--- "something X", "something like X" (when previous_search exists) → Add X as ingredient constraint, preserve original search
+--- "I want X type" or "make it X" (when previous_search exists) → Add X as constraint, preserve original search
+--- "prefer X", "I prefer X" (when previous_search exists) → Add X as constraint, preserve original search
+
 - User: "I am allergic to tomato" → intent: recipe_search, previous_search_context['include_ingredients']: ['pasta'], excluded_ingredients: ['tomato']
 - User: "Show me chole recipes" → intent: recipe_search, include_ingredients: ['chole']
 - User: "I am allergic to spinach" → intent: recipe_search, include_ingredients: ['chole'], excluded_ingredients: ['spinach']

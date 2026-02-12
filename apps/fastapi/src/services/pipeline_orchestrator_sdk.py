@@ -379,7 +379,10 @@ class RecipeSearchPipelineSDK:
                         if excluded_ingredients:
                             if "excluded_ingredients" not in nlid_result_dict["filters"]:
                                 nlid_result_dict["filters"]["excluded_ingredients"] = []
-                            nlid_result_dict["filters"]["excluded_ingredients"].extend(excluded_ingredients)
+                            # Deduplicate before extending to avoid duplicates
+                            current_excluded = set(nlid_result_dict["filters"]["excluded_ingredients"])
+                            new_excluded = [ing for ing in excluded_ingredients if ing not in current_excluded]
+                            nlid_result_dict["filters"]["excluded_ingredients"].extend(new_excluded)
 
                             # Save allergies to session for future queries
                             for allergy in excluded_ingredients:
@@ -414,9 +417,13 @@ class RecipeSearchPipelineSDK:
                             top_k=20
                         )
 
+                        # Debug: log retrieval plan contents
                         logger.info(f"[REFINEMENT] Created new retrieval plan with constraints")
                         logger.info(f"[REFINEMENT] Vector query: {retrieval_plan.vector_query}")
-                        logger.info(f"[REFINEMENT] SQL filters: {list(retrieval_plan.sql_filters.keys()) if retrieval_plan.sql_filters else 'None'}")
+                        logger.info(f"[REFINEMENT] SQL filters: {dict(retrieval_plan.sql_filters)}")
+                        logger.info(f"[REFINEMENT] SQL filters excluded_ingredients: {retrieval_plan.sql_filters.get('excluded_ingredients', [])}" if retrieval_plan.sql_filters else None)
+                        logger.info(f"[REFINEMENT] Vector query: {retrieval_plan.vector_query}")
+                        logger.info(f"[REFINEMENT] SQL filters: {retrieval_plan.sql_filters}")
                     else:
                         # Standalone preference - search for recipes with this preference
                         logger.info(f"[PREFERENCE] Standalone preference - searching with constraints")
@@ -491,6 +498,18 @@ class RecipeSearchPipelineSDK:
                         # Continue with normal recipe search flow
                         logger.info(f"[PREFERENCE] Will search with constraints")
 
+            # Finalize the retrieval_plan to use for the rest of the pipeline
+            # If the refinement path created a new plan, use it; otherwise use the original plan
+            # This ensures we don't lose the refinement plan created above
+            if 'retrieval_plan' in locals() and isinstance(locals()['retrieval_plan'], RetrievalPlan):
+                # refinement_path_created_plan is a local variable from the if block above
+                pass  # Keep the plan created in the refinement/standalone logic
+            else:
+                # No plan created yet, will use the original retrieval_plan from strategy_decider
+                pass
+
+            # ============ STAGE 4+5+6: Embedding Search + Schema + SQL Generation ============
+
             # ============ STAGE 4+5+6: Embedding Search + Schema + SQL Generation ============
             # For HYBRID_VECTOR_TO_SQL: Wait for embedding search first, then generate SQL with candidate_ids
             # For other strategies: Can run in parallel
@@ -528,6 +547,7 @@ class RecipeSearchPipelineSDK:
 
                 # Step 3: SQL generation WITH candidate_ids (filters the embedding candidates)
                 logger.info(f"[HYBRID] Generating SQL to filter {len(candidate_ids)} embedding candidates...")
+                logger.info(f"[HYBRID] Passing sql_filters to generator: {retrieval_plan.sql_filters}")
                 sql_result = self.sql_generator.generate_sql(
                     query,
                     nlid_result_dict,
@@ -762,6 +782,14 @@ class RecipeSearchPipelineSDK:
             logger.info(f"[PIPELINE COMPLETE] Total time: {time.time() - pipeline_start_time:.3f}s | Results: {len(final_recipes)} recipes")
             logger.info("=" * 80)
 
+            # Prepare pipeline metadata for conversation storage
+            # This ensures search context is persisted across requests
+            pipeline_metadata = {
+                "vector_query": getattr(retrieval_plan, 'vector_query', None),
+                "intent": nlid_result_dict.get("intent"),
+                "filters": getattr(retrieval_plan, 'sql_filters', {})
+            }
+
             # Update session with the last search query for future refinements
             # Only save if this is a new recipe search, not a refinement
             if nlid_result_dict.get("intent") == "recipe_search" and retrieval_plan.vector_query:
@@ -796,7 +824,8 @@ class RecipeSearchPipelineSDK:
 
             return {
                 "response": response,
-                "metadata": metadata
+                "metadata": metadata,
+                "pipeline_metadata": pipeline_metadata  # For conversation context persistence
             }
 
         except Exception as e:
@@ -814,7 +843,8 @@ class RecipeSearchPipelineSDK:
             error_response = f"I apologize, but I encountered an error processing your request. Please try again."
             return {
                 "response": error_response,
-                "metadata": {"error": str(e), "pipeline_duration_ms": round(error_time * 1000, 2)}
+                "metadata": {"error": str(e), "pipeline_duration_ms": round(error_time * 1000, 2)},
+                "pipeline_metadata": {}
             }
 
     async def _generate_sdk_response(
@@ -1229,15 +1259,15 @@ class RecipeSearchPipelineSDK:
             else:
                 contextual_query = "recipes"
 
-            # Add new allergies
-            if excluded_ingredients:
-                context_excluded = list(session.excluded_ingredients) + excluded_ingredients
-                if context_excluded:
-                    contextual_query += f" without {context_excluded[0]}"
-                    if len(context_excluded) > 1:
-                        contextual_query += f" or {' or '.join(context_excluded[1:])}"
+            # CRITICAL: Do NOT add allergies to the vector query
+            # Allergies should only be applied as SQL filters (excluded_ingredients)
+            # The embedding search should find semantically similar recipes based on the original query
+            # Then SQL will filter out recipes containing the allergens
+            # This prevents the issue where "garlic" gets embedded and finds garlic-containing recipes
 
             logger.info(f"[CONTEXTUAL QUERY] Built from previous search context: {contextual_query}")
+            if excluded_ingredients:
+                logger.info(f"[CONTEXTUAL QUERY] Excluded ingredients (allergies) will be applied as SQL filters, NOT in embedding query: {excluded_ingredients}")
             return contextual_query
 
         # Fallback: Build from conversation history
