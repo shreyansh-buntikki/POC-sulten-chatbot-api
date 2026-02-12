@@ -14,6 +14,9 @@ from models import (
     IngredientMacros, IngredientMicros, MeasuringUnit, IngredientPricing, Country, Currency
 )
 
+# Import logger from fastapi app
+from apps.fastapi import logger
+
 
 # =====================================================
 # Recipe Search Tools
@@ -39,9 +42,6 @@ def search_recipes_by_embedding(
     Returns:
         List of (Recipe, similarity_score) tuples
     """
-    # Debug logging
-    import logging
-    logger = logging.getLogger(__name__)
 
     from apps.fastapi.src.services.embedding_service import EmbeddingService
 
@@ -597,6 +597,8 @@ def get_ingredient_pricing(
     if not ingredient:
         return None
 
+    logger.info(f"[INGREDIENT_PRICING] Found ingredient: {ingredient.name} (id: {ingredient.id})")
+
     # Build query for pricing
     pricing_query = db.query(IngredientPricing, Country, Currency).join(
         Country, IngredientPricing.countryId == Country.id
@@ -606,16 +608,33 @@ def get_ingredient_pricing(
         IngredientPricing.ingredientId == ingredient.id
     )
 
-    # Filter by country if specified - match exact code or partial (e.g., "India" -> "IND")
+    # First, let's check what countries have pricing for this ingredient
+    all_pricing = db.query(IngredientPricing, Country).join(
+        Country, IngredientPricing.countryId == Country.id
+    ).filter(
+        IngredientPricing.ingredientId == ingredient.id
+    ).all()
+
+    if all_pricing:
+        available_countries = [(p.countryId, c.code, c.name) for p, c in all_pricing]
+        logger.info(f"[INGREDIENT_PRICING] Available countries for {ingredient.name}: {available_countries}")
+    else:
+        logger.info(f"[INGREDIENT_PRICING] No pricing records found for {ingredient.name}")
+
+    # Filter by country if specified - match code or name
     if country_code:
-        # Try exact match first, then partial match
+        logger.info(f"[INGREDIENT_PRICING] Filtering by country: {country_code}")
+        # Try matching against both country code and country name
         pricing_query = pricing_query.filter(
             (Country.code.ilike(country_code)) |
-            (Country.code.ilike(f"%{country_code}%"))
+            (Country.code.ilike(f"%{country_code}%")) |
+            (Country.name.ilike(country_code)) |
+            (Country.name.ilike(f"%{country_code}%"))
         )
 
     # Get all pricing records
     pricing_records = pricing_query.all()
+    logger.info(f"[INGREDIENT_PRICING] Query returned {len(pricing_records)} records")
 
     # Return None instead of empty dict to trigger LLM fallback
     if not pricing_records:
@@ -660,6 +679,317 @@ def get_ingredient_pricing(
     }
 
 
+# Unit conversion factors to base units
+# Weight: base unit is grams (g)
+# Volume: base unit is milliliters (ml)
+# Count: base unit is pieces (x, piece, pcs)
+UNIT_TO_BASE = {
+    # Weight conversions to grams
+    'g': 1.0,
+    'gram': 1.0,
+    'grams': 1.0,
+    'kg': 1000.0,
+    'kilogram': 1000.0,
+    'kilograms': 1000.0,
+    'mg': 0.001,
+    'milligram': 0.001,
+    'oz': 28.3495,
+    'ounce': 28.3495,
+    'ounces': 28.3495,
+    'lb': 453.592,
+    'pound': 453.592,
+    'pounds': 453.592,
+    'lbs': 453.592,
+
+    # Volume conversions to milliliters
+    'ml': 1.0,
+    'milliliter': 1.0,
+    'milliliters': 1.0,
+    'l': 1000.0,
+    'liter': 1000.0,
+    'liters': 1000.0,
+    'litre': 1000.0,
+    'litres': 1000.0,
+    'cup': 236.588,
+    'cups': 236.588,
+    'tbsp': 14.787,
+    'tablespoon': 14.787,
+    'tablespoons': 14.787,
+    'tsp': 4.929,
+    'teaspoon': 4.929,
+    'teaspoons': 4.929,
+    'fl oz': 29.5735,
+    'fluid ounce': 29.5735,
+
+    # Count units (no conversion needed, treated as 1:1)
+    'x': 1.0,
+    'piece': 1.0,
+    'pieces': 1.0,
+    'pcs': 1.0,
+    'whole': 1.0,
+    'clove': 1.0,
+    'cloves': 1.0,
+    'slice': 1.0,
+    'slices': 1.0,
+    'can': 1.0,
+    'cans': 1.0,
+    'bunch': 1.0,
+    'bunches': 1.0,
+    'stalk': 1.0,
+    'stalks': 1.0,
+    'leaf': 1.0,
+    'leaves': 1.0,
+    'sprig': 1.0,
+    'sprigs': 1.0,
+    'head': 1.0,
+    'heads': 1.0,
+    'egg': 1.0,
+    'eggs': 1.0,
+}
+
+# Unit categories for compatibility checking
+WEIGHT_UNITS = {'g', 'gram', 'grams', 'kg', 'kilogram', 'kilograms', 'mg', 'milligram', 'oz', 'ounce', 'ounces', 'lb', 'pound', 'pounds', 'lbs'}
+VOLUME_UNITS = {'ml', 'milliliter', 'milliliters', 'l', 'liter', 'liters', 'litre', 'litres', 'cup', 'cups', 'tbsp', 'tablespoon', 'tablespoons', 'tsp', 'teaspoon', 'teaspoons', 'fl oz', 'fluid ounce'}
+COUNT_UNITS = {'x', 'piece', 'pieces', 'pcs', 'whole', 'clove', 'cloves', 'slice', 'slices', 'can', 'cans', 'bunch', 'bunches', 'stalk', 'stalks', 'leaf', 'leaves', 'sprig', 'sprigs', 'head', 'heads', 'egg', 'eggs'}
+
+
+def get_unit_category(unit: str) -> str:
+    """Get the category of a unit (weight, volume, count)"""
+    unit_lower = unit.lower().strip() if unit else ''
+    if unit_lower in WEIGHT_UNITS:
+        return 'weight'
+    elif unit_lower in VOLUME_UNITS:
+        return 'volume'
+    elif unit_lower in COUNT_UNITS:
+        return 'count'
+    return 'unknown'
+
+
+def convert_units(amount: float, from_unit: str, to_unit: str) -> Optional[float]:
+    """
+    Convert an amount from one unit to another.
+    Returns None if units are incompatible.
+
+    Args:
+        amount: The amount to convert
+        from_unit: Source unit (e.g., 'g', 'kg', 'piece')
+        to_unit: Target unit (e.g., 'kg', 'g', 'piece')
+
+    Returns:
+        Converted amount or None if incompatible
+    """
+    from_unit_lower = from_unit.lower().strip() if from_unit else ''
+    to_unit_lower = to_unit.lower().strip() if to_unit else ''
+
+    # If units are the same, no conversion needed
+    if from_unit_lower == to_unit_lower:
+        return amount
+
+    # Check if both units are in the same category
+    from_category = get_unit_category(from_unit_lower)
+    to_category = get_unit_category(to_unit_lower)
+
+    if from_category == 'unknown' or to_category == 'unknown':
+        # Unknown units - assume 1:1 ratio as fallback
+        return amount
+
+    if from_category != to_category:
+        # Incompatible units (can't convert weight to volume, etc.)
+        # Return None to indicate we should use the amount directly
+        return None
+
+    # Get conversion factors
+    from_factor = UNIT_TO_BASE.get(from_unit_lower, 1.0)
+    to_factor = UNIT_TO_BASE.get(to_unit_lower, 1.0)
+
+    # Convert: amount in from_unit -> base unit -> to_unit
+    base_amount = amount * from_factor
+    converted = base_amount / to_factor
+
+    return converted
+
+
+def calculate_ingredient_cost(
+    recipe_amount: float,
+    recipe_unit: str,
+    price_per_unit: float,
+    pricing_quantity: float,
+    pricing_unit: str
+) -> float:
+    """
+    Calculate the cost of an ingredient in a recipe.
+
+    The pricing is stored as: price_per_unit for pricing_quantity of pricing_unit
+    E.g., ₹100 for 1 kg means price_per_unit=100, pricing_quantity=1, pricing_unit='kg'
+
+    If recipe needs 100g and price is ₹100 per 1 kg:
+    - Convert 100g to kg = 0.1 kg
+    - Cost = 0.1 * (100/1) = ₹10
+
+    Args:
+        recipe_amount: Amount needed in recipe
+        recipe_unit: Unit used in recipe (e.g., 'g', 'piece')
+        price_per_unit: Price for the pricing quantity
+        pricing_quantity: Quantity that the price covers
+        pricing_unit: Unit of the pricing (e.g., 'kg', 'can')
+
+    Returns:
+        Calculated cost
+    """
+    # Try to convert recipe amount to pricing unit
+    converted_amount = convert_units(recipe_amount, recipe_unit, pricing_unit)
+
+    if converted_amount is not None:
+        # Units are compatible - use converted amount
+        # Cost = (converted_amount / pricing_quantity) * price_per_unit
+        cost = (converted_amount / pricing_quantity) * price_per_unit
+    else:
+        # Units are incompatible (e.g., 'clove' vs 'kg')
+        # Assume recipe amount is directly usable
+        # This handles cases like "1 clove" priced at "X per clove"
+        cost = (recipe_amount / pricing_quantity) * price_per_unit
+
+    return cost
+
+
+def get_recipe_cost_all_countries(
+    db: Session,
+    recipe_id: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Calculate the cost of a recipe for all available countries.
+
+    Args:
+        db: Database session
+        recipe_id: Recipe UUID
+
+    Returns:
+        Dictionary with cost breakdown per country or None
+    """
+    # Get recipe
+    recipe = db.query(Recipe).filter(Recipe.id == recipe_id).first()
+    if not recipe:
+        return None
+
+    # Get recipe ingredients with their units
+    ingredients = db.query(RecipeIngredient).filter(
+        RecipeIngredient.recipeId == recipe_id,
+        RecipeIngredient.deletedAt == None
+    ).all()
+
+    if not ingredients:
+        return None
+
+    # Pre-fetch unit translations for recipe ingredients
+    recipe_unit_query = text("""
+        SELECT ri.id as recipe_ingredient_id, mut.name as unit_name
+        FROM recipe_ingredient ri
+        LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+        WHERE ri."recipeId" = :recipe_id AND ri."deletedAt" IS NULL
+    """)
+    recipe_units = {str(row[0]): row[1] for row in db.execute(recipe_unit_query, {"recipe_id": recipe_id}).fetchall()}
+
+    # Get all countries
+    countries = db.query(Country).all()
+
+    country_costs = []
+
+    for country in countries:
+        total_cost = 0
+        ingredient_costs = []
+        has_pricing = False
+
+        for ri in ingredients:
+            if not ri.ingredientId:
+                continue
+
+            ingredient = db.query(Ingredient).filter(Ingredient.id == ri.ingredientId).first()
+            if not ingredient:
+                continue
+
+            # Get pricing for this ingredient in this country with unit name
+            pricing_query = text("""
+                SELECT ip."pricePerUnit", ip.quantity, c.code as currency_code, c.symbol as currency_symbol,
+                       mut.name as pricing_unit
+                FROM ingredient_pricing ip
+                JOIN currency c ON ip."currencyId" = c.id
+                LEFT JOIN measuring_unit_translation mut ON ip."measuringUnitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+                WHERE ip."ingredientId" = :ingredient_id AND ip."countryId" = :country_id
+                LIMIT 1
+            """)
+            pricing_result = db.execute(pricing_query, {
+                "ingredient_id": ri.ingredientId,
+                "country_id": country.id
+            }).fetchone()
+
+            # Get the recipe ingredient unit
+            recipe_unit = recipe_units.get(str(ri.id), "")
+
+            if pricing_result:
+                price_per_unit, pricing_quantity, currency_code, currency_symbol, pricing_unit = pricing_result
+                # Calculate cost with proper unit conversion
+                recipe_quantity = ri.amount or 1
+                pricing_qty = pricing_quantity or 1
+
+                # Use the unit conversion function for accurate cost calculation
+                cost = calculate_ingredient_cost(
+                    recipe_amount=recipe_quantity,
+                    recipe_unit=recipe_unit or "",
+                    price_per_unit=float(price_per_unit),
+                    pricing_quantity=pricing_qty,
+                    pricing_unit=pricing_unit or ""
+                )
+
+                # Use recipe unit if available, otherwise pricing unit
+                unit_name = recipe_unit or pricing_unit or ""
+
+                ingredient_costs.append({
+                    "ingredient": ingredient.name,
+                    "amount": recipe_quantity,
+                    "unit": unit_name,
+                    "cost": round(cost, 2),
+                    "currency": currency_code,
+                    "currency_symbol": currency_symbol
+                })
+
+                total_cost += cost
+                has_pricing = True
+            else:
+                ingredient_costs.append({
+                    "ingredient": ingredient.name,
+                    "amount": ri.amount,
+                    "unit": recipe_unit or "",
+                    "cost": None,
+                    "note": "No pricing data available"
+                })
+
+        # Only add country if it has at least some pricing data
+        if has_pricing and ingredient_costs:
+            currency_code = ingredient_costs[0].get("currency") if ingredient_costs else "USD"
+            currency_symbol = ingredient_costs[0].get("currency_symbol") if ingredient_costs else "$"
+
+            country_costs.append({
+                "country": country.code,
+                "country_name": country.name,
+                "total_cost": round(total_cost, 2) if total_cost > 0 else 0,
+                "currency": currency_code,
+                "currency_symbol": currency_symbol,
+                "ingredient_costs": ingredient_costs,
+                "servings": recipe.servings or 1,
+                "cost_per_serving": round(total_cost / (recipe.servings or 1), 2) if total_cost > 0 else 0
+            })
+
+    if not country_costs:
+        return None
+
+    return {
+        "recipe_id": str(recipe.id),
+        "recipe_name": recipe.name,
+        "countries": country_costs,
+        "servings": recipe.servings or 1
+    }
+
+
 def get_recipe_cost(
     db: Session,
     recipe_id: str,
@@ -667,15 +997,21 @@ def get_recipe_cost(
 ) -> Optional[Dict[str, Any]]:
     """
     Calculate the cost of a recipe based on ingredient prices.
+    If country_code is None, returns costs for all available countries.
 
     Args:
         db: Database session
         recipe_id: Recipe UUID
         country_code: Optional country code for pricing (e.g., 'US', 'NO', 'IN')
+                     If None, returns costs for all countries
 
     Returns:
         Dictionary with cost breakdown or None
     """
+    # If no country specified, return all countries
+    if not country_code:
+        return get_recipe_cost_all_countries(db, recipe_id)
+
     # Get recipe
     recipe = db.query(Recipe).filter(Recipe.id == recipe_id).first()
     if not recipe:
@@ -690,8 +1026,18 @@ def get_recipe_cost(
     if not ingredients:
         return None
 
+    # Pre-fetch unit translations for recipe ingredients
+    recipe_unit_query = text("""
+        SELECT ri.id as recipe_ingredient_id, mut.name as unit_name
+        FROM recipe_ingredient ri
+        LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+        WHERE ri."recipeId" = :recipe_id AND ri."deletedAt" IS NULL
+    """)
+    recipe_units = {str(row[0]): row[1] for row in db.execute(recipe_unit_query, {"recipe_id": recipe_id}).fetchall()}
+
     total_cost = 0
     ingredient_costs = []
+    country_name = ""  # Will be set from pricing data
 
     for ri in ingredients:
         if not ri.ingredientId:
@@ -701,57 +1047,79 @@ def get_recipe_cost(
         if not ingredient:
             continue
 
-        # Get pricing for this ingredient
-        pricing_query = db.query(IngredientPricing, Currency).join(
-            Currency, IngredientPricing.currencyId == Currency.id
-        ).join(
-            Country, IngredientPricing.countryId == Country.id
-        ).filter(
-            IngredientPricing.ingredientId == ri.ingredientId
-        )
+        # Get pricing for this ingredient with unit name
+        pricing_query = text("""
+            SELECT ip."pricePerUnit", ip.quantity, c.code as currency_code, c.symbol as currency_symbol,
+                   co.name as country_name, co.code as country_code,
+                   mut.name as pricing_unit
+            FROM ingredient_pricing ip
+            JOIN currency c ON ip."currencyId" = c.id
+            JOIN country co ON ip."countryId" = co.id
+            LEFT JOIN measuring_unit_translation mut ON ip."measuringUnitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+            WHERE ip."ingredientId" = :ingredient_id 
+              AND (co.code ILIKE :country_pattern OR co.name ILIKE :country_pattern)
+            LIMIT 1
+        """)
+        pricing_result = db.execute(pricing_query, {
+            "ingredient_id": ri.ingredientId,
+            "country_pattern": f"%{country_code}%"
+        }).fetchone()
 
-        # Filter by country if specified
-        if country_code:
-            pricing_query = pricing_query.filter(Country.code.ilike(f"%{country_code}%"))
-
-        # Get first matching price
-        pricing_result = pricing_query.first()
+        # Get the recipe ingredient unit
+        recipe_unit = recipe_units.get(str(ri.id), "")
 
         if pricing_result:
-            pricing, currency = pricing_result
-            # Calculate cost: price per unit * (recipe amount / pricing quantity)
+            price_per_unit, pricing_quantity, currency_code_val, currency_symbol, country_name_val, country_code_val, pricing_unit = pricing_result
+            # Calculate cost with proper unit conversion
             recipe_quantity = ri.amount or 1
-            pricing_quantity = pricing.quantity or 1
-            cost_per_base_unit = float(pricing.pricePerUnit)
-            cost = cost_per_base_unit * (recipe_quantity / pricing_quantity)
+            pricing_qty = pricing_quantity or 1
+
+            # Use the unit conversion function for accurate cost calculation
+            cost = calculate_ingredient_cost(
+                recipe_amount=recipe_quantity,
+                recipe_unit=recipe_unit or "",
+                price_per_unit=float(price_per_unit),
+                pricing_quantity=pricing_qty,
+                pricing_unit=pricing_unit or ""
+            )
+
+            # Use recipe unit if available, otherwise pricing unit
+            unit_name = recipe_unit or pricing_unit or ""
 
             ingredient_costs.append({
                 "ingredient": ingredient.name,
                 "amount": recipe_quantity,
+                "unit": unit_name,
                 "cost": round(cost, 2),
-                "currency": currency.code,
-                "currency_symbol": currency.symbol
+                "currency": currency_code_val,
+                "currency_symbol": currency_symbol,
+                "country_name": country_name_val
             })
 
             total_cost += cost
+            # Store country name for the response
+            country_name = country_name_val
         else:
             ingredient_costs.append({
                 "ingredient": ingredient.name,
                 "amount": ri.amount,
+                "unit": recipe_unit or "",
                 "cost": None,
                 "note": "No pricing data available"
             })
 
     # Get currency for total (use first available)
-    currency_code = ingredient_costs[0].get("currency") if ingredient_costs else "USD"
+    currency_code_final = ingredient_costs[0].get("currency") if ingredient_costs else "USD"
     currency_symbol = ingredient_costs[0].get("currency_symbol") if ingredient_costs else "$"
+    country_name = ingredient_costs[0].get("country_name", "") if ingredient_costs else ""
 
     return {
         "recipe_id": str(recipe.id),
         "recipe_name": recipe.name,
         "total_cost": round(total_cost, 2) if total_cost > 0 else None,
-        "currency": currency_code,
+        "currency": currency_code_final,
         "currency_symbol": currency_symbol,
+        "country_name": country_name,
         "ingredient_costs": ingredient_costs,
         "servings": recipe.servings or 1,
         "cost_per_serving": round(total_cost / (recipe.servings or 1), 2) if total_cost > 0 else None

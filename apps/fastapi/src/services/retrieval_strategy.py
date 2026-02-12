@@ -6,6 +6,7 @@ from typing import Dict, Any, Literal, Optional, List
 from enum import Enum
 from dataclasses import dataclass
 
+from apps.fastapi import logger
 
 # Ingredient synonym mapping for common ingredient name variations
 INGREDIENT_SYNONYMS = {
@@ -135,7 +136,8 @@ class RetrievalStrategyDecider:
         self,
         query: str,
         intent: str,
-        session_context: Dict[str, Any]
+        session_context: Dict[str, Any],
+        nlid_result: Optional[Dict[str, Any]] = None
     ) -> tuple[bool, str]:
         """
         Detect if user is refining previous search vs starting a new one
@@ -144,6 +146,7 @@ class RetrievalStrategyDecider:
             query: Current user query
             intent: Detected intent from NLID
             session_context: Session context with previous searches
+            nlid_result: Current NLID detection result (optional)
 
         Returns:
             Tuple of (is_refinement, original_vector_query)
@@ -192,7 +195,45 @@ class RetrievalStrategyDecider:
         is_short_query = len(query.split()) <= 6
 
         # Check if current query lacks new ingredients (refinements usually add constraints)
-        filters = session_context.get("filters", {})
+        # Get and merge filters from both NLID result (fresh) and session context (stale/persistent)
+        # This preserves filters across conversation for proper refinements
+
+        # Start with existing filters from session context (persistent across turns)
+        existing_filters = session_context.get("filters", {})
+
+        # Get fresh filters from current NLID detection
+        fresh_filters = (nlid_result or {}).get("filters", {})
+
+        # Merge fresh filters with existing filters
+        # This ensures refinements like "I am allergic to tomatoes" add to previous filters
+        # instead of replacing them
+        if existing_filters and fresh_filters:
+            # Merge: Add new filters to existing ones
+            for key, value in fresh_filters.items():
+                if key in existing_filters:
+                    # Key exists - merge values
+                    if isinstance(existing_filters[key], list) and isinstance(value, list):
+                        # Both are lists - extend
+                        existing_filters[key].extend(value)
+                    elif isinstance(existing_filters[key], list):
+                        # Existing is list, value is single - append
+                        existing_filters[key].append(value)
+                    elif isinstance(value, list):
+                        # Existing is single, value is list - extend
+                        existing_filters[key].extend(value)
+                    else:
+                        # Both are single values - combine
+                        existing_filters[key] = [existing_filters[key], value]
+                else:
+                    # New key - just add it
+                    existing_filters[key] = value if not isinstance(value, list) else [value]
+            logger.info(f"[REFINEMENT] Merging filters - existing: {existing_filters}, fresh: {fresh_filters}")
+            filters = existing_filters
+        else:
+            # No existing or fresh filters - use what's available
+            filters = existing_filters if existing_filters else fresh_filters
+            logger.info(f"[REFINEMENT] Using filters - existing: {existing_filters}, fresh: {fresh_filters}")
+
         has_new_included_ingredients = bool(filters.get("included_ingredients"))
 
         # Return both boolean and original vector query
@@ -426,7 +467,7 @@ class RetrievalStrategyDecider:
 
         # Determine the actual vector query to use
         # If this is a refinement of a previous search, preserve the original recipe query
-        is_refinement, original_vector_query = self._is_query_refinement(query, intent, session_context)
+        is_refinement, original_vector_query = self._is_query_refinement(query, intent, session_context, nlid_result)
         if is_refinement:
             # For refinements, preserve the original query for embedding search
             # Apply constraints via SQL filtering instead
@@ -612,8 +653,15 @@ class RetrievalStrategyDecider:
         if filters.get("excluded_ingredients"):
             tight_filter_count += 1
 
-        # Need at least 2 tight filters for SQL-only
-        return tight_filter_count >= 2
+        # Filter-only query intents (nutrition/pricing) - check for specific filter keys
+        if filters.get("nutrition_filters") or filters.get("price_filters"):
+            # These queries use metadata sorting, need different handling
+            # They don't rely on WHERE clauses with static thresholds
+            # Return False because they need different strategy (SQL_ONLY with ORDER BY)
+            return False
+        else:
+            # Need at least 2 tight filters for SQL-only
+            return tight_filter_count >= 2
 
     def _build_sql_filters(
         self,
@@ -678,8 +726,7 @@ class RetrievalStrategyDecider:
         # IMPORTANT: Skip included_ingredients for HYBRID_VECTOR_TO_SQL strategy
         # because embeddings already handle ingredient matching semantically.
         # Adding EXISTS clauses for ingredients would be redundant and too restrictive.
-        import logging
-        logger = logging.getLogger(__name__)
+
         logger.info(f"[RETRIEVAL STRATEGY] Strategy: {strategy}, HYBRID_VECTOR_TO_SQL: {strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL}")
         logger.info(f"[RETRIEVAL STRATEGY] include_ingredients in filters: {'include_ingredients' in filters}")
         logger.info(f"[RETRIEVAL STRATEGY] included_ingredients in filters: {'included_ingredients' in filters}")

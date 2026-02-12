@@ -16,6 +16,7 @@ from models import (
     SeasonalityTypeEnum, RecipeIngredient, RecipeSeasonality
 )
 from database import get_db
+from apps.fastapi import logger
 
 # Load environment variables
 load_dotenv()
@@ -243,9 +244,6 @@ class EmbeddingService:
         Returns:
             List of (Recipe, similarity_score) tuples
         """
-        # Debug logging
-        import logging
-        logger = logging.getLogger(__name__)
 
         # Generate embedding for query
         query_embedding = self._generate_embedding(query_text)

@@ -194,75 +194,78 @@ class ChatRoutes:
                 detail={"error": "Failed to process message", "code": "PROCESSING_ERROR"}
             )
 
-    # @staticmethod
-    # @chat_route.get(
-    #     "/sessions/{session_id}",
-    #     status_code=status.HTTP_200_OK,
-    #     response_model=SessionResponse,
-    #     summary="Get session details",
-    #     description="Retrieve details of a specific chat session"
-    # )
-    # def get_session(
-    #     session_id: str,
-    #     db: Session = Depends(get_db)
-    # ):
-    #     """Get details of a specific chat session"""
-    #     chat_service = ChatService(db)
-    #     session = chat_service.get_session(session_id)
-    #
-    #     if not session:
-    #         raise HTTPException(
-    #             status_code=status.HTTP_404_NOT_FOUND,
-    #             detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-    #         )
-    #
-    #     return session
+    @staticmethod
+    @chat_route.get(
+        "/sessions/{session_id}",
+        status_code=status.HTTP_200_OK,
+        response_model=SessionResponse,
+        summary="Get session details",
+        description="Retrieve details of a specific chat session"
+    )
+    def get_session(
+        session_id: str,
+        db: Session = Depends(get_db)
+    ):
+        """Get details of a specific chat session"""
+        chat_service = ChatService(db)
+        session = chat_service.get_session(session_id)
 
-    # @staticmethod
-    # @chat_route.get(
-    #     "/sessions/{session_id}/history",
-    #     status_code=status.HTTP_200_OK,
-    #     response_model=SessionHistoryResponse,
-    #     summary="Get session history",
-    #     description="Retrieve full message history for a specific session"
-    # )
-    # def get_session_history(
-    #     session_id: str,
-    #     limit: int = Query(100, ge=1, le=1000, description="Maximum number of messages"),
-    #     db: Session = Depends(get_db)
-    # ):
-    #     """Get full message history for a session"""
-    #     chat_service = ChatService(db)
-    #     history = chat_service.get_session_history(session_id, limit)
-    #
-    #     if not history:
-    #         raise HTTPException(
-    #             status_code=status.HTTP_404_NOT_FOUND,
-    #             detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-    #         )
-    #
-    #     return history
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return session
+
+    @staticmethod
+    @chat_route.get(
+        "/sessions/{session_id}/history",
+        status_code=status.HTTP_200_OK,
+        summary="Get session history",
+        description="Retrieve full message history for a specific session"
+    )
+    def get_session_history(
+        session_id: str,
+        limit: int = Query(100, ge=1, le=1000, description="Maximum number of messages"),
+        db: Session = Depends(get_db)
+    ):
+        """Get full message history for a session"""
+        chat_service = ChatService(db)
+        history = chat_service.get_session_history(session_id, limit)
+
+        if not history:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return history
 
     @staticmethod
     @chat_route.get(
         "/sessions/user/{user_uid}",
         status_code=status.HTTP_200_OK,
-        summary="Get user sessions",
-        description="Retrieve all chat sessions for a specific user"
+        summary="Get user's most recent session",
+        description="Retrieve the session with the most recent user conversation. Returns the session that had the last user message, with all its conversations. The response includes 'active_session_id' at the top level for easy access - use this session_id for subsequent queries to continue the conversation. Note: Maximum 5 sessions are maintained per user."
     )
     def get_user_sessions(
         user_uid: str,
-        limit: int = Query(50, ge=1, le=100, description="Maximum number of sessions"),
+        limit: int = Query(50, ge=1, le=100, description="Maximum number of conversations to return"),
         db: Session = Depends(get_db)
     ):
-        """Get all chat sessions for a user"""
+        """Get the most recently active session for a user with all its conversations"""
         try:
             chat_service = ChatService(db)
             sessions = chat_service.get_user_sessions(user_uid, limit)
 
+            # Extract the active session_id for easier frontend access
+            active_session_id = sessions[0]["session_id"] if sessions and len(sessions) > 0 else None
+
             return {
                 "success": True,
                 "user_uid": user_uid,
+                "active_session_id": active_session_id,  # Session ID to use for next queries
                 "sessions": sessions,
                 "count": len(sessions)
             }
@@ -287,58 +290,85 @@ class ChatRoutes:
                 detail={"error": "Failed to get user sessions", "code": "INTERNAL_ERROR"}
             )
 
-    # @staticmethod
-    # @chat_route.delete(
-    #     "/sessions/{session_id}",
-    #     status_code=status.HTTP_200_OK,
-    #     summary="Delete session",
-    #     description="Delete a chat session and all its messages"
-    # )
-    # def delete_session(
-    #     session_id: str,
-    #     db: Session = Depends(get_db)
-    # ):
-    #     """Delete a chat session"""
-    #     chat_service = ChatService(db)
-    #     success = chat_service.delete_session(session_id)
-    #
-    #     if not success:
-    #         raise HTTPException(
-    #             status_code=status.HTTP_404_NOT_FOUND,
-    #             detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-    #         )
-    #
-    #     return {
-    #         "success": True,
-    #         "message": "Session deleted successfully",
-    #         "session_id": session_id
-    #     }
-    #
-    # @staticmethod
-    # @chat_route.patch(
-    #     "/sessions/{session_id}/title",
-    #     status_code=status.HTTP_200_OK,
-    #     summary="Update session title",
-    #     description="Update the title of a chat session"
-    # )
-    # def update_session_title(
-    #     session_id: str,
-    #     title: str = Query(..., min_length=1, max_length=255, description="New session title"),
-    #     db: Session = Depends(get_db)
-    # ):
-    #     """Update session title"""
-    #     chat_service = ChatService(db)
-    #     success = chat_service.update_session_title(session_id, title)
-    #
-    #     if not success:
-    #         raise HTTPException(
-    #             status_code=status.HTTP_404_NOT_FOUND,
-    #             detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-    #         )
-    #
-    #     return {
-    #         "success": True,
-    #         "message": "Session title updated",
-    #         "session_id": session_id,
-    #         "title": title
-    #     }
+    @staticmethod
+    @chat_route.delete(
+        "/sessions/{session_id}",
+        status_code=status.HTTP_200_OK,
+        summary="Delete session",
+        description="Delete a chat session and all its messages"
+    )
+    def delete_session(
+        session_id: str,
+        db: Session = Depends(get_db)
+    ):
+        """Delete a chat session"""
+        chat_service = ChatService(db)
+        success = chat_service.delete_session(session_id)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return {
+            "success": True,
+            "message": "Session deleted successfully",
+            "session_id": session_id
+        }
+
+    @staticmethod
+    @chat_route.patch(
+        "/sessions/{session_id}/close",
+        status_code=status.HTTP_200_OK,
+        summary="Close session",
+        description="Mark a chat session as inactive (archived). The session data is preserved but won't appear in active sessions list."
+    )
+    def close_session(
+        session_id: str,
+        db: Session = Depends(get_db)
+    ):
+        """Close/archive a chat session"""
+        chat_service = ChatService(db)
+        success = chat_service.close_session(session_id)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return {
+            "success": True,
+            "message": "Session closed successfully",
+            "session_id": session_id
+        }
+
+    @staticmethod
+    @chat_route.patch(
+        "/sessions/{session_id}/title",
+        status_code=status.HTTP_200_OK,
+        summary="Update session title",
+        description="Update the title of a chat session"
+    )
+    def update_session_title(
+        session_id: str,
+        title: str = Query(..., min_length=1, max_length=255, description="New session title"),
+        db: Session = Depends(get_db)
+    ):
+        """Update session title"""
+        chat_service = ChatService(db)
+        success = chat_service.update_session_title(session_id, title)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return {
+            "success": True,
+            "message": "Session title updated",
+            "session_id": session_id,
+            "title": title
+        }

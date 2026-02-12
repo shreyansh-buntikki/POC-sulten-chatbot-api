@@ -57,6 +57,58 @@ class ChatService:
             logger.error(f"[CHAT SERVICE] User not found: {user_uid}")
             raise ValueError(f"User '{user_uid}' does not exist")
 
+    def _cleanup_old_sessions(self, user_uid: str, max_sessions: int = 5) -> None:
+        """
+        Delete old sessions to maintain maximum session limit per user.
+        Keeps the most recent sessions based on last user message timestamp.
+
+        Args:
+            user_uid: User identifier
+            max_sessions: Maximum number of sessions to keep (default 5)
+        """
+        try:
+            # Get all active sessions for user
+            sessions = self.conversation_store.get_user_sessions(user_uid, limit=100)
+
+            if len(sessions) <= max_sessions:
+                return  # Nothing to cleanup
+
+            # Get last user message timestamp for each session
+            sessions_with_timestamps = []
+            for s in sessions:
+                messages = self.conversation_store.get_messages(str(s.id))
+                user_msgs = [m for m in messages if m.role == "user"]
+
+                if user_msgs:
+                    last_user_msg_time = user_msgs[-1].created_at
+                else:
+                    last_user_msg_time = s.created_at  # Fallback to session creation time
+
+                sessions_with_timestamps.append({
+                    "session": s,
+                    "last_user_msg_time": last_user_msg_time
+                })
+
+            # Sort by last user message timestamp (most recent first)
+            sessions_with_timestamps.sort(
+                key=lambda x: x["last_user_msg_time"] or datetime.min,
+                reverse=True
+            )
+
+            # Delete sessions beyond the limit
+            sessions_to_delete = sessions_with_timestamps[max_sessions:]
+
+            for item in sessions_to_delete:
+                session_to_delete = item["session"]
+                logger.info(f"[CHAT SERVICE] Deleting old session {session_to_delete.id} for user {user_uid}")
+                self.conversation_store.delete_session(str(session_to_delete.id))
+
+            if sessions_to_delete:
+                logger.info(f"[CHAT SERVICE] Cleaned up {len(sessions_to_delete)} old sessions for user {user_uid}")
+
+        except Exception as e:
+            logger.error(f"[CHAT SERVICE] Error cleaning up old sessions for user {user_uid}: {e}")
+
     async def create_session(
         self,
         user_uid: Optional[str] = None,
@@ -105,83 +157,127 @@ class ChatService:
         limit: int = 50
     ) -> List[Dict[str, Any]]:
         """
-        Get all sessions for a user with first user message and last assistant message
+        Get the session with the most recent user conversation for a user.
+        Returns the session that had the last user message, with all its conversations.
+        Note: Maximum 5 sessions are maintained per user (old ones auto-deleted on new session creation).
 
         Args:
             user_uid: User identifier
-            limit: Maximum number of sessions
+            limit: Maximum number of messages to return per session (default 50)
 
         Returns:
-            List of session dictionaries with query, answer, and recipe details
+            List containing the most recently active session with all its conversations
         """
         # Validate user exists before loading conversation history
         self._validate_user_exists(user_uid)
 
-        sessions = self.conversation_store.get_user_sessions(user_uid, limit)
+        # Get all active sessions for user
+        sessions = self.conversation_store.get_user_sessions(user_uid, limit=100)
 
-        result = []
+        if not sessions:
+            return []
+
+        # Find the session with the most recent user message
+        most_recent_session = None
+        most_recent_time = None
+
         for s in sessions:
-            session_data = {
-                "session_id": str(s.id),
-                "title": s.title,
-                "created_at": s.created_at.isoformat() if s.created_at else None,
-                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
-                "is_active": s.is_active
+            messages = self.conversation_store.get_messages(str(s.id))
+            user_msgs = [m for m in messages if m.role == "user"]
+
+            if user_msgs:
+                last_user_msg_time = user_msgs[-1].created_at
+                if most_recent_time is None or (last_user_msg_time and last_user_msg_time > most_recent_time):
+                    most_recent_time = last_user_msg_time
+                    most_recent_session = s
+
+        if not most_recent_session:
+            return []
+
+        # Get all messages for the most recent session
+        messages = self.conversation_store.get_messages(str(most_recent_session.id), limit=limit)
+
+        if not messages:
+            return []
+
+        # Build the session response - maintain original structure
+        session_data = {
+            "session_id": str(most_recent_session.id),
+            "title": most_recent_session.title,
+            "created_at": most_recent_session.created_at.isoformat() if most_recent_session.created_at else None,
+            "updated_at": most_recent_session.updated_at.isoformat() if most_recent_session.updated_at else None,
+            "is_active": most_recent_session.is_active
+        }
+
+        # Find first user message and last assistant message (original structure)
+        user_msgs = [m for m in messages if m.role == "user"]
+        assistant_msgs = [m for m in messages if m.role == "assistant"]
+
+        if user_msgs:
+            first_user_msg = user_msgs[0]
+            session_data["user_message"] = {
+                "id": str(first_user_msg.id),
+                "content": first_user_msg.content,
+                "created_at": first_user_msg.created_at.isoformat() if first_user_msg.created_at else None
             }
 
-            # Get messages for this session
-            messages = self.conversation_store.get_messages(str(s.id))
+        if assistant_msgs:
+            last_assistant = assistant_msgs[-1]
+            session_data["assistant_message"] = {
+                "id": str(last_assistant.id),
+                "content": last_assistant.content,
+                "created_at": last_assistant.created_at.isoformat() if last_assistant.created_at else None
+            }
 
-            if not messages:
-                logger.warning(f"[CHAT SERVICE] Session {s.id} has no messages")
-                result.append(session_data)
-                continue
+            # Include metadata with recipe details if present (original structure)
+            if last_assistant.meta:
+                metadata = {}
+                for key, value in last_assistant.meta.items():
+                    metadata[key] = value
+                if metadata:
+                    session_data["metadata"] = metadata
 
-            # Find first user message (query)
-            first_user_msg = next((m for m in messages if m.role == "user"), None)
-            if first_user_msg and first_user_msg.content:
-                session_data["user_message"] = {
-                    "id": str(first_user_msg.id),
-                    "content": first_user_msg.content,
-                    "created_at": first_user_msg.created_at.isoformat() if first_user_msg.created_at else None
+        # Add conversations array with all message pairs (new addition)
+        conversations = []
+        i = 0
+        while i < len(messages):
+            conversation = {}
+
+            # Get user message
+            if i < len(messages) and messages[i].role == "user":
+                user_msg = messages[i]
+                conversation["user_message"] = {
+                    "id": str(user_msg.id),
+                    "content": user_msg.content,
+                    "created_at": user_msg.created_at.isoformat() if user_msg.created_at else None
                 }
-            else:
-                logger.warning(f"[CHAT SERVICE] Session {s.id} has no user message with content")
+                i += 1
 
-            # Find last assistant message (answer)
-            assistant_msgs = [m for m in messages if m.role == "assistant"]
-            if assistant_msgs:
-                last_assistant = assistant_msgs[-1]
-                if last_assistant.content:
-                    session_data["assistant_message"] = {
-                        "id": str(last_assistant.id),
-                        "content": last_assistant.content,
-                        "created_at": last_assistant.created_at.isoformat() if last_assistant.created_at else None
-                    }
-                else:
-                    logger.warning(f"[CHAT SERVICE] Session {s.id} has empty assistant message")
+            # Get assistant message (if exists)
+            if i < len(messages) and messages[i].role == "assistant":
+                assistant_msg = messages[i]
+                conversation["assistant_message"] = {
+                    "id": str(assistant_msg.id),
+                    "content": assistant_msg.content,
+                    "created_at": assistant_msg.created_at.isoformat() if assistant_msg.created_at else None
+                }
 
                 # Include metadata with recipe details if present
-                if last_assistant.meta:
-                    # Build metadata object with all fields
-                    metadata = {}
-                    for key, value in last_assistant.meta.items():
-                        if key != "recipes":  # Skip recipes for now, will add separately
-                            metadata[key] = value
+                if assistant_msg.meta:
+                    conv_metadata = {}
+                    for key, value in assistant_msg.meta.items():
+                        conv_metadata[key] = value
+                    if conv_metadata:
+                        conversation["metadata"] = conv_metadata
+                i += 1
 
-                    # Add recipes to metadata if present
-                    recipes = last_assistant.meta.get("recipes")
-                    if recipes:
-                        metadata["recipes"] = recipes
+            if conversation:
+                conversations.append(conversation)
 
-                    if metadata:  # Only add metadata if there's something in it
-                        session_data["metadata"] = metadata
-            else:
-                logger.warning(f"[CHAT SERVICE] Session {s.id} has no assistant messages")
+        session_data["conversations"] = conversations
 
-            result.append(session_data)
+        return [session_data]
 
-        return result
 
     def get_session_history(
         self,
@@ -250,6 +346,10 @@ class ChatService:
             # Generate title from first message
             title = message[:50] + "..." if len(message) > 50 else message
             session = self.conversation_store.create_session(user_uid, title)
+
+            # Cleanup old sessions - maintain max 5 sessions per user
+            if user_uid:
+                self._cleanup_old_sessions(user_uid, max_sessions=5)
 
         # Step 2: Save user message
         user_msg = self.conversation_store.add_message(
@@ -390,6 +490,20 @@ class ChatService:
             True if successful
         """
         return self.conversation_store.delete_session(session_id)
+
+    def close_session(self, session_id: str) -> bool:
+        """
+        Close/archive a session (mark as inactive)
+
+        The session data is preserved but won't appear in active sessions list.
+
+        Args:
+            session_id: Session UUID
+
+        Returns:
+            True if successful
+        """
+        return self.conversation_store.close_session(session_id)
 
     def update_session_title(self, session_id: str, title: str) -> bool:
         """

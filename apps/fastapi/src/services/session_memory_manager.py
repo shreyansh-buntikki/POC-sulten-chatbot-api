@@ -7,9 +7,8 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import json
-import logging
 
-logger = logging.getLogger(__name__)
+from apps.fastapi import logger
 
 # Module-level cache for session state persistence across requests
 # This ensures context is preserved when SessionMemoryManager is instantiated multiple times

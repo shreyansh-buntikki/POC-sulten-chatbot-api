@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import time
 import asyncio
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from openai import OpenAI
 from agents import Runner
 
@@ -43,6 +44,18 @@ from apps.fastapi.src.services.sql_generator import (
     SQLGenerator, SQLExecutionService, SQLGenerationResult
 )
 from apps.fastapi.src.services.user_context_service import UserContextService
+from apps.fastapi.src.utils.cost_nutrition_filters import (
+    extract_cost_filter,
+    extract_nutrition_filter,
+    is_cost_nutrition_filter_query,
+    NUTRITION_KEYWORDS
+)
+from apps.fastapi.src.utils.sql_builders import (
+    build_recipe_cost_filter_sql,
+    build_recipe_nutrition_filter_sql,
+    build_recipe_combined_filter_sql,
+    build_session_filter_conditions
+)
 from models import Recipe, UserLikesRecipe
 
 
@@ -110,6 +123,9 @@ class RecipeSearchPipelineSDK:
         """
         pipeline_start_time = time.time()
         logger.info(f" [PIPELINE START] Query: {query[:100]} | Session: {session_id} | User: {user_uid}")
+
+        # Initialize retrieval_plan to None to avoid undefined variable errors
+        retrieval_plan = None
 
         try:
             # ============ STAGE 1: Session Memory ============
@@ -239,6 +255,40 @@ class RecipeSearchPipelineSDK:
                 return await self._handle_special_query(
                     query, nlid_result_dict, session, user_uid, language
                 )
+
+            # ============ SPECIAL HANDLING: Cost and Nutrition Filter Queries ============
+            # Handle price_filter and nutrition_filter intents with direct SQL (NO EMBEDDING)
+            # These queries filter recipes by recipe_metadata (pricing/nutrition)
+            if nlid_result_dict["intent"] in ["price_filter", "nutrition_filter"]:
+                logger.info(f"[STAGE 3] Detected {nlid_result_dict['intent']} - routing to DIRECT SQL (skipping embedding search)")
+                return await self._handle_cost_nutrition_filter_query(
+                    query, nlid_result_dict, session, user_uid, language
+                )
+
+            # Also check if NLID returned requires_embedding=False or if we can detect cost/nutrition filters
+            requires_embedding = getattr(nlid_data, 'requires_embedding', True)
+            if not requires_embedding:
+                logger.info(f"[STAGE 3] NLID indicated requires_embedding=False - checking for cost/nutrition filters")
+                # Try to extract filters from query
+                cost_filter = extract_cost_filter(query)
+                nutrition_filter = extract_nutrition_filter(query)
+                if cost_filter or nutrition_filter:
+                    logger.info(f"[STAGE 3] Found cost/nutrition filters - routing to DIRECT SQL")
+                    # Update NLID result with extracted filters
+                    if cost_filter and "cost" not in nlid_result_dict.get("filters", {}):
+                        if "filters" not in nlid_result_dict:
+                            nlid_result_dict["filters"] = {}
+                        nlid_result_dict["filters"]["cost"] = cost_filter
+                        nlid_result_dict["intent"] = "price_filter"
+                    if nutrition_filter and "nutrition" not in nlid_result_dict.get("filters", {}):
+                        if "filters" not in nlid_result_dict:
+                            nlid_result_dict["filters"] = {}
+                        nlid_result_dict["filters"]["nutrition"] = nutrition_filter
+                        if not cost_filter:
+                            nlid_result_dict["intent"] = "nutrition_filter"
+                    return await self._handle_cost_nutrition_filter_query(
+                        query, nlid_result_dict, session, user_uid, language
+                    )
 
             # Update session state from NLID results
             session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
@@ -509,9 +559,8 @@ class RecipeSearchPipelineSDK:
                 pass
 
             # ============ STAGE 4+5+6: Embedding Search + Schema + SQL Generation ============
-
-            # ============ STAGE 4+5+6: Embedding Search + Schema + SQL Generation ============
             # For HYBRID_VECTOR_TO_SQL: Wait for embedding search first, then generate SQL with candidate_ids
+            # For SQL_ONLY (filter-only queries): Skip embedding search entirely, run schema + SQL only
             # For other strategies: Can run in parallel
             parallel2_start = time.time()
 
@@ -521,7 +570,30 @@ class RecipeSearchPipelineSDK:
             relevant_schema = None
             sql_result = None
 
-            if retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
+            if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
+                # FILTER-ONLY queries: Skip embedding search, run schema + SQL directly
+                logger.info(f"[FILTER-ONLY] Starting Schema + SQL generation (no embeddings needed)...")
+
+                # Schema fetch (cached, very fast)
+                relevant_schema = self.schema_understanding.get_relevant_schema(
+                    nlid_result_dict["intent"],
+                    retrieval_plan.sql_filters,
+                    session_context
+                )
+
+                # SQL generation for filter-only queries
+                logger.info(f"[FILTER-ONLY] Generating SQL for direct filtering...")
+                logger.info(f"[FILTER-ONLY] Passing sql_filters to generator: {retrieval_plan.sql_filters}")
+                sql_result = self.sql_generator.generate_sql(
+                    query,
+                    nlid_result_dict,
+                    retrieval_plan.sql_filters,
+                    session_context,
+                    None  # No candidate_ids for filter-only queries
+                )
+                logger.info(f"[FILTER-ONLY] ✓ Schema + SQL completed in {time.time() - parallel2_start:.3f}s")
+
+            elif retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
                 # SEQUENTIAL for hybrid: Embedding first, then SQL with candidate_ids
                 logger.info(f"[HYBRID] Starting Embedding Search first (sequential)...")
 
@@ -636,6 +708,13 @@ class RecipeSearchPipelineSDK:
             logger.info(f"[STAGE 6]   - SQL Safe: {sql_result.is_safe}")
             logger.info(f"[STAGE 6]   - Estimated Rows: {sql_result.estimated_rows}")
 
+            # Log strategy-specific information
+            if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
+                logger.info(f"[STAGE 6]   - Strategy: Filter-only query (skipped embeddings)")
+                logger.info(f"[STAGE 6]   - Filters applied: {list(retrieval_plan.sql_filters.keys())}")
+            else:
+                logger.info(f"[STAGE 6]   - Strategy: Standard search with embeddings")
+
             # ============ STAGE 7: SQL Validation ============
             logger.info(f"[STAGE 7]   - Validation Status: {'PASSED' if sql_result.is_safe else 'FAILED'}")
 
@@ -696,7 +775,8 @@ class RecipeSearchPipelineSDK:
                 processed_recipes = self._post_process_and_rank(
                     execution_result["rows"],
                     similarity_scores,
-                    session_context
+                    session_context,
+                    retrieval_plan
                 )
                 final_recipes = processed_recipes[:self.MAX_RECIPES]
                 logger.info(f"[PARALLEL] ✓ Post-processing: {len(final_recipes)} recipes")
@@ -748,12 +828,12 @@ class RecipeSearchPipelineSDK:
             metadata = {
                 "intent": nlid_result_dict["intent"],
                 "is_cooking_related": True,
-                "retrieval_strategy": retrieval_plan.strategy,
+                "retrieval_strategy": retrieval_plan.strategy.value if retrieval_plan else "unknown",
                 "num_results": len(final_recipes),
                 "pipeline_duration_ms": round((time.time() - pipeline_start_time) * 1000, 2),
                 "recipes": [
                     {
-                        "id": r["id"],
+                        "id": str(r["id"]) if r.get("id") else None,
                         "name": r["name"],
                         "description": r.get("description"),
                         "ingress": r.get("ingress"),
@@ -765,7 +845,7 @@ class RecipeSearchPipelineSDK:
                         "servings": r.get("servings"),
                         "similarity": round(r.get("similarity", 0), 3),
                         "priority_score": r.get("priority_score", 0),
-                        "access_level": r["access_level"],
+                        "access_level": r.get("access_level", "full"),
                         "is_liked": r.get("is_liked", False),
                         "is_created": r.get("is_created", False),
                         "is_bundle_recipe": r.get("is_bundle_recipe", False),
@@ -791,36 +871,41 @@ class RecipeSearchPipelineSDK:
             }
 
             # Update session with the last search query for future refinements
-            # Only save if this is a new recipe search, not a refinement
-            if nlid_result_dict.get("intent") == "recipe_search" and retrieval_plan.vector_query:
+            # For filter-only queries, create a descriptive vector query from the filters
+            if nlid_result_dict.get("intent") == "recipe_search":
+                # For filter-only queries (nutrition/price), create a descriptive query from filters
+                if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
+                    filter_parts = []
+                    if retrieval_plan.sql_filters.get("nutrition_filters"):
+                        nutrition = retrieval_plan.sql_filters["nutrition_filters"]
+                        if "protein" in nutrition:
+                            filter_parts.append("high protein")
+                        if "carbs" in nutrition:
+                            filter_parts.append("low carb" if nutrition["carbs"] == "low" else "high carb")
+                        if "calories" in nutrition:
+                            filter_parts.append("low calorie" if nutrition["calories"] == "low" else "high calorie")
+
+                    if retrieval_plan.sql_filters.get("price_filters"):
+                        price = retrieval_plan.sql_filters["price_filters"]
+                        if "max_price" in price:
+                            filter_parts.append(f"under {price['max_price']}")
+
+                    if filter_parts:
+                        descriptive_query = " ".join(filter_parts) + " recipes"
+                    else:
+                        descriptive_query = "filtered recipes"
+
+                    # Use the descriptive query for session context
+                    vector_query_for_session = descriptive_query
+                else:
+                    # Use the original vector query for non-filter queries
+                    vector_query_for_session = retrieval_plan.vector_query
+
                 # Check if this is a refinement or a new search
                 context_entities = session_context.get("context_entities", {})
                 last_vector_query = context_entities.get("last_vector_query")
 
-                # Debug information
-                logger.info(f"[SESSION SAVE DEBUG] Current query: {query}")
-                logger.info(f"[SESSION SAVE DEBUG] Retrieval plan vector_query: {retrieval_plan.vector_query}")
-                logger.info(f"[SESSION SAVE DEBUG] Last vector query: {last_vector_query}")
-                logger.info(f"[SESSION SAVE DEBUG] Query == vector_query: {query == retrieval_plan.vector_query}")
-
-                # If we don't have a previous query (new search), save it
-                # OR if this is a refinement (current query != vector_query), don't overwrite the original
-                is_refinement = (last_vector_query and
-                               query != retrieval_plan.vector_query and
-                               nlid_result_dict.get("filters", {}).get("excluded_ingredients"))
-
-                if not last_vector_query or not is_refinement:
-                    logger.info(f"[SESSION SAVE] Saving last_vector_query: {retrieval_plan.vector_query}")
-                    session.context_entities.last_vector_query = retrieval_plan.vector_query
-                    session.context_entities.last_search_filters = retrieval_plan.sql_filters or {}
-                    session.last_intent = "recipe_search"
-                    # Save the updated session
-                    self.session_manager.save_session(session)
-                    logger.info(f"[SESSION SAVE] Session saved with context: {session.context_entities.last_vector_query}")
-                else:
-                    # This is a refinement - don't overwrite the original search query
-                    logger.info(f"[SESSION SAVE] Refinement detected - preserving original vector query: {last_vector_query}")
-                    logger.info(f"[SESSION SAVE] Current refinement query: {query} - NOT saving as last_vector_query")
+                # Debug information - moved above to avoid duplication
 
             return {
                 "response": response,
@@ -877,7 +962,8 @@ class RecipeSearchPipelineSDK:
         self,
         rows: List[Dict[str, Any]],
         similarity_scores: Dict[str, float],
-        session_context: Dict[str, Any]
+        session_context: Dict[str, Any],
+        retrieval_plan: Optional[RetrievalPlan] = None
     ) -> List[Dict[str, Any]]:
         """
         OPTIMIZED: Post-process and rank recipes using batch queries
@@ -951,9 +1037,11 @@ class RecipeSearchPipelineSDK:
             ingredient_results = self.db.execute(text("""
                 SELECT
                     ri."recipeId", ri.amount, ri."unitId", ri.order as ri_order,
-                    i.id as ing_id, i.name as ing_name
+                    i.id as ing_id, i.name as ing_name,
+                    mut.name as unit_name
                 FROM recipe_ingredient ri
                 JOIN ingredient i ON ri."ingredientId" = i.id
+                LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
                 WHERE ri."recipeId" = ANY(:recipe_ids)
                 AND ri."deletedAt" IS NULL
                 ORDER BY ri."recipeId", ri.order
@@ -966,7 +1054,8 @@ class RecipeSearchPipelineSDK:
                 ingredients_map[recipe_id].append({
                     "name": ir[5],
                     "amount": ir[1],
-                    "unit": str(ir[2]) if ir[2] else None
+                    "unit": ir[6],  # unit name from translation table
+                    "unit_id": str(ir[2]) if ir[2] else None
                 })
 
         # =====================================================
@@ -1132,8 +1221,11 @@ class RecipeSearchPipelineSDK:
                     if priority_score == 0:
                         priority_score = 50
 
-            # Get similarity score
-            similarity = similarity_scores.get(recipe_id, 0.7)
+            # Get similarity score (default to 0.7 for SQL_ONLY queries where no embeddings were used)
+            if retrieval_plan and retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
+                similarity = similarity_scores.get(recipe_id, 0.5)
+            else:
+                similarity = similarity_scores.get(recipe_id, 0.7)
 
             # Get ingredients from pre-loaded map
             ingredient_list = ingredients_map.get(recipe_id, [])
@@ -1425,6 +1517,379 @@ class RecipeSearchPipelineSDK:
 
         return contextual_query
 
+    async def _handle_cost_nutrition_filter_query(
+        self,
+        query: str,
+        nlid_result: Dict[str, Any],
+        session: SessionState,
+        user_uid: Optional[str],
+        language: Optional[str]
+    ) -> Dict[str, Any]:
+        """
+        Handle price_filter and nutrition_filter intents with DIRECT SQL queries.
+
+        These queries bypass embedding search entirely and query recipe_metadata directly.
+        This provides accurate filtering by cost and nutrition values stored in the database.
+
+        Args:
+            query: User's query text
+            nlid_result: NLID detection result
+            session: Session state
+            user_uid: User identifier
+            language: Language code
+
+        Returns:
+            Response dictionary with recipes and metadata
+        """
+        from sqlalchemy import text
+
+        pipeline_start_time = time.time()
+        intent = nlid_result.get("intent", "")
+        filters = nlid_result.get("filters", {})
+
+        logger.info(f"[COST/NUTRITION FILTER] Processing intent: {intent}")
+        logger.info(f"[COST/NUTRITION FILTER] Filters from NLID: {filters}")
+
+        # Extract cost and nutrition filters
+        cost_filter = filters.get("cost")
+        nutrition_filter = filters.get("nutrition")
+
+        # Fallback: try to extract from query if NLID didn't provide them
+        if not cost_filter and intent == "price_filter":
+            cost_filter = extract_cost_filter(query)
+            logger.info(f"[COST/NUTRITION FILTER] Extracted cost filter from query: {cost_filter}")
+
+        if not nutrition_filter and intent == "nutrition_filter":
+            nutrition_filter = extract_nutrition_filter(query)
+            logger.info(f"[COST/NUTRITION FILTER] Extracted nutrition filter from query: {nutrition_filter}")
+
+        # Get session context for additional filters (dietary restrictions, allergies, etc.)
+        session_context = self.session_manager.get_user_context(session, {})
+        session_filters = session_context.get("filters", {})
+
+        # Merge with NLID filters
+        merged_filters = {**session_filters, **filters}
+
+        # Build additional SQL conditions from session context
+        additional_conditions = build_session_filter_conditions(merged_filters)
+
+        # Build the SQL query
+        sql_query = None
+
+        if cost_filter and nutrition_filter:
+            # Combined cost + nutrition filter
+            logger.info(f"[COST/NUTRITION FILTER] Building combined cost + nutrition SQL")
+            sql_query = build_recipe_combined_filter_sql(
+                cost_filter=cost_filter,
+                nutrition_filter=nutrition_filter,
+                user_uid=user_uid or "",
+                language=language or "en",
+                additional_conditions=additional_conditions,
+                limit=20
+            )
+        elif cost_filter:
+            # Cost-only filter
+            logger.info(f"[COST/NUTRITION FILTER] Building cost filter SQL: {cost_filter}")
+            sql_query = build_recipe_cost_filter_sql(
+                cost_filter=cost_filter,
+                user_uid=user_uid or "",
+                language=language or "en",
+                additional_conditions=additional_conditions,
+                limit=20
+            )
+        elif nutrition_filter:
+            # Nutrition-only filter
+            logger.info(f"[COST/NUTRITION FILTER] Building nutrition filter SQL: {nutrition_filter}")
+            sql_query = build_recipe_nutrition_filter_sql(
+                nutrition_filter=nutrition_filter,
+                user_uid=user_uid or "",
+                language=language or "en",
+                additional_conditions=additional_conditions,
+                limit=20
+            )
+        else:
+            # No valid filters found - fall back to error message
+            logger.warning(f"[COST/NUTRITION FILTER] No valid filters found, returning guidance")
+            error_response = "I couldn't understand the cost or nutrition filter you're looking for. Try queries like 'recipes under $20' or 'high protein meals'."
+            session.add_to_history("assistant", error_response)
+            self.session_manager.save_session(session)
+            return {
+                "response": error_response,
+                "metadata": {
+                    "intent": intent,
+                    "is_cooking_related": True,
+                    "retrieval_strategy": "direct_sql",
+                    "num_results": 0,
+                    "error": "No valid filters"
+                }
+            }
+
+        logger.info(f"[COST/NUTRITION FILTER] Generated SQL:\n{sql_query}")
+
+        # Execute the SQL query
+        try:
+            result = self.db.execute(text(sql_query))
+            rows = [dict(row._mapping) for row in result.fetchall()]
+            logger.info(f"[COST/NUTRITION FILTER] ✓ SQL executed, {len(rows)} results")
+        except Exception as e:
+            logger.error(f"[COST/NUTRITION FILTER] SQL execution error: {e}")
+            error_response = "I encountered an error while searching for recipes. Please try again."
+            session.add_to_history("assistant", error_response)
+            self.session_manager.save_session(session)
+            return {
+                "response": error_response,
+                "metadata": {
+                    "intent": intent,
+                    "is_cooking_related": True,
+                    "retrieval_strategy": "direct_sql",
+                    "num_results": 0,
+                    "error": str(e)
+                }
+            }
+
+        # Post-process the results
+        processed_recipes = await self._post_process_cost_nutrition_results(
+            rows,
+            user_uid,
+            cost_filter,
+            nutrition_filter
+        )
+
+        # Limit to MAX_RECIPES
+        final_recipes = processed_recipes[:self.MAX_RECIPES]
+
+        # Generate natural language response
+        if final_recipes:
+            response = await self._generate_cost_nutrition_response(
+                query, final_recipes, intent, cost_filter, nutrition_filter
+            )
+        else:
+            response = await self._generate_no_results_response(query, nlid_result)
+
+        # Save to session
+        session.add_to_history("assistant", response)
+        self.session_manager.save_session(session)
+
+        # Build metadata
+        metadata = {
+            "intent": intent,
+            "is_cooking_related": True,
+            "retrieval_strategy": "direct_sql",
+            "num_results": len(final_recipes),
+            "pipeline_duration_ms": round((time.time() - pipeline_start_time) * 1000, 2),
+            "filters_applied": {
+                "cost": cost_filter,
+                "nutrition": nutrition_filter
+            },
+            "recipes": [
+                {
+                    "id": r.get("id"),
+                    "name": r.get("name"),
+                    "ingress": r.get("ingress"),
+                    "image": r.get("image"),
+                    "total_time": r.get("total_time"),
+                    "difficulty": r.get("difficulty"),
+                    "servings": r.get("servings"),
+                    "cost": r.get("cost"),
+                    "nutrition_highlight": r.get("nutrition_highlight"),
+                    "access_level": r.get("access_level", "full"),
+                    "ingredients": r.get("ingredients", []),
+                    "instructions": r.get("instructions", []),
+                }
+                for r in final_recipes
+            ]
+        }
+
+        logger.info(f"[COST/NUTRITION FILTER] ✓ Pipeline completed in {time.time() - pipeline_start_time:.3f}s | Results: {len(final_recipes)}")
+
+        return {
+            "response": response,
+            "metadata": metadata
+        }
+
+    async def _post_process_cost_nutrition_results(
+        self,
+        rows: List[Dict[str, Any]],
+        user_uid: Optional[str],
+        cost_filter: Optional[Dict[str, Any]],
+        nutrition_filter: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Post-process cost/nutrition filter results.
+
+        Extracts relevant cost/nutrition data from recipe_metadata for display.
+        Also fetches ingredients and instructions for each recipe.
+        """
+        processed = []
+
+        # Map country codes to lowercase keys used in DB
+        country_key_map = {
+            "US": "usa",
+            "India": "india",
+            "Norway": "norway"
+        }
+
+        # Get all recipe IDs for batch fetching ingredients and instructions
+        recipe_ids = [row.get("id") for row in rows if row.get("id")]
+
+        # Batch fetch ingredients
+        ingredients_map = {}
+        if recipe_ids:
+            try:
+                ingredient_results = self.db.execute(text("""
+                    SELECT
+                        ri."recipeId", ri.amount, ri."unitId", ri.order as ri_order,
+                        i.id as ing_id, i.name as ing_name,
+                        mut.name as unit_name
+                    FROM recipe_ingredient ri
+                    JOIN ingredient i ON ri."ingredientId" = i.id
+                    LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+                    WHERE ri."recipeId" = ANY(:recipe_ids)
+                    AND ri."deletedAt" IS NULL
+                    ORDER BY ri."recipeId", ri.order
+                """), {"recipe_ids": recipe_ids}).fetchall()
+
+                for ir in ingredient_results:
+                    recipe_id = str(ir[0])
+                    if recipe_id not in ingredients_map:
+                        ingredients_map[recipe_id] = []
+                    ingredients_map[recipe_id].append({
+                        "name": ir[5],
+                        "amount": ir[1],
+                        "unit": ir[6],
+                        "unit_id": str(ir[2]) if ir[2] else None
+                    })
+            except Exception as e:
+                logger.warning(f"[COST/NUTRITION FILTER] Failed to fetch ingredients: {e}")
+
+        # Batch fetch instructions
+        instructions_map = {}
+        if recipe_ids:
+            try:
+                instruction_results = self.db.execute(text("""
+                    SELECT "recipeId", "order", description, image
+                    FROM recipe_instruction
+                    WHERE "recipeId" = ANY(:recipe_ids)
+                    AND "deletedAt" IS NULL
+                    ORDER BY "recipeId", "order"
+                """), {"recipe_ids": recipe_ids}).fetchall()
+
+                for instr in instruction_results:
+                    recipe_id = str(instr[0])
+                    if recipe_id not in instructions_map:
+                        instructions_map[recipe_id] = []
+                    instructions_map[recipe_id].append({
+                        "order": instr[1],
+                        "description": instr[2],
+                        "image": instr[3]
+                    })
+            except Exception as e:
+                logger.warning(f"[COST/NUTRITION FILTER] Failed to fetch instructions: {e}")
+
+        for row in rows:
+            recipe_id = str(row.get("id"))
+            metadata = row.get("recipe_metadata") or {}
+
+            # Parse metadata if it's a string
+            if isinstance(metadata, str):
+                import json
+                try:
+                    metadata = json.loads(metadata)
+                except:
+                    metadata = {}
+
+            # Extract cost info for the relevant country
+            # Structure: pricing -> country -> {total, currency}
+            cost_info = None
+            if cost_filter:
+                country = cost_filter.get("country", "US")
+                country_key = country_key_map.get(country, country.lower())
+                pricing = metadata.get("pricing", {})
+                if pricing and country_key in pricing:
+                    country_pricing = pricing[country_key]
+                    cost_info = {
+                        "amount": country_pricing.get("total", 0),
+                        "country": country,
+                        "currency": country_pricing.get("currency", "$" if country == "US" else "₹" if country == "India" else "NOK")
+                    }
+
+            # Extract nutrition highlight
+            # Structure: totalNutrition -> macros -> nutrient
+            nutrition_highlight = None
+            if nutrition_filter:
+                nutrient_key = nutrition_filter.get("nutrient_key") or nutrition_filter.get("sort_by")
+                if nutrient_key:
+                    # Map common names to actual keys
+                    key_mapping = {
+                        "protein": "protein",
+                        "carbohydrates": "carbohydrates",
+                        "carbs": "carbohydrates",
+                        "totalFat": "totalFat",
+                        "fat": "totalFat",
+                        "energyKcal": "energyKcal",
+                        "calories": "energyKcal",
+                        "totalFiber": "totalFiber",
+                        "fiber": "totalFiber",
+                        "totalSugars": "totalSugars",
+                        "sugar": "totalSugars"
+                    }
+                    actual_key = key_mapping.get(nutrient_key, nutrient_key)
+                    # Get from totalNutrition -> macros
+                    total_nutrition = metadata.get("totalNutrition", {})
+                    macros = total_nutrition.get("macros", {})
+                    if macros and actual_key in macros:
+                        nutrition_highlight = {
+                            "nutrient": nutrient_key,
+                            "value": macros[actual_key],
+                            "level": nutrition_filter.get("level", "high")
+                        }
+
+            processed.append({
+                "id": recipe_id,
+                "name": row.get("name"),
+                "ingress": row.get("ingress"),
+                "image": row.get("image"),
+                "total_time": row.get("total_time"),
+                "difficulty": row.get("difficulty"),
+                "servings": row.get("servings"),
+                "cost": cost_info,
+                "nutrition_highlight": nutrition_highlight,
+                "recipe_metadata": metadata,
+                "access_level": "full",
+                "ingredients": ingredients_map.get(recipe_id, []),
+                "instructions": instructions_map.get(recipe_id, [])
+            })
+
+        return processed
+
+    async def _generate_cost_nutrition_response(
+        self,
+        query: str,
+        recipes: List[Dict[str, Any]],
+        intent: str,
+        cost_filter: Optional[Dict[str, Any]],
+        nutrition_filter: Optional[Dict[str, Any]]
+    ) -> str:
+        """
+        Generate natural language response for cost/nutrition filter queries.
+        Uses the standard NLG agent for consistent, natural responses.
+        """
+        if not recipes:
+            return await self._generate_no_results_response(query, {"intent": intent})
+
+        # Use the standard NLG agent for generating response
+        # This provides consistent, natural language responses
+        nlid_result = {
+            "intent": intent,
+            "filters": {}
+        }
+        if cost_filter:
+            nlid_result["filters"]["cost"] = cost_filter
+        if nutrition_filter:
+            nlid_result["filters"]["nutrition"] = nutrition_filter
+
+        return await self._generate_natural_language_response(query, recipes, nlid_result)
+
     async def _handle_special_query(
         self,
         query: str,
@@ -1443,6 +1908,7 @@ class RecipeSearchPipelineSDK:
         entities = nlid_result.get("entities", {})
 
         logger.info(f"[SPECIAL QUERY] Handling intent: {intent}")
+        logger.info(f"[SPECIAL QUERY] Entities: {entities}")
 
         response_data = None
         metadata = {
@@ -1453,67 +1919,138 @@ class RecipeSearchPipelineSDK:
 
         if intent == "pricing_info":
             # Handle pricing queries - can be for ingredients OR recipes
-            ingredients = entities.get("ingredients", [])
-            recipes = entities.get("recipes", [])
+            # Entities can be: {"ingredients": ["sugar"]} or {"ingredients": "sugar"}
+            raw_ingredients = entities.get("ingredients", [])
+            raw_recipes = entities.get("recipes", [])
+
+            # Normalize to list
+            ingredients = raw_ingredients if isinstance(raw_ingredients, list) else [raw_ingredients] if raw_ingredients else []
+            recipes = raw_recipes if isinstance(raw_recipes, list) else [raw_recipes] if raw_recipes else []
+
             parameters = nlid_result.get("parameters", {})
             country_code = parameters.get("country") or parameters.get("region")
 
-            # Check if this is a recipe cost query (patterns like "price to make X", "cost of making X")
+            # Also check entities for country
+            if not country_code:
+                raw_country = entities.get("country", [])
+                country_list = raw_country if isinstance(raw_country, list) else [raw_country] if raw_country else []
+                if country_list:
+                    country_code = country_list[0]
+
+            logger.info(f"[SPECIAL QUERY] Parsed - ingredients: {ingredients}, recipes: {recipes}, country: {country_code}")
+
+            # Check if this is explicitly a recipe cost query (patterns like "price to make X", "cost of making X")
             query_lower = query.lower()
             is_recipe_cost_query = any(pattern in query_lower for pattern in [
-                "to make", "to cook", "cost of making", "price to make", "how much to make"
+                "to make", "to cook", "cost of making", "price to make", "how much to make", "recipe"
             ])
 
-            # Prioritize recipe cost if detected by pattern or if recipe entity exists
-            if (is_recipe_cost_query or recipes) and not ingredients:
-                # This is a recipe cost query
-                # Extract recipe name from query if not in entities
-                if not recipes:
-                    # Try to extract recipe name from query patterns
-                    import re
-                    recipe_patterns = [
-                        r"price to make\s+(.+?)(?:\s|$|\?)",
-                        r"cost of making\s+(.+?)(?:\s|$|\?)",
-                        r"how much to make\s+(.+?)(?:\s|$|\?)",
-                        r"price of\s+(.+?)(?:\s|$|\?)",
-                    ]
-                    for pattern in recipe_patterns:
-                        match = re.search(pattern, query_lower)
-                        if match:
-                            recipe_name = match.group(1).strip()
-                            recipes = [recipe_name]
-                            break
+            # Determine lookup order based on NLID classification
+            # If NLID says it's an ingredient, check ingredients FIRST
+            # If NLID says it's a recipe OR query has recipe patterns, check recipes FIRST
+            check_ingredient_first = bool(ingredients) and not recipes and not is_recipe_cost_query
 
-                if recipes:
-                    recipe_name = recipes[0]
-                    logger.info(f"[PRICING] Looking up recipe cost for: {recipe_name}, country: {country_code}")
+            item_to_lookup = None
+            if ingredients:
+                item_to_lookup = ingredients[0]
+            elif recipes:
+                item_to_lookup = recipes[0]
 
-                    # Search for recipe by name
-                    from models import Recipe
-                    recipe = self.db.query(Recipe).filter(
-                        Recipe.name.ilike(f"%{recipe_name}%")
-                    ).first()
+            if item_to_lookup:
+                from models import Recipe
 
-                    if recipe:
-                        cost_data = get_recipe_cost(self.db, str(recipe.id), country_code)
-                        response_data = cost_data
-                        response_data["query_type"] = "recipe_cost"
-                        metadata["recipe"] = recipe_name
-                        metadata["recipe_id"] = str(recipe.id)
+                if check_ingredient_first:
+                    # NLID identified as ingredient - check ingredient pricing first
+                    logger.info(f"[PRICING] Looking up price for ingredient: {item_to_lookup}, country: {country_code}")
+                    pricing_data = get_ingredient_pricing(self.db, item_to_lookup, country_code)
+
+                    if pricing_data:
+                        response_data = pricing_data
+                        response_data["query_type"] = "ingredient_price"
+                        metadata["ingredient"] = item_to_lookup
                         metadata["country_code"] = country_code
                     else:
-                        logger.info(f"[PRICING] Recipe not found: {recipe_name}")
+                        # Ingredient not found OR no pricing data for specified country
+                        # DO NOT fall back to recipe lookup for ingredient price queries
+                        # This prevents "price of banana" from returning "Banana Blueberry Muffins" recipe cost
+                        logger.info(f"[PRICING] No pricing data found for ingredient: {item_to_lookup}")
+                        metadata["ingredient"] = item_to_lookup
+                        metadata["country_code"] = country_code
+                        # Let LLM fallback provide a general knowledge answer
+                else:
+                    # NLID identified as recipe OR has recipe patterns - check recipe first
+                    # BUT: If query has strong ingredient pricing signals AND item is likely a single ingredient
+                    # (not a multi-word recipe name), try ingredient first
 
-            # If not a recipe cost query, handle as ingredient pricing
-            if not response_data and ingredients:
-                ingredient_name = ingredients[0]
-                logger.info(f"[PRICING] Looking up price for ingredient: {ingredient_name}, country: {country_code}")
+                    # Only consider ingredient pricing if:
+                    # 1. Has ingredient pricing patterns
+                    # 2. NOT a recipe cost query pattern
+                    # 3. Item is short (1-2 words, likely an ingredient not a recipe name)
+                    item_word_count = len(item_to_lookup.split()) if item_to_lookup else 0
+                    is_likely_ingredient_price = (
+                        any(pattern in query_lower for pattern in [
+                            "price of", "cost of", "price for", "cost for", "how much is", "what is the price", "what is the cost"
+                        ])
+                        and not is_recipe_cost_query
+                        and item_word_count <= 2  # Single ingredient like "banana" or "tomato sauce"
+                        and not recipes  # NLID didn't identify it as a recipe
+                    )
 
-                pricing_data = get_ingredient_pricing(self.db, ingredient_name, country_code)
-                response_data = pricing_data
-                response_data["query_type"] = "ingredient_price"
-                metadata["ingredient"] = ingredient_name
-                metadata["country_code"] = country_code
+                    if is_likely_ingredient_price:
+                        # Query looks like ingredient price, try that first
+                        logger.info(f"[PRICING] Query suggests ingredient price, checking ingredient first: {item_to_lookup}")
+                        pricing_data = get_ingredient_pricing(self.db, item_to_lookup, country_code)
+                        if pricing_data:
+                            response_data = pricing_data
+                            response_data["query_type"] = "ingredient_price"
+                            metadata["ingredient"] = item_to_lookup
+                            metadata["country_code"] = country_code
+                        else:
+                            # No ingredient pricing, let LLM handle it (don't fall back to recipe)
+                            logger.info(f"[PRICING] No ingredient pricing found for: {item_to_lookup}")
+                            metadata["ingredient"] = item_to_lookup
+                            metadata["country_code"] = country_code
+                    else:
+                        # Standard recipe cost query
+                        recipe = self.db.query(Recipe).filter(
+                            Recipe.name.ilike(f"%{item_to_lookup}%")
+                        ).first()
+
+                        if recipe:
+                            logger.info(f"[PRICING] Looking up recipe cost for: {recipe.name}, country: {country_code}")
+                            cost_data = get_recipe_cost(self.db, str(recipe.id), country_code)
+                            if cost_data:
+                                response_data = cost_data
+                                response_data["query_type"] = "recipe_cost"
+                                metadata["recipe"] = recipe.name
+                                metadata["recipe_id"] = str(recipe.id)
+                                metadata["country_code"] = country_code
+                            else:
+                                # Recipe found but no cost data - set recipe metadata for error response
+                                response_data = {
+                                    "query_type": "recipe_cost",
+                                    "recipe": recipe.name,
+                                    "recipe_id": str(recipe.id),
+                                    "country_code": country_code,
+                                    "error": f"No cost data found for recipe '{recipe.name}'"
+                                }
+                                metadata["recipe"] = recipe.name
+                                metadata["recipe_id"] = str(recipe.id)
+                                metadata["country_code"] = country_code
+                        else:
+                            # Not found as recipe - try as ingredient (fallback)
+                            logger.info(f"[PRICING] Recipe not found, trying as ingredient: {item_to_lookup}")
+                            pricing_data = get_ingredient_pricing(self.db, item_to_lookup, country_code)
+                            if pricing_data:
+                                response_data = pricing_data
+                                response_data["query_type"] = "ingredient_price"
+                                metadata["ingredient"] = item_to_lookup
+                                metadata["country_code"] = country_code
+                            else:
+                                # Not found anywhere - let LLM handle it
+                                logger.info(f"[PRICING] No data found anywhere for: {item_to_lookup}")
+                                metadata["ingredient"] = item_to_lookup
+                                metadata["country_code"] = country_code
 
         elif intent == "nutritional_info":
             # Handle ingredient nutrition queries
@@ -1529,7 +2066,25 @@ class RecipeSearchPipelineSDK:
                 ingredient_results = search_ingredients_by_name(self.db, ingredient_name, limit=1)
                 if ingredient_results:
                     nutrition_data = get_ingredient_nutrition(self.db, str(ingredient_results[0].id))
-                    response_data = nutrition_data
+                    if nutrition_data:
+                        response_data = nutrition_data
+                        response_data["query_type"] = "ingredient_nutrition"
+                        metadata["ingredient"] = ingredient_name
+                    else:
+                        logger.info(f"[NUTRITION] No nutrition data found for ingredient: {ingredient_name}")
+                        response_data = {
+                            "query_type": "ingredient_nutrition",
+                            "ingredient": ingredient_name,
+                            "error": f"No nutrition data found for '{ingredient_name}'"
+                        }
+                        metadata["ingredient"] = ingredient_name
+                else:
+                    logger.info(f"[NUTRITION] Ingredient not found: {ingredient_name}")
+                    response_data = {
+                        "query_type": "ingredient_nutrition",
+                        "ingredient": ingredient_name,
+                        "error": f"Ingredient '{ingredient_name}' not found"
+                    }
                     metadata["ingredient"] = ingredient_name
 
             elif recipes:
@@ -1545,24 +2100,59 @@ class RecipeSearchPipelineSDK:
 
                 if recipe:
                     nutrition_data = get_recipe_nutrition(self.db, str(recipe.id))
-                    response_data = nutrition_data
+                    if nutrition_data:
+                        response_data = nutrition_data
+                        response_data["query_type"] = "recipe_nutrition"
+                        metadata["recipe"] = recipe_name
+                        metadata["recipe_id"] = str(recipe.id)
+                    else:
+                        logger.info(f"[NUTRITION] No nutrition data found for recipe: {recipe_name}")
+                        response_data = {
+                            "query_type": "recipe_nutrition",
+                            "recipe": recipe_name,
+                            "recipe_id": str(recipe.id),
+                            "error": f"No nutrition data found for recipe '{recipe_name}'"
+                        }
+                        metadata["recipe"] = recipe_name
+                        metadata["recipe_id"] = str(recipe.id)
+                else:
+                    logger.info(f"[NUTRITION] Recipe not found: {recipe_name}")
+                    response_data = {
+                        "query_type": "recipe_nutrition",
+                        "recipe": recipe_name,
+                        "error": f"Recipe '{recipe_name}' not found"
+                    }
                     metadata["recipe"] = recipe_name
-                    metadata["recipe_id"] = str(recipe.id)
 
         # Generate natural language response
-        # Check if we have actual data (not just empty pricing list)
+        # Check if we have actual data (not just empty pricing list or error)
         has_data = False
+        has_error = False
         if response_data:
-            if intent == "pricing_info":
-                query_type = response_data.get("query_type", "ingredient_price")
-                if query_type == "recipe_cost":
-                    has_data = response_data.get("total_cost") is not None
-                else:
-                    has_data = bool(response_data.get("pricing"))
-            elif intent == "nutritional_info":
-                has_data = bool(response_data.get("macros") or response_data.get("micros"))
+            has_error = "error" in response_data
+            if not has_error:
+                if intent == "pricing_info":
+                    query_type = response_data.get("query_type", "ingredient_price")
+                    if query_type == "recipe_cost":
+                        # Check for multi-country response (countries list) OR single-country response (total_cost)
+                        has_data = bool(response_data.get("countries")) or response_data.get("total_cost") is not None
+                    else:
+                        has_data = bool(response_data.get("pricing"))
+                elif intent == "nutritional_info":
+                    has_data = bool(response_data.get("macros") or response_data.get("micros"))
 
-        if has_data:
+        if has_error:
+            # Generate error response
+            error_msg = response_data.get("error", "Data not found")
+            response = f"I'm sorry, I couldn't find the information you're looking for. {error_msg}"
+            session.add_to_history("assistant", response)
+            self.session_manager.save_session(session)
+
+            return {
+                "response": response,
+                "metadata": {**metadata, "num_results": 0, "error": error_msg}
+            }
+        elif has_data:
             response = await self._format_special_query_response(
                 query, intent, response_data
             )
@@ -1653,38 +2243,91 @@ class RecipeSearchPipelineSDK:
 
     def _format_recipe_cost_response(self, data: Dict[str, Any]) -> str:
         """Format recipe cost data into natural language"""
-        if not data or data.get("total_cost") is None:
-            return f"Sorry, I couldn't find pricing information for {data.get('recipe_name', 'that recipe')}."
-
         recipe_name = data.get("recipe_name", "the recipe")
+        servings = data.get("servings", 1)
+
+        # Check if this is a multi-country response
+        if "countries" in data:
+            # Multi-country response format
+            countries_data = data.get("countries", [])
+            if not countries_data:
+                return f"Sorry, I couldn't find pricing information for {recipe_name}."
+
+            response_parts = [f"Here's the pricing information for **{recipe_name}**:\n"]
+
+            for country_data in countries_data:
+                country_name = country_data.get("country_name", "Unknown")
+                currency = country_data.get("currency_symbol", "")
+                total_cost = country_data.get("total_cost", 0)
+                cost_per_serving = country_data.get("cost_per_serving", total_cost)
+                ingredient_costs = country_data.get("ingredient_costs", [])
+
+                # Country header with total cost
+                serving_text = f" per serving" if servings > 1 else ""
+                response_parts.append(f"**{country_name}**: {currency}{total_cost:.2f}{serving_text}")
+
+                # Ingredient breakdown
+                if ingredient_costs:
+                    for ing in ingredient_costs:
+                        ing_name = ing.get("ingredient", "")
+                        amount = ing.get("amount", "")
+                        unit = ing.get("unit", "")
+                        cost = ing.get("cost")
+
+                        # Format amount with unit if available
+                        amount_str = f" ({amount} {unit})" if amount and unit else f" ({amount})" if amount else ""
+
+                        if cost is not None:
+                            response_parts.append(f"  - {ing_name}{amount_str}: {currency}{cost:.2f}")
+                        elif ing.get("note"):
+                            response_parts.append(f"  - {ing_name}{amount_str}: {ing.get('note')}")
+
+                response_parts.append("")  # Empty line between countries
+
+            return "\n".join(response_parts).rstrip()
+
+        # Single country response format
+        if not data or data.get("total_cost") is None:
+            return f"Sorry, I couldn't find pricing information for {recipe_name}."
+
         currency = data.get("currency_symbol", "")
         currency_code = data.get("currency", "")
+        country_name = data.get("country_name", "")
         total_cost = data.get("total_cost", 0)
-        servings = data.get("servings", 1)
         cost_per_serving = data.get("cost_per_serving", total_cost)
         ingredient_costs = data.get("ingredient_costs", [])
 
-        # Build response
-        response_parts = [
-            f"The approximate cost to make **{recipe_name}** is {currency}{total_cost:.2f}."
-        ]
+        # Build response with country info if available
+        if country_name:
+            response_parts = [
+                f"The price of **{recipe_name}** in {country_name} ({currency_code}) is {currency}{total_cost:.2f}."
+            ]
+        else:
+            response_parts = [
+                f"The approximate cost to make **{recipe_name}** is {currency}{total_cost:.2f}."
+            ]
 
         if servings > 1:
             response_parts.append(f"That's about {currency}{cost_per_serving:.2f} per serving (serves {servings}).")
 
-        # Add ingredient breakdown if available
+        # Add ingredient breakdown if available - SHOW ALL INGREDIENTS with amounts
         if ingredient_costs:
-            response_parts.append("\n**Ingredient cost breakdown:**")
-            for ing in ingredient_costs[:5]:  # Show first 5 ingredients
+            response_parts.append("")  # Empty line before breakdown
+            for ing in ingredient_costs:
                 ing_name = ing.get("ingredient", "")
+                amount = ing.get("amount", "")
+                unit = ing.get("unit", "")
                 cost = ing.get("cost")
+
+                # Format amount with unit if available
+                amount_str = f" ({amount} {unit})" if amount and unit else f" ({amount})" if amount else ""
+
                 if cost is not None:
-                    response_parts.append(f"- {ing_name}: {currency}{cost:.2f}")
+                    response_parts.append(f"  - {ing_name}{amount_str}: {currency}{cost:.2f}")
+                elif ing.get("note"):
+                    response_parts.append(f"  - {ing_name}{amount_str}: {ing.get('note')}")
 
-            if len(ingredient_costs) > 5:
-                response_parts.append(f"- ... and {len(ingredient_costs) - 5} more ingredients")
-
-        return " ".join(response_parts)
+        return "\n".join(response_parts)
 
     def _format_nutrition_response(self, data: Dict[str, Any]) -> str:
         """Format nutrition data into natural language"""
@@ -1785,7 +2428,8 @@ class RecipeSearchPipelineSDK:
                     ])
             else:
                 # Ingredient pricing query
-                ingredient = entities.get("ingredients", [None])[0]
+                ingredients_list = entities.get("ingredients", [])
+                ingredient = ingredients_list[0] if ingredients_list else None
                 if not ingredient:
                     # Try to extract ingredient from query
                     import re
@@ -1811,7 +2455,9 @@ class RecipeSearchPipelineSDK:
                     ])
 
         elif intent == "nutritional_info":
-            item = entities.get("ingredients", entities.get("recipes", ["that item"]))[0]
+            ingredients_list = entities.get("ingredients", [])
+            recipes_list = entities.get("recipes", [])
+            item = ingredients_list[0] if ingredients_list else (recipes_list[0] if recipes_list else "that item")
             context_parts.extend([
                 f"The user is asking about nutrition for: {item}",
                 "Provide general nutritional information if you know it.",

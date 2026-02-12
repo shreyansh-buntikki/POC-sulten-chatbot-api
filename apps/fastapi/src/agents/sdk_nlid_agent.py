@@ -24,7 +24,7 @@ class IntentOutput(BaseModel):
         description="Whether the query is related to cooking, recipes, food, or kitchen activities"
     )
     intent: str = Field(
-        description="The primary intent category (e.g., recipe_search, nutritional_info, ingredient_substitution, recommendation, general_chat)"
+        description="The primary intent category (e.g., recipe_search, nutritional_info, ingredient_substitution, recommendation, general_chat, nutrition_filter, price_filter)"
     )
     entities: Dict[str, Any] = Field(
         default_factory=dict,
@@ -36,13 +36,17 @@ class IntentOutput(BaseModel):
     )
     filters: Dict[str, Any] = Field(
         default_factory=dict,
-        description="User preference filters for filtering results"
+        description="User preference filters for filtering results. For nutrition_filter: include 'nutrition' with sort_by, order, level. For price_filter: include 'cost' with operator, value, country."
     )
     summary: str = Field(
         description="A brief summary of what the user is looking for"
     )
     confidence: str = Field(
         description="Confidence level: high, medium, or low"
+    )
+    requires_embedding: bool = Field(
+        default=True,
+        description="Whether this query requires embedding search. Set to False for nutrition_filter and price_filter intents."
     )
 
 
@@ -135,6 +139,19 @@ Choose the most appropriate intent from the following categories:
    - Parameters: serving size, per 100g vs per serving
    - Filters: specific nutrients to highlight
 
+2a. **nutrition_filter**: User wants recipes based on nutritional criteria (SKIP EMBEDDING SEARCH)
+   - Examples: "high protein recipes", "low carb meals", "high fat options", "low sugar desserts"
+   - Examples: "recipes under 300 calories", "high protein meals", "low fat recipes"
+   - Examples: "suggest me high protein recipes", "show me low carb options"
+   - Entities: nutrient types (protein, carbs, fat, calories, fiber, sugar)
+   - Parameters: thresholds (e.g., "high" = sort DESC, "low" = sort ASC)
+   - Filters: 
+     * nutrition.sort_by: the nutrient to sort by (protein, carbohydrates, totalFat, energyKcal, totalFiber, totalSugars)
+     * nutrition.order: "DESC" for high, "ASC" for low
+     * nutrition.level: "high" or "low"
+   - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
+   - **CRITICAL**: Return filters.nutrition with sort_by, order, and level
+
 3. **ingredient_substitution**: User wants ingredient substitutes
    - Examples: "What can I use instead of eggs?", "Substitute for butter", "No milk options"
    - Entities: original ingredient, quantity, context (baking, cooking, etc.)
@@ -153,6 +170,26 @@ Choose the most appropriate intent from the following categories:
    - Parameters: country/region (if specified), quantity
    - Filters: None
    - IMPORTANT: Use pricing_info intent when user asks about "cost", "price", "how much is" for ingredients
+
+5a. **price_filter**: User wants recipes based on price criteria (SKIP EMBEDDING SEARCH)
+   - Examples: "recipes under 20 dollars", "budget meals", "expensive recipes", "cheap options"
+   - Examples: "what can I make for under 10$", "affordable dinner ideas", "meals under 500 rupees"
+   - Examples: "recipes under $20", "dishes below 100 kr"
+   - Entities: price amounts, currency indicators ($, ₹, kr, rupees, dollars, etc.)
+   - Parameters: 
+     * max_price: the maximum price value
+     * currency: detected currency (USD, INR, NOK)
+     * country: mapped country (US, India, Norway) based on currency
+   - Filters:
+     * cost.operator: "<=" for under/below/less than
+     * cost.value: the numeric price value
+     * cost.country: "US" for $, "India" for ₹/Rs, "Norway" for kr
+   - Currency to country mapping:
+     * $ / USD / dollars → US
+     * ₹ / INR / Rs / rupees → India  
+     * kr / NOK / krone → Norway
+   - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
+   - **CRITICAL**: Return filters.cost with operator, value, and country
 
 6. **general_chat**: General conversation or greeting
    - Examples: "Hello", "How are you?", "Thanks!", "What can you do?"
@@ -267,10 +304,71 @@ Return a JSON object with the following structure:
   "filters": {
     "include_ingredients": [],
     "exclude_ingredients": [],
+    "nutrition": {"sort_by": "protein", "order": "DESC", "level": "high"},
+    "cost": {"operator": "<=", "value": 20, "country": "US"},
     ...
   },
   "summary": "Brief summary",
-  "confidence": "high/medium/low"
+  "confidence": "high/medium/low",
+  "requires_embedding": true/false
+}
+
+## CRITICAL Examples for nutrition_filter and price_filter:
+
+Example 1: "suggest me high protein recipes"
+{
+  "is_cooking_related": true,
+  "intent": "nutrition_filter",
+  "entities": {"nutrients": ["protein"]},
+  "parameters": {},
+  "filters": {
+    "nutrition": {"sort_by": "protein", "order": "DESC", "level": "high"}
+  },
+  "summary": "User wants recipes high in protein, sorted by protein content descending",
+  "confidence": "high",
+  "requires_embedding": false
+}
+
+Example 2: "recipes under $20"
+{
+  "is_cooking_related": true,
+  "intent": "price_filter",
+  "entities": {"price": 20, "currency": "USD"},
+  "parameters": {"max_price": 20, "currency": "USD", "country": "US"},
+  "filters": {
+    "cost": {"operator": "<=", "value": 20, "country": "US"}
+  },
+  "summary": "User wants recipes that cost $20 or less",
+  "confidence": "high",
+  "requires_embedding": false
+}
+
+Example 3: "low carb dinner ideas"
+{
+  "is_cooking_related": true,
+  "intent": "nutrition_filter",
+  "entities": {"nutrients": ["carbohydrates"], "meal_type": "dinner"},
+  "parameters": {},
+  "filters": {
+    "nutrition": {"sort_by": "carbohydrates", "order": "ASC", "level": "low"}
+  },
+  "summary": "User wants dinner recipes low in carbohydrates",
+  "confidence": "high",
+  "requires_embedding": false
+}
+
+Example 4: "meals under 500 rupees"
+{
+  "is_cooking_related": true,
+  "intent": "price_filter",
+  "entities": {"price": 500, "currency": "INR"},
+  "parameters": {"max_price": 500, "currency": "INR", "country": "India"},
+  "filters": {
+    "cost": {"operator": "<=", "value": 500, "country": "India"}
+  },
+  "summary": "User wants meals that cost 500 rupees or less in India",
+  "confidence": "high",
+  "requires_embedding": false
 }
 
 Analyze the user's query carefully and provide accurate structured output.""",

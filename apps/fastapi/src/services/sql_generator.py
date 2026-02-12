@@ -222,14 +222,17 @@ class SQLGenerator:
             query, nlid_result, sql_filters, session_context, candidate_ids, relevant_schema
         )
 
-        import logging
-        logger = logging.getLogger(__name__)
 
         # DEBUG: Log the sql_filters to verify ingredients are excluded
         logger.info(f"[SQL GENERATOR] sql_filters keys: {list(sql_filters.keys())}")
         logger.info(f"[SQL GENERATOR] included_ingredients in filters: {'included_ingredients' in sql_filters}")
         if 'included_ingredients' in sql_filters:
             logger.info(f"[SQL GENERATOR] included_ingredients value: {sql_filters['included_ingredients']}")
+
+        # Log nutrition and pricing filters
+        logger.info(f"[SQL GENERATOR] nutrition filters: {sql_filters.get('nutrition_filters', {})}")
+        logger.info(f"[SQL GENERATOR] pricing filters: {sql_filters.get('pricing_filters', {})}")
+        logger.info(f"[SQL GENERATOR] currency: {sql_filters.get('currency', 'USD')}")
 
         # Generate SQL using LLM
         response = self.client.chat.completions.create(
@@ -385,6 +388,49 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         if sql_filters.get("excluded_ingredients"):
             parts.append(f"- Exclude ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
 
+        # Add nutrition filters
+        if sql_filters.get("nutrition_filters"):
+            nutrition_filters = sql_filters['nutrition_filters']
+            parts.append("\n## Nutrition Filters")
+            for nutrient, constraint in nutrition_filters.items():
+                if isinstance(constraint, str):
+                    # Text-based constraints (high, low, under, over)
+                    parts.append(f"- {nutrient}: {constraint} (e.g., high = >20g, low = <10g)")
+                else:
+                    # Numeric constraints
+                    parts.append(f"- {nutrient}: {constraint}g")
+
+            parts.append("""
+   CRITICAL: For filter-only nutrition queries, use ORDER BY sorting instead of WHERE filter clauses
+   This allows dynamic sorting by actual nutrition values in recipe_metadata
+
+   SORTING LOGIC:
+   - "high protein" → ORDER BY protein DESC (higher protein first)
+   - "low carb" → ORDER BY carbohydrates ASC (lower carbs first)
+   - "high calorie" → ORDER BY calories DESC
+   - "under 300 calories" → ORDER BY calories ASC (under 300)
+
+   DO NOT use hardcoded WHERE clauses like "> 20" or "< 10"
+   Instead, rely on ORDER BY to sort results by actual values""")
+
+        # Add pricing filters
+        if sql_filters.get("pricing_filters"):
+            pricing_filters = sql_filters['pricing_filters']
+            currency = sql_filters.get('currency', 'USD')
+            parts.append(f"\n## Pricing Filters (Currency: {currency})")
+
+            for constraint, amount in pricing_filters.items():
+                if constraint == 'max_price':
+                    parts.append(f"- Max price: {amount} {currency}")
+                    parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
+                    parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) <= {amount}")
+                elif constraint == 'min_price':
+                    parts.append(f"- Min price: {amount} {currency}")
+                    parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
+                    parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) >= {amount}")
+
+            parts.append("  Use appropriate ORDER BY clauses for sorting by price")
+
         # IMPORTANT: Only show included_ingredients if we DON'T have candidate_ids
         # When candidate_ids are provided, embedding search already handled ingredient matching semantically
         if not candidate_ids and sql_filters.get("included_ingredients"):
@@ -403,8 +449,7 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             parts.append(f"  DO NOT use NOT EXISTS - that would exclude recipes with these ingredients!")
         elif candidate_ids and sql_filters.get("included_ingredients"):
             # candidate_ids present but included_ingredients in filters - log warning
-            import logging
-            logger = logging.getLogger(__name__)
+
             logger.warning(f"[SQL GENERATOR] candidate_ids present but included_ingredients in filters - will ignore included_ingredients")
             parts.append(f"  NOTE: included_ingredients ignored - candidate_ids provided, embedding search already handled ingredient matching")
         elif not candidate_ids and not sql_filters.get("included_ingredients"):
@@ -451,8 +496,7 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         This is a safety net to handle cases where the LLM generates incorrect SQL
         """
         import re
-        import logging
-        logger = logging.getLogger(__name__)
+
 
         original_sql = sql
 
@@ -513,8 +557,7 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
     ) -> str:
         """Substitute placeholders in SQL with actual values"""
         import re
-        import logging
-        logger = logging.getLogger(__name__)
+
 
         # Debug: Log original SQL before substitution
         logger.debug(f"[SQL SUBSTITUTION] Before: {sql[:200]}...")
@@ -735,4 +778,3 @@ class SQLExecutionService:
                 "error": str(e),
                 "sql": sql
             }
-

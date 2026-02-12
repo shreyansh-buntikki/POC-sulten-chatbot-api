@@ -5,6 +5,8 @@ This script updates ingredient pricing with realistic country-specific prices
 import sys
 import os
 
+from apps.fastapi import logger
+
 # Add project root to Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -12,15 +14,6 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from models import Ingredient, IngredientPricing
 from sqlalchemy import text
-import logging
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
 
 class CountryPricingFixer:
     """
