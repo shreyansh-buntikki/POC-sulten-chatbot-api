@@ -76,7 +76,10 @@ class ConsoleLogger:
 
     def get_handler(self):
         formatter = ColoredFormatter(
-            f"%(log_color)s%(asctime)s - {self.app_name} - %(request_route)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s%(reset)s",
+            # f"%(log_color)s%(asctime)s - {self.app_name} - %(request_route)s - %(levelname)s - [%(pathname)s:%(lineno)d] - %(message)s%(reset)s",
+            f"%(log_color)s%(asctime)s - {self.app_name} - %(request_route)s - %(levelname)s - [%(filename)s:%("
+            f"lineno)d] - "
+            f"%(message)s%(reset)s",
             datefmt="%Y-%m-%d %H:%M:%S",
             reset=True,
             log_colors={

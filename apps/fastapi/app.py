@@ -1,4 +1,5 @@
 import sys
+import os
 from pathlib import Path
 
 import uvicorn
@@ -10,9 +11,26 @@ from starlette.middleware.cors import CORSMiddleware
 BASE_DIR = str(Path(__file__).resolve().parent.parent.parent)
 sys.path.append(BASE_DIR)
 
+# OpenAI Agents SDK tracing DISABLED for performance
+# Tracing adds 2-3 seconds per call. Enable only for debugging.
+# To enable: uncomment the code below
+# try:
+#     from agents import set_tracing_export_api_key
+#     openai_api_key = os.getenv('OPENAI_API_KEY')
+#     if openai_api_key:
+#         set_tracing_export_api_key(openai_api_key)
+#         print("✅ OpenAI Agents SDK tracing enabled")
+# except ImportError:
+#     print("⚠️  OpenAI Agents SDK not available, tracing disabled")
+# except Exception as e:
+#     print(f"⚠️  Failed to enable SDK tracing: {e}")
+
 
 from apps.fastapi import logger
 from apps.fastapi.src.routes.index import index_route
+from apps.fastapi.src.routes.users import users_route
+from apps.fastapi.src.routes.chat import chat_route
+from apps.fastapi.src.routes.admin import admin_route
 from libs.services.fastapi.openapi_customization import custom_openapi
 from libs.utils.common.exceptions.fastapi import AppException
 from libs.utils.common.models.fastapi.responses import ErrorResponse
@@ -79,7 +97,10 @@ def root():
 
 
 app.include_router(index_route)
+app.include_router(users_route)
+app.include_router(chat_route)
+app.include_router(admin_route)
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=HOST, port=FASTAPI_PORT, reload=False)
+    uvicorn.run("app:app", host=HOST, port=FASTAPI_PORT, reload=True)
