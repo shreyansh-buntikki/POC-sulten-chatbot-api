@@ -319,16 +319,19 @@ class ChatService:
         session_id: Optional[str],
         user_uid: Optional[str],
         message: str,
-        language: Optional[str] = None
+        language: Optional[str] = None,
+        new_session: bool = False
     ) -> Dict[str, Any]:
         """
         Send a message and get AI response using the 10-stage pipeline
 
         Args:
-            session_id: Existing session ID (None creates new session)
+            session_id: Existing session ID (None to auto-detect or create new)
             user_uid: Optional user identifier
             message: User's message content
             language: Optional language code (e.g., 'en', 'no') for filtering recipes
+            new_session: If True, always create a new session (for "Start New Chat" button)
+                        If False and no session_id, try to continue user's most recent session
 
         Returns:
             Dictionary with response and updated session info
@@ -338,14 +341,27 @@ class ChatService:
             self._validate_user_exists(user_uid)
 
         # Step 1: Get or create session
+        session = None
+
         if session_id:
+            # Explicit session_id provided - use it
             session = self.conversation_store.get_session(session_id)
             if not session:
                 return {"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-        else:
-            # Generate title from first message
+            logger.info(f"[CHAT SERVICE] Using provided session: {session.id}")
+        elif not new_session and user_uid:
+            # No session_id, not forcing new session, and user_uid provided
+            # Try to continue the user's most recent active session
+            user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+            if user_sessions:
+                session = user_sessions[0]
+                logger.info(f"[CHAT SERVICE] Continuing most recent active session: {session.id}")
+
+        if not session:
+            # Create new session (either new_session=True or no existing session found)
             title = message[:50] + "..." if len(message) > 50 else message
             session = self.conversation_store.create_session(user_uid, title)
+            logger.info(f"[CHAT SERVICE] Created new session: {session.id}")
 
             # Cleanup old sessions - maintain max 5 sessions per user
             if user_uid:

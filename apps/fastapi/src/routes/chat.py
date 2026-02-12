@@ -69,13 +69,15 @@ class MessageRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Continue existing session (omit for new session)")
     user_uid: Optional[str] = Field(None, description="Optional user identifier")
     message: str = Field(..., min_length=1, description="User's message content")
+    new_session: bool = Field(False, description="Force creation of a new session (use when 'Start New Chat' is clicked)")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "session_id": None,
                 "user_uid": "user-123",
-                "message": "I need a quick chicken recipe for dinner"
+                "message": "I need a quick chicken recipe for dinner",
+                "new_session": False
             }
         }
 
@@ -135,16 +137,17 @@ class ChatRoutes:
         Send a message to the chatbot
 
         - If `session_id` is provided, continues the existing conversation
-        - If `session_id` is omitted, creates a new session
+        - If `session_id` is omitted and `new_session` is False, continues the user's most recent active session
+        - If `session_id` is omitted and `new_session` is True, creates a new session (use for "Start New Chat")
         - Maintains context from the last 10 messages
         - Routes through appropriate AI agent based on intent
         - Language header filters recipes by languageId
         - **Response caching**: Repeated queries return instantly from cache (5 min TTL)
         """
-        logger.info(f"Message received - session: {request.session_id}, user: {request.user_uid}, language: {language}")
+        logger.info(f"Message received - session: {request.session_id}, user: {request.user_uid}, new_session: {request.new_session}, language: {language}")
 
-        # Check cache for identical queries (only for new sessions without context)
-        if not request.session_id:
+        # Check cache for identical queries (only for truly new sessions)
+        if not request.session_id and request.new_session:
             cache_key = _get_cache_key(request.message, request.user_uid, language)
             cached_response = _get_cached_response(cache_key)
             if cached_response:
@@ -157,7 +160,8 @@ class ChatRoutes:
                 session_id=request.session_id,
                 user_uid=request.user_uid,
                 message=request.message,
-                language=language
+                language=language,
+                new_session=request.new_session
             )
 
             if "error" in result:
@@ -166,8 +170,8 @@ class ChatRoutes:
                     detail=result
                 )
 
-            # Cache successful responses for new sessions
-            if not request.session_id and "response" in result:
+            # Cache successful responses for new sessions only
+            if not request.session_id and request.new_session and "response" in result:
                 cache_key = _get_cache_key(request.message, request.user_uid, language)
                 _set_cached_response(cache_key, result)
 
