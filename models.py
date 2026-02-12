@@ -219,6 +219,7 @@ class Recipe(Base):
     private = Column(Boolean, nullable=False, default=False)
     search_vector = Column(Text)  # tsvector (fixed name)
     embedding = Column(Vector(1536), nullable=True)  # For semantic search
+    recipe_metadata = Column(JSON)  # Recipe-specific metadata (renamed from 'metadata' to avoid conflicts)
 
 
 class RecipeIngredient(Base):

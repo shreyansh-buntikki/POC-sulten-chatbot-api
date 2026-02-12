@@ -56,6 +56,7 @@ bundles (collections of recipes for purchase), and various supporting tables.
 | `private` | `BOOLEAN` **NOT NULL** | Whether content is private (not public) |
 | `search_vector` | `TSVECTOR` | Full-text search vector for fast searching |
 | `embedding` | `VECTOR(1536)` | Vector embedding for semantic search (OpenAI text-embedding-3-small) |
+| `recipe_metadata` | `JSONB` | Recipe-specific metadata (renamed from 'metadata' to avoid conflicts) |
 
 
 ### `recipe_ingredient`
