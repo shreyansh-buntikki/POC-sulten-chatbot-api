@@ -858,6 +858,7 @@ def get_recipe_cost_all_countries(
 ) -> Optional[Dict[str, Any]]:
     """
     Calculate the cost of a recipe for all available countries.
+    OPTIMIZED: Single query to fetch all pricing data at once.
 
     Args:
         db: Database session
@@ -880,103 +881,114 @@ def get_recipe_cost_all_countries(
     if not ingredients:
         return None
 
-    # Pre-fetch unit translations for recipe ingredients
-    recipe_unit_query = text("""
-        SELECT ri.id as recipe_ingredient_id, mut.name as unit_name
-        FROM recipe_ingredient ri
-        LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
-        WHERE ri."recipeId" = :recipe_id AND ri."deletedAt" IS NULL
-    """)
-    recipe_units = {str(row[0]): row[1] for row in db.execute(recipe_unit_query, {"recipe_id": recipe_id}).fetchall()}
+    # OPTIMIZED: Single query to get all pricing data for all ingredients across all countries
+    ingredient_ids = [str(ri.ingredientId) for ri in ingredients if ri.ingredientId]
+    if not ingredient_ids:
+        return None
 
-    # Get all countries
-    countries = db.query(Country).all()
+    pricing_query = text("""
+        SELECT 
+            ri.id as recipe_ingredient_id,
+            ri.amount,
+            ri."unitId",
+            mut_recipe.name as recipe_unit,
+            i.name as ingredient_name,
+            ip."pricePerUnit",
+            ip.quantity,
+            mut_pricing.name as pricing_unit,
+            c.code as currency_code,
+            c.symbol as currency_symbol,
+            co.code as country_code,
+            co.name as country_name
+        FROM recipe_ingredient ri
+        JOIN ingredient i ON ri."ingredientId" = i.id
+        LEFT JOIN measuring_unit_translation mut_recipe 
+            ON ri."unitId" = mut_recipe."measuringUnitId" AND mut_recipe."languageId" = 'en'
+        LEFT JOIN ingredient_pricing ip ON i.id = ip."ingredientId"
+        LEFT JOIN currency c ON ip."currencyId" = c.id
+        LEFT JOIN country co ON ip."countryId" = co.id
+        LEFT JOIN measuring_unit_translation mut_pricing 
+            ON ip."measuringUnitId" = mut_pricing."measuringUnitId" AND mut_pricing."languageId" = 'en'
+        WHERE ri."recipeId" = :recipe_id 
+          AND ri."deletedAt" IS NULL
+        ORDER BY co.code, ri."order"
+    """)
+
+    all_pricing = db.execute(pricing_query, {"recipe_id": recipe_id}).fetchall()
+
+    # Organize data by country
+    country_data = {}
+    for row in all_pricing:
+        country_code = row[10]
+
+        if not country_code:
+            continue
+
+        if country_code not in country_data:
+            country_data[country_code] = {
+                "country_name": row[11],
+                "currency_code": row[8],
+                "currency_symbol": row[9],
+                "ingredients": [],
+                "total_cost": 0.0
+            }
+
+        # Calculate cost for this ingredient
+        recipe_amount = row[1] or 1
+        recipe_unit = row[3] or ""
+        ingredient_name = row[4]
+
+        if row[5]:  # Has pricing
+            price_per_unit = float(row[5])
+            pricing_quantity = row[6] or 1
+            pricing_unit = row[7] or ""
+
+            cost = calculate_ingredient_cost(
+                recipe_amount=recipe_amount,
+                recipe_unit=recipe_unit,
+                price_per_unit=price_per_unit,
+                pricing_quantity=pricing_quantity,
+                pricing_unit=pricing_unit
+            )
+
+            country_data[country_code]["ingredients"].append({
+                "ingredient": ingredient_name,
+                "amount": recipe_amount,
+                "unit": recipe_unit,
+                "cost": round(cost, 2),
+                "currency": country_data[country_code]["currency_code"],
+                "currency_symbol": country_data[country_code]["currency_symbol"]
+            })
+
+            country_data[country_code]["total_cost"] += cost
+        else:
+            # No pricing available
+            country_data[country_code]["ingredients"].append({
+                "ingredient": ingredient_name,
+                "amount": recipe_amount,
+                "unit": recipe_unit,
+                "cost": None,
+                "note": "No pricing data available"
+            })
+
+    # Build final response
+    if not country_data:
+        return None
 
     country_costs = []
-
-    for country in countries:
-        total_cost = 0
-        ingredient_costs = []
-        has_pricing = False
-
-        for ri in ingredients:
-            if not ri.ingredientId:
-                continue
-
-            ingredient = db.query(Ingredient).filter(Ingredient.id == ri.ingredientId).first()
-            if not ingredient:
-                continue
-
-            # Get pricing for this ingredient in this country with unit name
-            pricing_query = text("""
-                SELECT ip."pricePerUnit", ip.quantity, c.code as currency_code, c.symbol as currency_symbol,
-                       mut.name as pricing_unit
-                FROM ingredient_pricing ip
-                JOIN currency c ON ip."currencyId" = c.id
-                LEFT JOIN measuring_unit_translation mut ON ip."measuringUnitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
-                WHERE ip."ingredientId" = :ingredient_id AND ip."countryId" = :country_id
-                LIMIT 1
-            """)
-            pricing_result = db.execute(pricing_query, {
-                "ingredient_id": ri.ingredientId,
-                "country_id": country.id
-            }).fetchone()
-
-            # Get the recipe ingredient unit
-            recipe_unit = recipe_units.get(str(ri.id), "")
-
-            if pricing_result:
-                price_per_unit, pricing_quantity, currency_code, currency_symbol, pricing_unit = pricing_result
-                # Calculate cost with proper unit conversion
-                recipe_quantity = ri.amount or 1
-                pricing_qty = pricing_quantity or 1
-
-                # Use the unit conversion function for accurate cost calculation
-                cost = calculate_ingredient_cost(
-                    recipe_amount=recipe_quantity,
-                    recipe_unit=recipe_unit or "",
-                    price_per_unit=float(price_per_unit),
-                    pricing_quantity=pricing_qty,
-                    pricing_unit=pricing_unit or ""
-                )
-
-                # Use recipe unit if available, otherwise pricing unit
-                unit_name = recipe_unit or pricing_unit or ""
-
-                ingredient_costs.append({
-                    "ingredient": ingredient.name,
-                    "amount": recipe_quantity,
-                    "unit": unit_name,
-                    "cost": round(cost, 2),
-                    "currency": currency_code,
-                    "currency_symbol": currency_symbol
-                })
-
-                total_cost += cost
-                has_pricing = True
-            else:
-                ingredient_costs.append({
-                    "ingredient": ingredient.name,
-                    "amount": ri.amount,
-                    "unit": recipe_unit or "",
-                    "cost": None,
-                    "note": "No pricing data available"
-                })
-
-        # Only add country if it has at least some pricing data
-        if has_pricing and ingredient_costs:
-            currency_code = ingredient_costs[0].get("currency") if ingredient_costs else "USD"
-            currency_symbol = ingredient_costs[0].get("currency_symbol") if ingredient_costs else "$"
-
+    for country_code, data in country_data.items():
+        # Only include countries that have at least some pricing data
+        has_pricing = any(ing.get("cost") is not None for ing in data["ingredients"])
+        if has_pricing:
             country_costs.append({
-                "country": country.code,
-                "country_name": country.name,
-                "total_cost": round(total_cost, 2) if total_cost > 0 else 0,
-                "currency": currency_code,
-                "currency_symbol": currency_symbol,
-                "ingredient_costs": ingredient_costs,
+                "country": country_code,
+                "country_name": data["country_name"],
+                "total_cost": round(data["total_cost"], 2),
+                "currency": data["currency_code"],
+                "currency_symbol": data["currency_symbol"],
+                "ingredient_costs": data["ingredients"],
                 "servings": recipe.servings or 1,
-                "cost_per_serving": round(total_cost / (recipe.servings or 1), 2) if total_cost > 0 else 0
+                "cost_per_serving": round(data["total_cost"] / (recipe.servings or 1), 2) if data["total_cost"] > 0 else 0
             })
 
     if not country_costs:

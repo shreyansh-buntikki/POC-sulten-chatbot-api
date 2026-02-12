@@ -15,9 +15,21 @@ DB_NAME = os.getenv('DB_NAME')
 
 # Create database URL
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
-# Create engine
-engine = create_engine(DATABASE_URL, echo=False)
+# DATABASE_URL = ("postgresql://avnadmin:AVNS_Roa_CF0J1F6VpriDnmB@sulten-pg-18db3400-sulten-ebb4.f.aivencloud.com:17534"
+#                 "/defaultdb?sslmode=require")
+# Create engine with optimized connection pooling
+engine = create_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=10,  # Maintain 10 persistent connections
+    max_overflow=20,  # Allow up to 20 additional connections under load
+    pool_pre_ping=True,  # Verify connection health before using
+    pool_recycle=3600,  # Recycle connections after 1 hour
+    connect_args={
+        "connect_timeout": 10,
+        "options": "-c statement_timeout=30000"  # 30s query timeout
+    }
+)
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
