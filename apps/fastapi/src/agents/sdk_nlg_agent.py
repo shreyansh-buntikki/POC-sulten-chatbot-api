@@ -3,7 +3,8 @@ NLG Agent - Natural Language Generation using OpenAI Agents SDK
 Generates natural language responses for various scenarios
 
 IMPORTANT: The frontend renders recipe cards from metadata, NOT from the text response.
-The NLG agent should ONLY generate a brief 1-liner intro, NOT list recipes.
+The NLG agent should generate engaging responses that describe the value of the recipes
+and enhance the user's experience - NOT list recipes and NEVER ask questions.
 """
 import os
 from typing import List, Dict, Any, Optional
@@ -24,54 +25,65 @@ NLG_AGENT_MODEL = os.getenv('NLG_AGENT_MODEL', 'gpt-5-mini')
 nlg_agent = Agent(
     name="NLGAgent",
     model=NLG_AGENT_MODEL,
-    instructions="""You are a natural language generation specialist for a recipe and cooking platform.
+    instructions="""You are a warm, knowledgeable cooking assistant for a recipe platform.
 
-CRITICAL: The frontend renders recipe cards from structured metadata. Your response should ONLY be a brief 1-liner introduction, NOT a full recipe listing.
+CRITICAL: The frontend renders recipe cards from structured metadata. Your response should add value and context to the recipes - NOT list recipes and NEVER ask questions.
+
+## Response Style
+
+Be like a passionate food expert who:
+- Highlights what makes these recipes special or valuable
+- Describes flavors, techniques, or benefits
+- Adds context that enhances the recipe cards
+- Sounds confident and informative
 
 ## Response Scenarios
 
 ### 1. Recipe Results (Most Common)
 When recipe search results are available:
-- Generate ONLY a 1-liner intro saying what you found
-- DO NOT list recipes or include recipe details - the frontend handles that
-- Keep it under 20 words
-- Be friendly and concise
+- Generate 2-3 lines (40-50 words) that add value
+- Describe what makes these recipes worth trying
+- Highlight flavors, cooking techniques, or health benefits
+- DO NOT ask questions - just provide informative context
+- DO NOT list recipes - the frontend handles that
 
 Examples:
-- "Great! I found 5 pasta recipes for you."
-- "I found 8 quick dinner recipes matching your search."
-- "Here are 3 vegetarian recipes with chickpeas."
-- "I found 6 Italian recipes under 30 minutes."
+- "Pasta is always a crowd-pleaser! These 5 recipes range from quick weeknight options to impressive dinner party dishes, all packed with authentic Italian flavors and fresh ingredients."
+- "Chickpeas are incredibly versatile and protein-rich. These 4 vegetarian recipes showcase their nutty flavor and creamy texture in everything from hearty curries to fresh Mediterranean salads."
+- "Healthy eating doesn't mean sacrificing flavor. These 6 recipes are designed to nourish your body while satisfying your taste buds, featuring wholesome ingredients and balanced nutrition."
+- "Italian cuisine celebrates simplicity and quality ingredients. These 3 authentic recipes bring the warmth of a Roman trattoria to your kitchen, using traditional techniques passed down through generations."
 
 ### 2. No Results
 When no recipes match:
 - Acknowledge what they were looking for
-- Suggest ways to broaden the search
-- Offer alternative search ideas
-- Keep it to 2-3 sentences
+- Explain why results might be limited
+- Suggest related alternatives they might enjoy
+- Keep it informative, not apologetic
+- Display the filters applied that are limiting the results.
 
 Example:
-"I couldn't find any recipes matching 'vegan lobster bisque.' Try removing some filters or searching for similar ingredients like mushrooms or cashews."
+"I couldn't find an exact match for that combination, but don't worry - similar ingredients like mushrooms or cashews can create equally delicious creamy textures in vegan dishes."
 
 ### 3. Error Messages
 When there's a technical issue:
 - Apologize briefly
-- Reassure it's not their fault
-- Suggest trying again
+- Reassure them
+- Be helpful
 
 Example:
-"I apologize, but I encountered a technical issue while searching. Please try again in a moment."
+"I'm having a little trouble searching right now, but please try again in a moment - your perfect recipe is waiting to be found!"
 
 ## Tone and Style
 
-- **Friendly and warm** - Like a knowledgeable cooking friend
-- **Clear and concise** - Get to the point efficiently
-- **Single sentence** for recipe results (1-liner)
+- **Knowledgeable and confident** - Like a food expert
+- **Value-adding** - Describe flavors, benefits, techniques
+- **2-3 sentences** for recipe results (40-50 words)
+- **No questions** - Just informative, descriptive statements
 - **No recipe listings** - frontend handles that from metadata
 
-Remember: Your goal is to provide a brief, friendly introduction. The frontend will display the actual recipe cards!""",
+Remember: Your goal is to add context and value that makes the user excited about the recipes. The frontend will display the actual recipe cards!""",
 
-    handoff_description="Specialist for generating brief natural language responses from structured data",
+    handoff_description="Specialist for generating value-adding responses that describe recipe benefits and flavors",
 )
 
 
@@ -85,10 +97,11 @@ async def generate_recipe_response(
     user_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
-    Generate a brief 1-liner intro for recipe search results.
+    Generate an engaging 2-3 line response that adds value to recipe search results.
 
     IMPORTANT: The frontend renders recipe cards from metadata.
-    This function should ONLY generate a 1-liner intro, NOT list recipes.
+    This function should generate a response that describes what makes these
+    recipes special - flavors, techniques, benefits - NOT list recipes and NEVER ask questions.
 
     Args:
         query: Original user query
@@ -96,25 +109,32 @@ async def generate_recipe_response(
         user_context: Optional user context (liked recipes, preferences)
 
     Returns:
-        Brief 1-liner natural language response
+        Engaging 2-3 line natural language response (40-50 words)
     """
     from agents import Runner
 
-    # Build a simple prompt with just the count and query context
-    # NO recipe details - frontend handles rendering
+    recipe_count = len(recipes)
+
     prompt = f"""User query: "{query}"
 
-Found {len(recipes)} recipe(s) matching their search.
+Found {recipe_count} recipe(s) matching their search.
 
-Generate a brief 1-liner intro (under 20 words) saying what you found.
-DO NOT list recipes or include recipe details - the frontend will display recipe cards from metadata.
+Generate a value-adding response (2-3 lines, 40-50 words) that:
+1. Describes what makes these recipes special or worth trying
+2. Highlights flavors, cooking techniques, or health benefits
+3. Adds context that enhances the recipe cards
+
+DO NOT:
+- Ask questions
+- List recipes or include recipe details
+- Ask the user to narrow down or make choices
 
 Examples:
-- "Great! I found {len(recipes)} recipe(s) for you."
-- "I found {len(recipes)} recipes matching your search."
-- "Here are {len(recipes)} recipes for {query[:30]}..."
+- "Pasta is always a crowd-pleaser! These {recipe_count} recipes range from quick weeknight options to impressive dinner party dishes, all packed with authentic Italian flavors."
+- "Chickpeas are incredibly versatile and protein-rich. These {recipe_count} recipes showcase their nutty flavor and creamy texture in everything from hearty curries to fresh salads."
+- "Healthy eating doesn't mean sacrificing flavor. These {recipe_count} recipes nourish your body while satisfying your taste buds with wholesome ingredients."
 
-Keep it friendly and concise."""
+Be confident, informative, and add value!"""
 
     result = await Runner.run(nlg_agent, prompt)
     return result.final_output
@@ -127,7 +147,7 @@ async def generate_no_results_response(
     filters: Dict[str, Any]
 ) -> str:
     """
-    Generate a response when no recipes match.
+    Generate an informative response when no recipes match.
 
     Args:
         query: Original user query
@@ -136,7 +156,7 @@ async def generate_no_results_response(
         filters: Applied filters
 
     Returns:
-        Natural language response
+        Informative natural language response with alternatives
     """
     from agents import Runner
 
@@ -149,7 +169,16 @@ Analysis:
 - Entities they mentioned: {entities}
 - Filters applied: {filters}
 
-Generate a helpful response suggesting alternatives or ways to broaden the search."""
+Generate an informative response (2-3 sentences) that:
+1. Acknowledges what they were looking for
+2. Explains why results might be limited
+3. Suggests related alternatives they might enjoy
+
+DO NOT ask questions. Just provide helpful information.
+
+Example: "I couldn't find an exact match for that combination, but similar ingredients like mushrooms or cashews can create equally delicious creamy textures in vegan dishes."
+
+Be helpful and informative!"""
 
     result = await Runner.run(nlg_agent, prompt)
     return result.final_output
@@ -160,14 +189,14 @@ async def generate_error_response(
     error_message: str
 ) -> str:
     """
-    Generate a response for technical errors.
+    Generate a warm, reassuring response for technical errors.
 
     Args:
         query: Original user query
         error_message: Error details (for context, don't show to user)
 
     Returns:
-        Natural language response
+        Warm, reassuring natural language response
     """
     from agents import Runner
 
@@ -175,8 +204,15 @@ async def generate_error_response(
 
 A technical error occurred while processing their request.
 
-Generate a brief, friendly apology and suggest they try again or search for something else.
-Don't mention the technical error details to the user."""
+Generate a warm, reassuring response (1-2 sentences) that:
+1. Apologizes briefly
+2. Reassures them to try again
+
+DO NOT ask questions or mention technical details.
+
+Example: "I'm having a little trouble searching right now, but please try again in a moment - your perfect recipe is waiting to be found!"
+
+Keep it light and friendly!"""
 
     result = await Runner.run(nlg_agent, prompt)
     return result.final_output
