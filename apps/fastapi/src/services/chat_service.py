@@ -168,13 +168,17 @@ class ChatService:
         Returns:
             List containing the most recently active session with all its conversations
         """
+        logger.info(f"[CHAT SERVICE] get_user_sessions called for user: {user_uid}")
+
         # Validate user exists before loading conversation history
         self._validate_user_exists(user_uid)
 
         # Get all active sessions for user
         sessions = self.conversation_store.get_user_sessions(user_uid, limit=100)
+        logger.info(f"[CHAT SERVICE] Found {len(sessions)} active sessions for user {user_uid}")
 
         if not sessions:
+            logger.warning(f"[CHAT SERVICE] No sessions found for user {user_uid}")
             return []
 
         # Find the session with the most recent user message
@@ -182,36 +186,79 @@ class ChatService:
         most_recent_time = None
 
         for s in sessions:
+            logger.info(f"[CHAT SERVICE] Checking session {s.id}: is_active={s.is_active}")
+
+            # Verify session still exists and is active (defensive check)
+            if not s.is_active:
+                logger.info(f"[CHAT SERVICE] Session {s.id} is inactive, skipping")
+                continue
+
             messages = self.conversation_store.get_messages(str(s.id))
+            logger.info(f"[CHAT SERVICE] Session {s.id} has {len(messages)} total messages")
             user_msgs = [m for m in messages if m.role == "user"]
 
             if user_msgs:
                 last_user_msg_time = user_msgs[-1].created_at
+                logger.info(f"[CHAT SERVICE] Session {s.id} has {len(user_msgs)} user messages, last at {last_user_msg_time}")
                 if most_recent_time is None or (last_user_msg_time and last_user_msg_time > most_recent_time):
                     most_recent_time = last_user_msg_time
                     most_recent_session = s
 
+        # If no session with user messages, try to find any active session
+        if not most_recent_session and sessions:
+            logger.info(f"[CHAT SERVICE] No session with user messages found, looking for any active session")
+            for s in sessions:
+                if s.is_active:
+                    most_recent_session = s
+                    logger.info(f"[CHAT SERVICE] Found active session without user messages: {s.id}")
+                    break
+
         if not most_recent_session:
+            logger.warning(f"[CHAT SERVICE] No most_recent_session found for user {user_uid}")
             return []
 
-        # Get all messages for the most recent session
-        messages = self.conversation_store.get_messages(str(most_recent_session.id), limit=limit)
+        logger.info(f"[CHAT SERVICE] Most recent session: {most_recent_session.id}")
+
+        # Final verification that session exists in database (prevents race conditions)
+        verified_session = self.conversation_store.get_session(str(most_recent_session.id))
+        if not verified_session:
+            logger.warning(f"[CHAT SERVICE] Session {most_recent_session.id} disappeared during get_user_sessions")
+            return []
+
+        # Get all messages for the verified session
+        messages = self.conversation_store.get_messages(str(verified_session.id), limit=limit)
+        logger.info(f"[CHAT SERVICE] Retrieved {len(messages)} messages for verified session {verified_session.id}")
 
         if not messages:
+            logger.warning(f"[CHAT SERVICE] No messages found for session {verified_session.id}")
             return []
 
-        # Build the session response - maintain original structure
+        # Build the session response - use verified_session for consistency
         session_data = {
-            "session_id": str(most_recent_session.id),
-            "title": most_recent_session.title,
-            "created_at": most_recent_session.created_at.isoformat() if most_recent_session.created_at else None,
-            "updated_at": most_recent_session.updated_at.isoformat() if most_recent_session.updated_at else None,
-            "is_active": most_recent_session.is_active
+            "session_id": str(verified_session.id),
+            "title": verified_session.title,
+            "created_at": verified_session.created_at.isoformat() if verified_session.created_at else None,
+            "updated_at": verified_session.updated_at.isoformat() if verified_session.updated_at else None,
+            "is_active": verified_session.is_active
         }
 
         # Find first user message and last assistant message (original structure)
         user_msgs = [m for m in messages if m.role == "user"]
         assistant_msgs = [m for m in messages if m.role == "assistant"]
+
+        logger.info(f"[CHAT SERVICE] Building response: {len(user_msgs)} user msgs, {len(assistant_msgs)} assistant msgs")
+
+        # Add all messages as a flat array for frontend consumption
+        session_data["messages"] = [
+            {
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "metadata": m.meta if m.meta else None
+            }
+            for m in messages
+        ]
 
         if user_msgs:
             first_user_msg = user_msgs[0]
@@ -275,6 +322,7 @@ class ChatService:
                 conversations.append(conversation)
 
         session_data["conversations"] = conversations
+        logger.info(f"[CHAT SERVICE] Returning {len(conversations)} conversation pairs in response")
 
         return [session_data]
 
@@ -344,12 +392,42 @@ class ChatService:
         session = None
 
         if session_id:
-            # Explicit session_id provided - use it
+            # Explicit session_id provided - try to use it
             session = self.conversation_store.get_session(session_id)
             if not session:
-                return {"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-            logger.info(f"[CHAT SERVICE] Using provided session: {session.id}")
-        elif not new_session and user_uid:
+                # Session not found - this can happen if it was cleaned up
+                # Instead of failing, try to continue user's most recent session or create new one
+                logger.warning(f"[CHAT SERVICE] Session {session_id} not found, attempting recovery for user {user_uid}")
+                if user_uid and not new_session:
+                    # Try to get user's most recent active session
+                    user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+                    if user_sessions:
+                        session = user_sessions[0]
+                        logger.info(f"[CHAT SERVICE] Recovered to most recent session: {session.id}")
+                # If still no session, will create new one below
+            elif not session.is_active:
+                # Session exists but is inactive - treat as not found and recover
+                logger.warning(f"[CHAT SERVICE] Session {session_id} is inactive, attempting recovery for user {user_uid}")
+                if user_uid and not new_session:
+                    user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+                    if user_sessions:
+                        session = user_sessions[0]
+                        logger.info(f"[CHAT SERVICE] Recovered to active session: {session.id}")
+                else:
+                    session = None  # Will create new session below
+            elif user_uid and session.user_uid and session.user_uid != user_uid:
+                # Session belongs to a different user - don't use it, recover instead
+                logger.warning(f"[CHAT SERVICE] Session {session_id} belongs to different user ({session.user_uid}), recovering for user {user_uid}")
+                user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+                if user_sessions:
+                    session = user_sessions[0]
+                    logger.info(f"[CHAT SERVICE] Recovered to user's own session: {session.id}")
+                else:
+                    session = None  # Will create new session below
+            else:
+                logger.info(f"[CHAT SERVICE] Using provided session: {session.id}")
+
+        if not session and not new_session and user_uid:
             # No session_id, not forcing new session, and user_uid provided
             # Try to continue the user's most recent active session
             user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
