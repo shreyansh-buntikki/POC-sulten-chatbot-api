@@ -14,6 +14,10 @@ load_dotenv()
 ORCHESTRATOR_AGENT_MODEL = os.getenv('ORCHESTRATOR_AGENT_MODEL', 'gpt-5-mini')
 COOKING_GUARDRAIL_MODEL = os.getenv('COOKING_GUARDRAIL_MODEL', 'gpt-5-mini')
 
+# Agent keys for database lookup
+ORCHESTRATOR_AGENT_KEY = "orchestrator_agent"
+COOKING_GUARDRAIL_KEY = "cooking_guardrail"
+
 # Import specialist agents
 from apps.fastapi.src.agents.sdk_nlid_agent import nlid_agent, IntentOutput
 from apps.fastapi.src.agents.sdk_recipe_agent import recipe_agent
@@ -35,13 +39,10 @@ class CookingRelatedOutput(BaseModel):
 
 
 # =====================================================
-# Guardrail Agent for Cooking-Related Check
+# Default Prompts (fallback if DB not available)
 # =====================================================
 
-cooking_guardrail_agent = Agent(
-    name="CookingGuardrail",
-    model=COOKING_GUARDRAIL_MODEL,
-    instructions="""You are a guardrail that checks if a user query is related to cooking, recipes, food, or kitchen activities.
+DEFAULT_COOKING_GUARDRAIL_PROMPT = """You are a guardrail that checks if a user query is related to cooking, recipes, food, or kitchen activities.
 
 A query is cooking-related if it mentions:
 - Food, recipes, cooking, baking, kitchen
@@ -69,39 +70,10 @@ Examples of NON-cooking queries:
 
 Return your assessment as a JSON object with:
 - is_cooking_related: true/false
-- reasoning: brief explanation""",
-    output_type=AgentOutputSchema(CookingRelatedOutput, strict_json_schema=False),
-)
+- reasoning: brief explanation"""
 
 
-# =====================================================
-# Guardrail Function
-# =====================================================
-
-async def cooking_guardrail(ctx, agent, input_data):
-    """
-    Guardrail function that checks if the query is cooking-related.
-    Trips if the query is NOT cooking-related.
-    """
-    result = await Runner.run(cooking_guardrail_agent, input_data, context=ctx.context)
-    # With AgentOutputSchema, final_output is already the typed object
-    output = result.final_output
-    final_output = output if isinstance(output, CookingRelatedOutput) else CookingRelatedOutput(**output)
-
-    return GuardrailFunctionOutput(
-        output_info=final_output,
-        tripwire_triggered=not final_output.is_cooking_related,
-    )
-
-
-# =====================================================
-# Main Orchestrator Agent with Handoffs
-# =====================================================
-
-orchestrator_agent = Agent(
-    name="OrchestratorAgent",
-    model=ORCHESTRATOR_AGENT_MODEL,
-    instructions="""You are the main cooking assistant coordinator for a recipe and food platform.
+DEFAULT_ORCHESTRATOR_PROMPT = """You are the main cooking assistant coordinator for a recipe and food platform.
 
 Your role is to help users with their cooking-related questions by either:
 1. Routing them to the appropriate specialist agent
@@ -165,50 +137,6 @@ When a user query arrives:
 - Offer to help with cooking-related questions instead
 - Be friendly but clear about your scope
 
-## Conversation Examples
-
-### Example 1: Recipe Search
-**User:** "I need dinner ideas with chicken"
-
-**You:** "I'd love to help you find some chicken dinner ideas! Let me search our recipe database for you."
-
-[Hand off to RecipeRetrievalAgent]
-
-[Then present results:] "Here are some great chicken dinner recipes I found:"
-
-### Example 2: Nutrition Question
-**User:** "How many calories in a serving of lasagna?"
-
-**You:** "That's a great question about nutritional content! Let me get that information for you."
-
-[Hand off to NutritionalAgent]
-
-[Then present answer:] "According to the nutritional data, a typical serving of lasagna contains..."
-
-### Example 3: General Cooking Chat
-**User:** "What's the best way to cook pasta?"
-
-**You:** [Handle yourself] "Great question! Here are my tips for perfectly cooked pasta:
-1. Use plenty of salted water (at least 4 quarts per pound)
-2. Bring to a rolling boil before adding pasta
-3. Stir immediately to prevent sticking
-4. Cook until al dente (usually 1-2 minutes less than package says)
-5. Reserve some pasta water before draining
-6. Don't rinse with water (removes starch for sauce adherence)
-
-Is there a specific type of pasta dish you're making?"
-
-### Example 4: Non-Cooking Query
-**User:** "What's the weather like today?"
-
-**You:** [After guardrail trip] "I specialize in helping with cooking, recipes, and food-related questions. I'm not able to help with weather information, but I'd be happy to help you with:
-- Finding recipes for any meal
-- Nutritional information about foods
-- Cooking tips and techniques
-- Meal planning ideas
-
-Is there anything food-related I can help you with?"
-
 ## Tone and Style
 
 - Warm and friendly (like a knowledgeable cooking friend)
@@ -216,15 +144,6 @@ Is there anything food-related I can help you with?"
 - Clear and concise in responses
 - Helpful and supportive
 - Not overly formal, but professional
-
-## Context Management
-
-You'll receive context that may include:
-- session_id: Current conversation session
-- user_uid: User identifier (if logged in)
-- db: Database session for tools
-
-Use this context to personalize responses when appropriate.
 
 ## Your Goals
 
@@ -234,20 +153,109 @@ Use this context to personalize responses when appropriate.
 4. Maintain a friendly, supportive conversation
 5. Always offer further assistance
 
-Remember: You're the face of the cooking assistant - make every interaction helpful and pleasant!""",
+Remember: You're the face of the cooking assistant - make every interaction helpful and pleasant!"""
 
-    handoffs=[
-        recipe_agent,      # For recipe search and retrieval
-        nutritional_agent, # For nutritional information
-        nlid_agent,        # For intent detection and entity extraction
-    ],
 
-    input_guardrails=[
-        InputGuardrail(guardrail_function=cooking_guardrail),
-    ],
+# =====================================================
+# Agent Factory Functions
+# =====================================================
 
-    handoff_description="Main cooking assistant coordinator that routes queries to specialist agents",
-)
+def create_cooking_guardrail_agent(prompt: Optional[str] = None) -> Agent:
+    """
+    Create a Cooking Guardrail agent with the given prompt.
+    """
+    instructions = prompt if prompt else DEFAULT_COOKING_GUARDRAIL_PROMPT
+
+    return Agent(
+        name="CookingGuardrail",
+        model=COOKING_GUARDRAIL_MODEL,
+        instructions=instructions,
+        output_type=AgentOutputSchema(CookingRelatedOutput, strict_json_schema=False),
+    )
+
+
+def create_orchestrator_agent(prompt: Optional[str] = None, guardrail_agent: Optional[Agent] = None) -> Agent:
+    """
+    Create an Orchestrator agent with the given prompt.
+    """
+    instructions = prompt if prompt else DEFAULT_ORCHESTRATOR_PROMPT
+
+    # Use provided guardrail agent or create default
+    guardrail = guardrail_agent if guardrail_agent else create_cooking_guardrail_agent()
+
+    async def cooking_guardrail_func(ctx, agent, input_data):
+        result = await Runner.run(guardrail, input_data, context=ctx.context)
+        output = result.final_output
+        final_output = output if isinstance(output, CookingRelatedOutput) else CookingRelatedOutput(**output)
+        return GuardrailFunctionOutput(
+            output_info=final_output,
+            tripwire_triggered=not final_output.is_cooking_related,
+        )
+
+    return Agent(
+        name="OrchestratorAgent",
+        model=ORCHESTRATOR_AGENT_MODEL,
+        instructions=instructions,
+        handoffs=[
+            recipe_agent,
+            nutritional_agent,
+            nlid_agent,
+        ],
+        input_guardrails=[
+            InputGuardrail(guardrail_function=cooking_guardrail_func),
+        ],
+        handoff_description="Main cooking assistant coordinator that routes queries to specialist agents",
+    )
+
+
+def get_orchestrator_agents_with_db_prompts(db):
+    """
+    Get Orchestrator and Guardrail agents with prompts loaded from database.
+    Falls back to default prompts if DB lookup fails.
+
+    Args:
+        db: Database session
+
+    Returns:
+        Tuple of (orchestrator_agent, cooking_guardrail_agent)
+    """
+    guardrail_prompt = DEFAULT_COOKING_GUARDRAIL_PROMPT
+    orchestrator_prompt = DEFAULT_ORCHESTRATOR_PROMPT
+
+    try:
+        from models import AgentPrompt
+
+        # Load guardrail prompt
+        guardrail_record = db.query(AgentPrompt).filter(
+            AgentPrompt.agent_key == COOKING_GUARDRAIL_KEY,
+            AgentPrompt.is_active == True
+        ).first()
+        if guardrail_record:
+            guardrail_prompt = guardrail_record.current_prompt
+
+        # Load orchestrator prompt
+        orchestrator_record = db.query(AgentPrompt).filter(
+            AgentPrompt.agent_key == ORCHESTRATOR_AGENT_KEY,
+            AgentPrompt.is_active == True
+        ).first()
+        if orchestrator_record:
+            orchestrator_prompt = orchestrator_record.current_prompt
+
+    except Exception as e:
+        pass  # Use defaults
+
+    guardrail_agent = create_cooking_guardrail_agent(guardrail_prompt)
+    orch_agent = create_orchestrator_agent(orchestrator_prompt, guardrail_agent)
+
+    return orch_agent, guardrail_agent
+
+
+# =====================================================
+# Default agent instances for backward compatibility
+# =====================================================
+
+cooking_guardrail_agent = create_cooking_guardrail_agent(DEFAULT_COOKING_GUARDRAIL_PROMPT)
+orchestrator_agent = create_orchestrator_agent(DEFAULT_ORCHESTRATOR_PROMPT, cooking_guardrail_agent)
 
 
 # =====================================================
