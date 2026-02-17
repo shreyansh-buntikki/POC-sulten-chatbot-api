@@ -479,10 +479,17 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             if candidate_ids:
                 parts.append(f"\n## Allergy Exclusion (CRITICAL)")
                 parts.append(f"- EXCLUDE recipes containing these ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
-                parts.append(f"- Add NOT EXISTS clause for EACH excluded ingredient")
-                parts.append(f"- Example for garlic: AND NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri.\"ingredientId\" = i.\"id\" WHERE ri.\"recipeId\" = r.\"id\" AND i.\"name\" ILIKE '%garlic%')")
+                parts.append(f"- Check in THREE places: recipe name (r.\"name\"), description (r.\"ingress\"), AND ingredients")
+                parts.append(f"- For EACH excluded ingredient, add a combined NOT condition like:")
+                parts.append(f"- Example for chocolate:")
+                parts.append(f"  AND (")
+                parts.append(f"    r.\"name\" NOT ILIKE '%chocolate%'")
+                parts.append(f"    AND r.\"ingress\" NOT ILIKE '%chocolate%'")
+                parts.append(f"    AND NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri.\"ingredientId\" = i.\"id\" WHERE ri.\"recipeId\" = r.\"id\" AND i.\"name\" ILIKE '%chocolate%')")
+                parts.append(f"  )")
             else:
                 parts.append(f"- Exclude ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
+                parts.append(f"- Check in: recipe name, description (ingress), and ingredients table")
 
         parts.append("\n## Task")
         parts.append("Generate a PostgreSQL SELECT query to retrieve recipes matching the criteria above.")

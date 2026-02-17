@@ -13,6 +13,9 @@ load_dotenv()
 # Model configuration from environment
 NLID_AGENT_MODEL = os.getenv('NLID_AGENT_MODEL', 'gpt-5-mini')
 
+# Agent key for database lookup
+AGENT_KEY = "nlid_agent"
+
 
 # =====================================================
 # Pydantic Models for Structured Output
@@ -24,11 +27,11 @@ class IntentOutput(BaseModel):
         description="Whether the query is related to cooking, recipes, food, or kitchen activities"
     )
     intent: str = Field(
-        description="The primary intent category (e.g., recipe_search, nutritional_info, ingredient_substitution, recommendation, general_chat, nutrition_filter, price_filter)"
+        description="The primary intent category: recipe_search, nutritional_info, nutrition_filter, ingredient_substitution, recommendation, pricing_info, price_filter, general_chat, recipe_reference, negative_feedback, educational_info, festival_occasion, clear_filters, combined_meal_search"
     )
     entities: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Extracted entities like ingredients, recipes, quantities, etc."
+        description="Extracted entities like ingredients, recipes, quantities, etc. For recipe_reference: include reference_position and detail_type."
     )
     parameters: Dict[str, Any] = Field(
         default_factory=dict,
@@ -46,18 +49,15 @@ class IntentOutput(BaseModel):
     )
     requires_embedding: bool = Field(
         default=True,
-        description="Whether this query requires embedding search. Set to False for nutrition_filter and price_filter intents."
+        description="Whether this query requires embedding search. Set to False for nutrition_filter, price_filter, recipe_reference, negative_feedback, and clear_filters intents."
     )
 
 
 # =====================================================
-# NLID Agent using OpenAI Agents SDK
+# Default Prompt (fallback if DB not available)
 # =====================================================
 
-nlid_agent = Agent(
-    name="NLIDAgent",
-    model=NLID_AGENT_MODEL,
-    instructions="""You are an expert Natural Language Intent Detection system for a recipe and cooking platform.
+DEFAULT_NLID_PROMPT = """You are an expert Natural Language Intent Detection system for a recipe and cooking platform.
 
 Your task is to analyze user queries and extract structured information including:
 1. Intent classification
@@ -196,6 +196,65 @@ Choose the most appropriate intent from the following categories:
    - Entities: None usually
    - Parameters: None
    - Filters: None
+
+7. **recipe_reference**: User references a previously shown recipe by position
+   - Examples: "Explain the 1st recipe", "Tell me about the second one", "More details on recipe 3"
+   - Examples: "What's in the first one?", "Show ingredients of the third"
+   - Entities:
+     * reference_position: integer (1-5) or "first", "second", "third", "last"
+     * detail_type: "full", "ingredients", "instructions", "nutrition", "cost"
+   - Parameters: None
+   - Filters: None
+   - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
+   - **CRITICAL**: Requires previous recipe results in context
+
+8. **negative_feedback**: User expresses dissatisfaction with shown results
+   - Examples: "I don't like these", "Show me different ones", "Not what I'm looking for"
+   - Examples: "Something else", "Other options please"
+   - Entities: None (uses session context)
+   - Parameters: None
+   - Filters: None
+   - **CRITICAL**: Should trigger re-search excluding previously shown recipes
+   - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
+
+9. **educational_info**: User asks about cooking concepts, techniques, or dietary information
+   - Examples: "What is vegan food?", "Explain keto diet", "What does gluten-free mean?"
+   - Examples: "How do I sauté?", "What is braising?", "Tips for baking bread"
+   - Entities:
+     * concept: string (vegan, keto, gluten-free, etc.)
+     * technique: string (sauté, braise, roast, etc.)
+   - Parameters: None
+   - Filters: May include related dietary tags for recipe suggestions
+   - **CRITICAL**: Should provide educational explanation + related recipes
+
+10. **festival_occasion**: User asks about festivals, holidays, or special occasions
+    - Examples: "Christmas recipes", "Diwali sweets", "Thanksgiving dinner ideas"
+    - Examples: "Birthday cake recipes", "Easter brunch ideas"
+    - Entities:
+      * occasion_name: string (Christmas, Diwali, Thanksgiving, etc.)
+      * occasion_type: "holiday", "celebration", "season"
+    - Parameters: None
+    - Filters: Related seasonality tags
+
+11. **clear_filters**: User wants to reset filters and start fresh
+    - Examples: "Clear filters", "Reset search", "Start over", "Forget my preferences"
+    - Examples: "Clear all", "New search", "Remove filters"
+    - Entities: None
+    - Parameters: None
+    - Filters: None
+    - **CRITICAL**: Should clear all session filters and exclusions
+    - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
+
+12. **combined_meal_search**: User wants multiple courses/courses for a complete meal
+    - Examples: "3-course dinner", "Appetizer and main course", "Full meal under $50"
+    - Examples: "Main course and dessert", "Breakfast and snack ideas"
+    - Entities:
+      * meal_types: array of meal types (appetizer, main course, dessert, etc.)
+      * course_count: integer (2, 3, etc.)
+    - Parameters:
+      * combined_budget: total budget for all courses
+      * combined_time: total time for all courses
+    - Filters: Dietary restrictions apply to all courses
 
 ## Entity Extraction Guidelines
 
@@ -371,10 +430,63 @@ Example 4: "meals under 500 rupees"
   "requires_embedding": false
 }
 
-Analyze the user's query carefully and provide accurate structured output.""",
-    output_type=AgentOutputSchema(IntentOutput, strict_json_schema=False),
-    handoff_description="Specialist for detecting user intent and extracting entities from cooking-related queries",
-)
+Analyze the user's query carefully and provide accurate structured output."""
+
+
+# =====================================================
+# Agent Factory Function
+# =====================================================
+
+def create_nlid_agent(prompt: Optional[str] = None) -> Agent:
+    """
+    Create an NLID agent with the given prompt.
+    If no prompt provided, uses the default prompt.
+
+    Args:
+        prompt: Optional custom prompt text
+
+    Returns:
+        Configured Agent instance
+    """
+    instructions = prompt if prompt else DEFAULT_NLID_PROMPT
+
+    return Agent(
+        name="NLIDAgent",
+        model=NLID_AGENT_MODEL,
+        instructions=instructions,
+        output_type=AgentOutputSchema(IntentOutput, strict_json_schema=False),
+        handoff_description="Specialist for detecting user intent and extracting entities from cooking-related queries",
+    )
+
+
+def get_nlid_agent_with_db_prompt(db) -> Agent:
+    """
+    Get NLID agent with prompt loaded from database.
+    Falls back to default prompt if DB lookup fails.
+
+    Args:
+        db: Database session
+
+    Returns:
+        Configured Agent instance
+    """
+    try:
+        from models import AgentPrompt
+        prompt_record = db.query(AgentPrompt).filter(
+            AgentPrompt.agent_key == AGENT_KEY,
+            AgentPrompt.is_active == True
+        ).first()
+
+        if prompt_record:
+            return create_nlid_agent(prompt_record.current_prompt)
+    except Exception as e:
+        pass  # Fall through to default
+
+    return create_nlid_agent(DEFAULT_NLID_PROMPT)
+
+
+# Create default agent instance for backward compatibility
+nlid_agent = create_nlid_agent(DEFAULT_NLID_PROMPT)
 
 
 # =====================================================

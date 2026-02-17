@@ -63,7 +63,7 @@ WHERE r."deletedAt" IS NULL
             base_query += f"  AND {condition}\n"
 
     base_query += f"""
-ORDER BY CAST(r."recipe_metadata"->'pricing'->'{country_key}'->>'total' AS FLOAT) ASC
+ORDER BY CAST(r."recipe_metadata"->'pricing'->'{country_key}'->>'total' AS FLOAT) DESC
 LIMIT {limit}
 """
 
@@ -405,8 +405,8 @@ def build_session_filter_conditions(
     if not session_filters:
         return conditions
 
-    # Include ingredients filter
-    include_ingredients = session_filters.get("include_ingredients", [])
+    # Include ingredients filter (check both key variants)
+    include_ingredients = session_filters.get("include_ingredients") or session_filters.get("included_ingredients", [])
     if include_ingredients:
         # Escape and join ingredient names
         escaped_ingredients = [ing.replace("'", "''").lower() for ing in include_ingredients]
@@ -420,17 +420,22 @@ def build_session_filter_conditions(
             )
         """)
 
-    # Exclude ingredients filter
-    exclude_ingredients = session_filters.get("exclude_ingredients", [])
+    # Exclude ingredients filter (checks name, description, AND ingredients)
+    # Support both key variants: exclude_ingredients and excluded_ingredients
+    exclude_ingredients = session_filters.get("exclude_ingredients") or session_filters.get("excluded_ingredients", [])
     if exclude_ingredients:
         for ing in exclude_ingredients:
             escaped_ing = ing.replace("'", "''").lower()
             conditions.append(f"""
-                NOT EXISTS (
-                    SELECT 1 FROM recipe_ingredient ri
-                    JOIN ingredient i ON ri."ingredientId" = i."id"
-                    WHERE ri."recipeId" = r."id"
-                    AND LOWER(i."name") LIKE '%{escaped_ing}%'
+                (
+                    LOWER(r."name") NOT LIKE '%{escaped_ing}%'
+                    AND LOWER(r."ingress") NOT LIKE '%{escaped_ing}%'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM recipe_ingredient ri
+                        JOIN ingredient i ON ri."ingredientId" = i."id"
+                        WHERE ri."recipeId" = r."id"
+                        AND LOWER(i."name") LIKE '%{escaped_ing}%'
+                    )
                 )
             """)
 
@@ -476,5 +481,31 @@ def build_session_filter_conditions(
             conditions.append(f"(r.\"prepTime\" + r.\"cookTime\") <= {max_time_int}")
         except (ValueError, TypeError):
             pass
+
+    # Excluded recipe IDs filter (for negative feedback: "I don't like these")
+    excluded_recipe_ids = session_filters.get("excluded_recipe_ids", [])
+    if excluded_recipe_ids:
+        # Create list of UUIDs for NOT IN clause
+        uuid_list = ", ".join([f"'{rid}'" for rid in excluded_recipe_ids])
+        conditions.append(f"r.\"id\" NOT IN ({uuid_list})")
+
+    # Ingredient count filter (for "recipes with under 5 ingredients")
+    ingredient_count_max = session_filters.get("ingredient_count_max")
+    if ingredient_count_max:
+        try:
+            count_int = int(ingredient_count_max)
+            conditions.append(f"""
+                (SELECT COUNT(*) FROM recipe_ingredient ri
+                 WHERE ri."recipeId" = r."id"
+                 AND ri."deletedAt" IS NULL) <= {count_int}
+            """)
+        except (ValueError, TypeError):
+            pass
+
+    # Creator filter (for "recipes by username")
+    creator_uid = session_filters.get("creator_uid")
+    if creator_uid:
+        escaped_uid = creator_uid.replace("'", "''")
+        conditions.append(f"r.\"userUid\" = '{escaped_uid}'")
 
     return conditions

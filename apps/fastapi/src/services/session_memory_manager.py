@@ -43,6 +43,9 @@ class ContextEntities:
     active_timers: List[Dict[str, Any]] = field(default_factory=list)  # [{"recipe": "X", "time": 300, "started_at": ...}]
     last_vector_query: Optional[str] = None  # Last search query for embedding search context
     last_search_filters: Optional[Dict[str, Any]] = None  # Last search filters for context
+    # NEW: For recipe reference queries ("Explain the 1st recipe")
+    last_recipe_results: List[Dict[str, Any]] = field(default_factory=list)  # [{"id": "uuid", "name": "Recipe Name"}, ...]
+    last_user_query: Optional[str] = None  # The actual user message (for re-search after clear)
 
 
 @dataclass
@@ -73,6 +76,13 @@ class SessionState:
     # Ingredient filters
     excluded_ingredients: List[str] = field(default_factory=list)  # allergies, dislikes
     included_ingredients: List[str] = field(default_factory=list)  # preferences
+
+    # Recipe exclusions (from negative feedback: "I don't like these")
+    excluded_recipe_ids: List[str] = field(default_factory=list)
+
+    # Allergies (persisted across session, expanded via ingredient matcher)
+    # Stores original allergy name -> expanded variants mapping
+    allergies: Dict[str, List[str]] = field(default_factory=dict)  # {"chocolate": ["chocolate", "cocoa", "cacao", ...]}
 
     # Query filters
     filters: SessionFilters = field(default_factory=SessionFilters)
@@ -602,6 +612,7 @@ class SessionMemoryManager:
             "language": session.language,
             "excluded_ingredients": session.excluded_ingredients,
             "included_ingredients": session.included_ingredients,
+            "excluded_recipe_ids": session.excluded_recipe_ids,
             "filters": {
                 "tags": session.filters.tags,
                 "cuisines": session.filters.cuisines,
@@ -618,6 +629,8 @@ class SessionMemoryManager:
                 "active_timers": session.context_entities.active_timers,
                 "last_vector_query": session.context_entities.last_vector_query,
                 "last_search_filters": session.context_entities.last_search_filters,
+                "last_recipe_results": session.context_entities.last_recipe_results,
+                "last_user_query": session.context_entities.last_user_query,
             },
         }
 
@@ -638,6 +651,8 @@ class SessionMemoryManager:
             # Keep core identification, clear everything else
             session.excluded_ingredients = []
             session.included_ingredients = []
+            session.excluded_recipe_ids = []
+            session.allergies = {}
             session.filters = SessionFilters()
             session.context_entities = ContextEntities()
             session.conversation_history = []
@@ -676,5 +691,184 @@ class SessionMemoryManager:
             session.context_entities.last_search_filters = filters
             session.last_intent = intent
             self.save_session(session)
+
+        return session
+
+    def update_last_recipe_results(
+        self,
+        session: SessionState,
+        recipes: List[Dict[str, Any]],
+        user_query: str
+    ) -> SessionState:
+        """
+        Update session with the last recipe results for reference queries.
+
+        Stores only IDs and names to keep memory small.
+        Enables queries like "Explain the 1st recipe" or "I don't like these".
+
+        Args:
+            session: Current session state
+            recipes: List of recipe dicts from search results
+            user_query: The actual user message
+
+        Returns:
+            Updated session state
+        """
+        # Store only essential info (id, name) for last 5 recipes
+        session.context_entities.last_recipe_results = [
+            {"id": str(r.get("id")), "name": r.get("name")}
+            for r in recipes[:5]
+            if r.get("id") and r.get("name")
+        ]
+        session.context_entities.last_user_query = user_query
+        self.save_session(session)
+
+        logger.info(
+            f"[SESSION] Updated last_recipe_results: "
+            f"{len(session.context_entities.last_recipe_results)} recipes"
+        )
+
+        return session
+
+    def add_excluded_recipe(
+        self,
+        session: SessionState,
+        recipe_id: str
+    ) -> SessionState:
+        """
+        Add a recipe to the excluded list (negative feedback).
+
+        These recipes will be filtered out in subsequent searches.
+        Used when user says "I don't like these" or "Not that one".
+
+        Args:
+            session: Current session state
+            recipe_id: Recipe UUID to exclude
+
+        Returns:
+            Updated session state
+        """
+        if recipe_id and recipe_id not in session.excluded_recipe_ids:
+            session.excluded_recipe_ids.append(recipe_id)
+            self.save_session(session)
+            logger.info(
+                f"[SESSION] Added recipe {recipe_id} to exclusions. "
+                f"Total excluded: {len(session.excluded_recipe_ids)}"
+            )
+
+        return session
+
+    def add_excluded_recipes(
+        self,
+        session: SessionState,
+        recipe_ids: List[str]
+    ) -> SessionState:
+        """
+        Add multiple recipes to the excluded list (negative feedback).
+
+        Args:
+            session: Current session state
+            recipe_ids: List of recipe UUIDs to exclude
+
+        Returns:
+            Updated session state
+        """
+        for recipe_id in recipe_ids:
+            if recipe_id and recipe_id not in session.excluded_recipe_ids:
+                session.excluded_recipe_ids.append(recipe_id)
+
+        if recipe_ids:
+            self.save_session(session)
+            logger.info(
+                f"[SESSION] Added {len(recipe_ids)} recipes to exclusions. "
+                f"Total excluded: {len(session.excluded_recipe_ids)}"
+            )
+
+        return session
+
+    def add_allergy(
+        self,
+        session: SessionState,
+        allergen: str,
+        expanded_variants: List[str]
+    ) -> SessionState:
+        """
+        Add an allergy with its expanded variants (from ingredient matcher).
+
+        Args:
+            session: Current session state
+            allergen: Original allergen name (e.g., "chocolate")
+            expanded_variants: List of variants from ingredient matcher
+                              (e.g., ["chocolate", "cocoa", "cacao", ...])
+
+        Returns:
+            Updated session state
+        """
+        allergen_lower = allergen.lower()
+
+        # Store the allergy with its expanded variants
+        if allergen_lower not in session.allergies:
+            session.allergies[allergen_lower] = expanded_variants
+        else:
+            # Merge new variants with existing ones
+            existing = set(session.allergies[allergen_lower])
+            session.allergies[allergen_lower] = list(existing | set(expanded_variants))
+
+        # Also add to excluded_ingredients for backward compatibility
+        for variant in expanded_variants:
+            if variant not in session.excluded_ingredients:
+                session.excluded_ingredients.append(variant)
+
+        self.save_session(session)
+        logger.info(
+            f"[SESSION] Added allergy '{allergen}' with {len(expanded_variants)} variants. "
+            f"Total allergies: {len(session.allergies)}"
+        )
+
+        return session
+
+    def get_all_allergen_variants(self, session: SessionState) -> List[str]:
+        """
+        Get all expanded allergen variants from all allergies.
+
+        Returns:
+            Flat list of all allergen variants
+        """
+        all_variants = set()
+        for variants in session.allergies.values():
+            all_variants.update(variants)
+        return list(all_variants)
+
+    def has_allergies(self, session: SessionState) -> bool:
+        """Check if session has any allergies recorded."""
+        return len(session.allergies) > 0
+
+    def clear_filters(self, session: SessionState) -> SessionState:
+        """
+        Clear all filters and exclusions from session.
+
+        Keeps conversation history and core identification.
+
+        Args:
+            session: Current session state
+
+        Returns:
+            Updated session state
+        """
+        # Clear ingredient exclusions
+        session.excluded_ingredients = []
+        session.included_ingredients = []
+
+        # Clear recipe exclusions
+        session.excluded_recipe_ids = []
+
+        # Clear allergies
+        session.allergies = {}
+
+        # Clear filters
+        session.filters = SessionFilters()
+
+        self.save_session(session)
+        logger.info(f"[SESSION] Cleared all filters for session {session.session_id}")
 
         return session

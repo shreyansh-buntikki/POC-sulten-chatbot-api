@@ -512,6 +512,9 @@ class ChatService:
                         "bundle_name": r.get("bundle_name"),
                         "ingredients": r.get("ingredients", []),
                         "instructions": r.get("instructions", []),
+                        "recipe_cost": r.get("recipe_cost"),
+                        "nutritional_info": r.get("nutritional_info"),
+                        "seasonality": r.get("seasonality"),
                     }
                     for r in recipes
                 ]
@@ -632,4 +635,90 @@ class ChatService:
             "message_count": summary["total_messages"],
             "last_activity": summary["updated_at"],
             "is_active": summary["is_active"]
+        }
+
+    def get_session_filters(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get all active filters for a session.
+
+        Args:
+            session_id: Session UUID
+
+        Returns:
+            Dictionary of active filters or None if session not found
+        """
+        from apps.fastapi.src.services.session_memory_manager import SessionMemoryManager
+
+        session_manager = SessionMemoryManager(self.db)
+        session = session_manager.load_session(session_id)
+
+        if not session:
+            return None
+
+        filters = {
+            "tags": session.filters.tags if session.filters else [],
+            "cuisines": session.filters.cuisines if session.filters else [],
+            "excluded_ingredients": session.excluded_ingredients or [],
+            "excluded_recipe_ids": session.excluded_recipe_ids or [],
+            "difficulty": session.filters.difficulty if session.filters else None,
+            "max_time": session.filters.max_time if session.filters else None,
+            "last_vector_query": session.context_entities.last_vector_query if session.context_entities else None,
+            "last_intent": session.last_intent
+        }
+
+        # Count active filters
+        active_filter_count = sum([
+            len(filters["tags"]),
+            len(filters["cuisines"]),
+            len(filters["excluded_ingredients"]),
+            len(filters["excluded_recipe_ids"]),
+            1 if filters["difficulty"] else 0,
+            1 if filters["max_time"] else 0
+        ])
+        filters["active_filter_count"] = active_filter_count
+
+        return filters
+
+    def clear_session_filters(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Clear all filters for a session.
+
+        Args:
+            session_id: Session UUID
+
+        Returns:
+            Dictionary with cleared items list or None if session not found
+        """
+        from apps.fastapi.src.services.session_memory_manager import SessionMemoryManager
+
+        session_manager = SessionMemoryManager(self.db)
+        session = session_manager.load_session(session_id)
+
+        if not session:
+            return None
+
+        # Track what was cleared
+        cleared_items = []
+
+        if session.filters and session.filters.tags:
+            cleared_items.append(f"tags: {', '.join(session.filters.tags)}")
+        if session.filters and session.filters.cuisines:
+            cleared_items.append(f"cuisines: {', '.join(session.filters.cuisines)}")
+        if session.excluded_ingredients:
+            cleared_items.append(f"excluded ingredients: {', '.join(session.excluded_ingredients[:5])}")
+        if session.excluded_recipe_ids:
+            cleared_items.append(f"excluded recipes: {len(session.excluded_recipe_ids)} recipes")
+        if session.filters and session.filters.difficulty:
+            cleared_items.append(f"difficulty: {session.filters.difficulty}")
+        if session.filters and session.filters.max_time:
+            cleared_items.append(f"max time: {session.filters.max_time} minutes")
+
+        # Clear filters using session manager
+        session = session_manager.clear_filters(session)
+
+        logger.info(f"[CHAT SERVICE] Cleared filters for session {session_id}: {cleared_items}")
+
+        return {
+            "session_id": session_id,
+            "cleared_items": cleared_items
         }

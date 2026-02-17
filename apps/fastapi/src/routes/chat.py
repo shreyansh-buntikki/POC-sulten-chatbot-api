@@ -376,3 +376,80 @@ class ChatRoutes:
             "session_id": session_id,
             "title": title
         }
+
+    @staticmethod
+    @chat_route.get(
+        "/sessions/{session_id}/filters",
+        status_code=status.HTTP_200_OK,
+        summary="Get session filters",
+        description="Retrieve all active filters for a session"
+    )
+    def get_session_filters(
+        session_id: str,
+        db: Session = Depends(get_db)
+    ):
+        """
+        Get all active filters for a session.
+
+        Returns:
+        - tags: Dietary preference tags (vegetarian, vegan, etc.)
+        - cuisines: Cuisine filters (italian, mexican, etc.)
+        - excluded_ingredients: Ingredients to exclude (allergies, dislikes)
+        - excluded_recipe_ids: Recipe IDs excluded from previous negative feedback
+        - difficulty: Difficulty filter (easy, medium, hard)
+        - max_time: Maximum cooking time in minutes
+        """
+        chat_service = ChatService(db)
+        filters = chat_service.get_session_filters(session_id)
+
+        if filters is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return {
+            "success": True,
+            "session_id": session_id,
+            "filters": filters
+        }
+
+    @staticmethod
+    @chat_route.post(
+        "/sessions/{session_id}/clear-filters",
+        status_code=status.HTTP_200_OK,
+        summary="Clear session filters",
+        description="Clear all filters for a session (tags, cuisines, excluded ingredients, excluded recipes)"
+    )
+    def clear_session_filters(
+        session_id: str,
+        db: Session = Depends(get_db)
+    ):
+        """
+        Clear all filters for a session.
+
+        This resets:
+        - Dietary preference tags
+        - Cuisine filters
+        - Excluded ingredients (allergies)
+        - Excluded recipe IDs (from negative feedback)
+        - Difficulty filter
+        - Time filter
+
+        Use this when the user says 'clear filters' or 'start over'.
+        """
+        chat_service = ChatService(db)
+        result = chat_service.clear_session_filters(session_id)
+
+        if result is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "Session not found", "code": "SESSION_NOT_FOUND"}
+            )
+
+        return {
+            "success": True,
+            "message": "All filters cleared successfully",
+            "session_id": session_id,
+            "cleared_items": result.get("cleared_items", [])
+        }

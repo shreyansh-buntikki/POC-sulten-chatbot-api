@@ -15,15 +15,15 @@ load_dotenv()
 # Model configuration from environment
 NUTRITIONAL_AGENT_MODEL = os.getenv('NUTRITIONAL_AGENT_MODEL', 'gpt-5-mini')
 
+# Agent key for database lookup
+AGENT_KEY = "nutritional_agent"
+
 
 # =====================================================
-# Nutritional Agent using OpenAI Agents SDK
+# Default Prompt (fallback if DB not available)
 # =====================================================
 
-nutritional_agent = Agent(
-    name="NutritionalAgent",
-    model=NUTRITIONAL_AGENT_MODEL,
-    instructions="""You are a nutrition expert helping users understand the nutritional content of recipes and ingredients.
+DEFAULT_NUTRITIONAL_PROMPT = """You are a nutrition expert helping users understand the nutritional content of recipes and ingredients.
 
 Your role is to provide accurate, helpful nutritional information in an easy-to-understand format.
 
@@ -206,8 +206,60 @@ All options maintain pesto's texture while keeping it nut-free. Sunflower seeds 
 ### User: "Is this recipe healthy?"
 "Yes, this is a nutritious choice! It's high in protein (28g per serving), provides good fiber from vegetables (6g), and is relatively low in saturated fat (3g). The recipe does contain a moderate amount of sodium (650mg), so if you're watching salt intake, you might reduce the added soy sauce."
 
-Remember: Always use your tools to get accurate nutritional data before responding. For substitutions, combine semantic search with your culinary knowledge to provide safe, practical alternatives.""",
+Remember: Always use your tools to get accurate nutritional data before responding. For substitutions, combine semantic search with your culinary knowledge to provide safe, practical alternatives."""
 
-    tools=nutrition_tools,
-    handoff_description="Specialist for nutritional information, ingredient substitutions, and dietary analysis",
-)
+
+# =====================================================
+# Agent Factory Function
+# =====================================================
+
+def create_nutritional_agent(prompt: Optional[str] = None) -> Agent:
+    """
+    Create a Nutritional agent with the given prompt.
+    If no prompt provided, uses the default prompt.
+
+    Args:
+        prompt: Optional custom prompt text
+
+    Returns:
+        Configured Agent instance
+    """
+    instructions = prompt if prompt else DEFAULT_NUTRITIONAL_PROMPT
+
+    return Agent(
+        name="NutritionalAgent",
+        model=NUTRITIONAL_AGENT_MODEL,
+        instructions=instructions,
+        tools=nutrition_tools,
+        handoff_description="Specialist for nutritional information, ingredient substitutions, and dietary analysis",
+    )
+
+
+def get_nutritional_agent_with_db_prompt(db) -> Agent:
+    """
+    Get Nutritional agent with prompt loaded from database.
+    Falls back to default prompt if DB lookup fails.
+
+    Args:
+        db: Database session
+
+    Returns:
+        Configured Agent instance
+    """
+    try:
+        from models import AgentPrompt
+        prompt_record = db.query(AgentPrompt).filter(
+            AgentPrompt.agent_key == AGENT_KEY,
+            AgentPrompt.is_active == True
+        ).first()
+
+        if prompt_record:
+            return create_nutritional_agent(prompt_record.current_prompt)
+    except Exception as e:
+        pass  # Fall through to default
+
+    return create_nutritional_agent(DEFAULT_NUTRITIONAL_PROMPT)
+
+
+# Create default agent instance for backward compatibility
+nutritional_agent = create_nutritional_agent(DEFAULT_NUTRITIONAL_PROMPT)
