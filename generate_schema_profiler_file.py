@@ -24,7 +24,6 @@ DB_PASSWORD = os.getenv('DB_PASSWORD')
 # Create database URL
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-
 # Intelligent column description mappings
 COLUMN_DESCRIPTIONS = {
     # Common identifiers

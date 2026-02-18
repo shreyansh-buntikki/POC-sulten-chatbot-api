@@ -126,7 +126,11 @@ class RetrievalStrategyDecider:
         "i am vegetarian", "i'm vegetarian", "im vegetarian",  # Dietary preferences
         "i am vegan", "i'm vegan", "im vegan",
         "i am gluten-free", "i'm gluten-free", "gluten free",
-        "show me", "only", "just", "asian", "indian", "italian"  # Cuisine/type refinements
+        "show me", "only", "just", "asian", "indian", "italian",  # Cuisine/type refinements
+        # Additional exclusion patterns (not having something = exclude it)
+        "don't have", "dont have", "i have no", "i don't have",
+        "ran out of", "out of", "don't got", "dont got",
+        "missing", "can't find", "cant find",
     ]
 
     # Intents that typically indicate refinement vs new search
@@ -296,12 +300,56 @@ class RetrievalStrategyDecider:
         }
 
         difficulty_patterns = {
+            # Easy difficulty mappings
             r'\beasy\b': 'easy',
             r'\bsimple\b': 'easy',
+            r'\bquick\b': 'easy',  # quick recipes are often easy
+            r'\bbasic\b': 'easy',
+            r'\bbeginner\b': 'easy',
+            r'\bbeginners\b': 'easy',
+            r'\bbeginner-friendly\b': 'easy',
+            r'\bnew to cooking\b': 'easy',
+            r'\bjust starting\b': 'easy',
+            r'\bstarter\b': 'easy',
+            r'\bnovice\b': 'easy',
+            r'\bfirst.?time\b': 'easy',
+            r'\bentry.?level\b': 'easy',
+            r'\bfoolproof\b': 'easy',
+            r'\bidiot.?proof\b': 'easy',
+            r'\bno.?brainer\b': 'easy',
+            r'\bfor.?kids\b': 'easy',
+            r'\bchild.?friendly\b': 'easy',
+
+            # Medium difficulty mappings
             r'\bmedium\b': 'medium',
+            r'\bmoderate\b': 'medium',
+            r'\bintermediate\b': 'medium',
+            r'\baverage\b': 'medium',
+            r'\bregular\b': 'medium',
+            r'\bstandard\b': 'medium',
+            r'\bnormal\b': 'medium',
+
+            # Hard difficulty mappings
             r'\bhard\b': 'hard',
             r'\bdifficult\b': 'hard',
             r'\bcomplex\b': 'hard',
+            r'\badvanced\b': 'hard',
+            r'\bexpert\b': 'hard',
+            r'\bexperts\b': 'hard',
+            r'\bprofessional\b': 'hard',
+            r'\bpro\b': 'hard',
+            r'\bmaster\b': 'hard',
+            r'\bmastery\b': 'hard',
+            r'\bchef.?level\b': 'hard',
+            r'\bchallenging\b': 'hard',
+            r'\belaborate\b': 'hard',
+            r'\bintricate\b': 'hard',
+            r'\bsophisticated\b': 'hard',
+            r'\bfancy\b': 'hard',
+            r'\bgourmet\b': 'hard',
+            r'\bfine.?dining\b': 'hard',
+            r'\brestaurant.?quality\b': 'hard',
+            r'\bimpressive\b': 'hard',
         }
 
         meal_type_patterns = {
@@ -527,7 +575,7 @@ class RetrievalStrategyDecider:
                     reasoning=f"Query has structured elements (score:{structured_score}) but filters are loose. Using SQL to narrow, vector to re-rank.",
                     vector_query=vector_query,
                     sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
-                    top_k=50,  # Get more candidates for re-ranking
+                    top_k=30,  # Get more candidates for re-ranking
                     use_reranking=True
                 )
 
@@ -684,37 +732,80 @@ class RetrievalStrategyDecider:
         if parameters.get("max_time"):
             sql_filters["max_time"] = parameters["max_time"]
         elif parameters.get("time_constraints"):
-            # Convert time_constraints to max_time
+            # Convert time_constraints to either max_time (filter) or time_sort_order (sort)
             time_constraints = parameters["time_constraints"]
             if isinstance(time_constraints, list) and time_constraints:
                 # Extract first time constraint
                 constraint = time_constraints[0]
                 if isinstance(constraint, str):
-                    # Map common time constraints to minutes
-                    time_map = {
-                        "quick": 20,
-                        "short": 30,
-                        "medium": 45,
-                        "long": 90,
-                        "under 30 min": 30,
-                        "under 30min": 30,
-                        "under 15 min": 15,
-                        "under 15min": 15,
+                    constraint_lower = constraint.lower()
+                    # Qualitative time queries → sort by time (no hard filter)
+                    # "quick", "short" → show quickest first (ASC)
+                    # "long" → show longest first (DESC)
+                    # "medium" → neutral (no special sorting)
+                    sort_order_map = {
+                        "quick": "ASC",
+                        "short": "ASC",
+                        "fast": "ASC",
+                        "long": "DESC",
+                        "slow": "DESC",
                     }
-                    # Try direct mapping first
-                    sql_filters["max_time"] = time_map.get(constraint.lower(), 30)
+                    if constraint_lower in sort_order_map:
+                        sql_filters["time_sort_order"] = sort_order_map[constraint_lower]
+                    else:
+                        # Specific time limits → filter by max_time
+                        time_map = {
+                            "under 30 min": 30,
+                            "under 30min": 30,
+                            "under 15 min": 15,
+                            "under 15min": 15,
+                            "under 60 min": 60,
+                            "under 60min": 60,
+                            "under 45 min": 45,
+                            "under 45min": 45,
+                        }
+                        # Try to extract numeric value from "under X min" pattern
+                        import re
+                        match = re.search(r'under\s*(\d+)\s*min', constraint_lower)
+                        if match:
+                            sql_filters["max_time"] = int(match.group(1))
+                        elif constraint_lower in time_map:
+                            sql_filters["max_time"] = time_map[constraint_lower]
                 elif isinstance(constraint, (int, float)):
+                    # Numeric value = max time filter
                     sql_filters["max_time"] = int(constraint)
             elif isinstance(time_constraints, (int, float, str)):
                 # Single value
                 if isinstance(time_constraints, str):
-                    time_map = {"quick": 20, "short": 30, "medium": 45, "long": 90}
-                    sql_filters["max_time"] = time_map.get(time_constraints.lower(), 30)
+                    constraint_lower = time_constraints.lower()
+                    sort_order_map = {
+                        "quick": "ASC",
+                        "short": "ASC",
+                        "fast": "ASC",
+                        "long": "DESC",
+                        "slow": "DESC",
+                    }
+                    if constraint_lower in sort_order_map:
+                        sql_filters["time_sort_order"] = sort_order_map[constraint_lower]
+                    else:
+                        # Try numeric extraction
+                        import re
+                        match = re.search(r'under\s*(\d+)\s*min', constraint_lower)
+                        if match:
+                            sql_filters["max_time"] = int(match.group(1))
                 else:
                     sql_filters["max_time"] = int(time_constraints)
 
         if parameters.get("difficulty"):
-            sql_filters["difficulty"] = parameters["difficulty"]
+            # Map difficulty to database values
+            # Database has: easy, normal, medium, hard
+            # User keywords map to: easy (includes 'normal'), medium, hard
+            difficulty = parameters["difficulty"]
+            if difficulty == "easy":
+                # Include both 'easy' and 'normal' for beginner-level recipes
+                sql_filters["difficulty"] = ["easy", "normal"]
+            else:
+                sql_filters["difficulty"] = difficulty
 
         if parameters.get("servings"):
             sql_filters["servings"] = parameters["servings"]
@@ -752,8 +843,22 @@ class RetrievalStrategyDecider:
                 else:
                     sql_filters["included_ingredients"] = [ingredients]
 
-        if filters.get("excluded_ingredients"):
-            sql_filters["excluded_ingredients"] = filters["excluded_ingredients"]
+        # Handle excluded_ingredients from NLID (support both key variants)
+        # NLID may return "exclude_ingredients" or "excluded_ingredients"
+        nlid_excluded = filters.get("excluded_ingredients") or filters.get("exclude_ingredients")
+        if nlid_excluded:
+            # Handle case where it might be a nested list (bug fix)
+            if isinstance(nlid_excluded, list):
+                # Flatten if nested
+                flattened = []
+                for item in nlid_excluded:
+                    if isinstance(item, list):
+                        flattened.extend(item)
+                    else:
+                        flattened.append(item)
+                sql_filters["excluded_ingredients"] = flattened
+            else:
+                sql_filters["excluded_ingredients"] = [nlid_excluded]
 
         if filters.get("cuisines"):
             sql_filters["cuisines"] = filters["cuisines"]
@@ -804,6 +909,13 @@ class RetrievalStrategyDecider:
             if session_included:
                 sql_filters["included_ingredients"] = session_included
 
+        # Creator filter - filter recipes by specific user
+        if session_filters.get("creator_uid"):
+            sql_filters["creator_uid"] = session_filters["creator_uid"]
+            logger.info(f"[RETRIEVAL STRATEGY] Added creator_uid to sql_filters: {session_filters['creator_uid']}")
+
+        logger.info(f"[RETRIEVAL STRATEGY] Final sql_filters: {sql_filters}")
+        logger.info(f"[RETRIEVAL STRATEGY] session_filters: {session_filters}")
         return sql_filters
 
 

@@ -26,7 +26,7 @@ def build_recipe_cost_filter_sql(
     Returns:
         SQL query string
     """
-    country = cost_filter.get("country", "US")
+    country = cost_filter.get("country", "Norway")
     operator = cost_filter.get("operator", "<=")
     value = cost_filter.get("value")
 
@@ -37,6 +37,19 @@ def build_recipe_cost_filter_sql(
         "Norway": "norway"
     }
     country_key = country_key_map.get(country, country.lower())
+
+    # Determine order direction based on operator and value
+    # For "low budget" queries (value is None), order by price ascending (cheapest first)
+    # For specific budget queries (value is set), order by price descending (closest to budget)
+    if value is None:
+        # No specific value - this is a "budget" or "cheap" request
+        # Order by price ascending to show cheapest recipes first
+        order_direction = "ASC"
+        price_condition = ""  # No filtering, just ordering
+    else:
+        # Specific budget provided
+        order_direction = "DESC"
+        price_condition = f"  AND CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}\n"
 
     # The actual structure is: recipe_metadata -> pricing -> country -> total
     base_query = f"""
@@ -55,7 +68,61 @@ WHERE r."deletedAt" IS NULL
   AND r."recipe_metadata"->'pricing' IS NOT NULL
   AND r."recipe_metadata"->'pricing'->'{country_key}' IS NOT NULL
   AND r."recipe_metadata"->'pricing'->'{country_key}'->>'total' IS NOT NULL
-  AND CAST(r."recipe_metadata"->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}
+{price_condition}"""
+
+    if additional_conditions:
+        for condition in additional_conditions:
+            base_query += f"  AND {condition}\n"
+
+    base_query += f"""
+ORDER BY CAST(r."recipe_metadata"->'pricing'->'{country_key}'->>'total' AS FLOAT) {order_direction}
+LIMIT {limit}
+"""
+
+    return base_query
+
+
+def build_recipe_time_filter_sql(
+    time_filter: Dict[str, Any],
+    user_uid: str,
+    language: str,
+    additional_conditions: Optional[List[str]] = None,
+    limit: int = 20
+) -> str:
+    """
+    Build SQL query for recipe time sorting.
+
+    Unlike cost/nutrition filters, time queries sort by (prepTime + cookTime)
+    rather than filtering. This shows all recipes sorted by total cooking time.
+
+    Args:
+        time_filter: Dict with sort_order ("ASC" for quick, "DESC" for long)
+        user_uid: User identifier
+        language: Language code
+        additional_conditions: Additional WHERE conditions
+        limit: Max results
+
+    Returns:
+        SQL query string
+    """
+    sort_order = time_filter.get("sort_order", "ASC").upper()
+
+    # Validate sort_order
+    if sort_order not in ["ASC", "DESC"]:
+        sort_order = "ASC"
+
+    base_query = f"""
+SELECT r."id", r."name", r."ingress", r."image",
+       (r."prepTime" + r."cookTime") as total_time,
+       r."difficulty", r."servings",
+       r."recipe_metadata"
+FROM recipe r
+LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
+LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+WHERE r."deletedAt" IS NULL
+  AND r."status" = 'published'
+  AND r."languageId" = '{language}'
+  AND (r."private" = false OR r."userUid" = '{user_uid}' OR br."bundleId" IS NOT NULL)
 """
 
     if additional_conditions:
@@ -63,7 +130,7 @@ WHERE r."deletedAt" IS NULL
             base_query += f"  AND {condition}\n"
 
     base_query += f"""
-ORDER BY CAST(r."recipe_metadata"->'pricing'->'{country_key}'->>'total' AS FLOAT) ASC
+ORDER BY (r."prepTime" + r."cookTime") {sort_order}
 LIMIT {limit}
 """
 
@@ -222,7 +289,7 @@ WHERE r."deletedAt" IS NULL
 
     # Add cost filter conditions
     if cost_filter:
-        country = cost_filter.get("country", "US")
+        country = cost_filter.get("country", "Norway")
         country_key = country_key_map.get(country, country.lower())
         operator = cost_filter.get("operator", "<=")
         value = cost_filter.get("value")
@@ -298,7 +365,7 @@ WHERE r."deletedAt" IS NULL
 
     # Default order by cost if no nutrition sort specified
     if not order_clause and cost_filter:
-        country = cost_filter.get("country", "US")
+        country = cost_filter.get("country", "Norway")
         country_key = country_key_map.get(country, country.lower())
         order_clause = f"ORDER BY CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) ASC"
 
@@ -405,8 +472,8 @@ def build_session_filter_conditions(
     if not session_filters:
         return conditions
 
-    # Include ingredients filter
-    include_ingredients = session_filters.get("include_ingredients", [])
+    # Include ingredients filter (check both key variants)
+    include_ingredients = session_filters.get("include_ingredients") or session_filters.get("included_ingredients", [])
     if include_ingredients:
         # Escape and join ingredient names
         escaped_ingredients = [ing.replace("'", "''").lower() for ing in include_ingredients]
@@ -420,17 +487,22 @@ def build_session_filter_conditions(
             )
         """)
 
-    # Exclude ingredients filter
-    exclude_ingredients = session_filters.get("exclude_ingredients", [])
+    # Exclude ingredients filter (checks name, description, AND ingredients)
+    # Support both key variants: exclude_ingredients and excluded_ingredients
+    exclude_ingredients = session_filters.get("exclude_ingredients") or session_filters.get("excluded_ingredients", [])
     if exclude_ingredients:
         for ing in exclude_ingredients:
             escaped_ing = ing.replace("'", "''").lower()
             conditions.append(f"""
-                NOT EXISTS (
-                    SELECT 1 FROM recipe_ingredient ri
-                    JOIN ingredient i ON ri."ingredientId" = i."id"
-                    WHERE ri."recipeId" = r."id"
-                    AND LOWER(i."name") LIKE '%{escaped_ing}%'
+                (
+                    LOWER(r."name") NOT LIKE '%{escaped_ing}%'
+                    AND LOWER(r."ingress") NOT LIKE '%{escaped_ing}%'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM recipe_ingredient ri
+                        JOIN ingredient i ON ri."ingredientId" = i."id"
+                        WHERE ri."recipeId" = r."id"
+                        AND LOWER(i."name") LIKE '%{escaped_ing}%'
+                    )
                 )
             """)
 
@@ -462,11 +534,19 @@ def build_session_filter_conditions(
             )
         """)
 
-    # Difficulty filter
+    # Difficulty filter - supports both single value and list
+    # When user asks for "easy" or "beginner", we include both "easy" and "normal"
     difficulty = session_filters.get("difficulty")
     if difficulty:
-        escaped_difficulty = difficulty.replace("'", "''")
-        conditions.append(f"r.\"difficulty\" = '{escaped_difficulty}'")
+        if isinstance(difficulty, list):
+            # Handle list of difficulties (e.g., ["easy", "normal"])
+            escaped_values = [d.replace("'", "''") for d in difficulty]
+            values_list = ", ".join([f"'{v}'" for v in escaped_values])
+            conditions.append(f"r.\"difficulty\" IN ({values_list})")
+        else:
+            # Handle single difficulty value
+            escaped_difficulty = difficulty.replace("'", "''")
+            conditions.append(f"r.\"difficulty\" = '{escaped_difficulty}'")
 
     # Time filter
     max_time = session_filters.get("max_time")
@@ -476,5 +556,31 @@ def build_session_filter_conditions(
             conditions.append(f"(r.\"prepTime\" + r.\"cookTime\") <= {max_time_int}")
         except (ValueError, TypeError):
             pass
+
+    # Excluded recipe IDs filter (for negative feedback: "I don't like these")
+    excluded_recipe_ids = session_filters.get("excluded_recipe_ids", [])
+    if excluded_recipe_ids:
+        # Create list of UUIDs for NOT IN clause
+        uuid_list = ", ".join([f"'{rid}'" for rid in excluded_recipe_ids])
+        conditions.append(f"r.\"id\" NOT IN ({uuid_list})")
+
+    # Ingredient count filter (for "recipes with under 5 ingredients")
+    ingredient_count_max = session_filters.get("ingredient_count_max")
+    if ingredient_count_max:
+        try:
+            count_int = int(ingredient_count_max)
+            conditions.append(f"""
+                (SELECT COUNT(*) FROM recipe_ingredient ri
+                 WHERE ri."recipeId" = r."id"
+                 AND ri."deletedAt" IS NULL) <= {count_int}
+            """)
+        except (ValueError, TypeError):
+            pass
+
+    # Creator filter (for "recipes by username")
+    creator_uid = session_filters.get("creator_uid")
+    if creator_uid:
+        escaped_uid = creator_uid.replace("'", "''")
+        conditions.append(f"r.\"userUid\" = '{escaped_uid}'")
 
     return conditions

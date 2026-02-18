@@ -230,7 +230,8 @@ class EmbeddingService:
         query_text: str,
         limit: int = 10,
         threshold: float = 0.7,
-        language_id: Optional[str] = None
+        language_id: Optional[str] = None,
+        offset: int = 0
     ) -> List[Tuple[Recipe, float]]:
         """
         Search recipes by semantic similarity using cosine similarity
@@ -240,6 +241,7 @@ class EmbeddingService:
             limit: Maximum number of results
             threshold: Minimum similarity score (0-1)
             language_id: Optional language ID filter (e.g., 'en', 'no')
+            offset: Number of results to skip (for pagination)
 
         Returns:
             List of (Recipe, similarity_score) tuples
@@ -264,6 +266,7 @@ class EmbeddingService:
             "query_embedding": embedding_array,
             "threshold": threshold,
             "limit": limit,
+            "offset": offset,
             "status": "published"
         }
 
@@ -293,6 +296,7 @@ class EmbeddingService:
             WHERE {' AND '.join(where_conditions)}
             ORDER BY embedding <=> CAST(:query_embedding AS vector)
             LIMIT :limit
+            OFFSET :offset
         """)
 
         result = self.db.execute(sql_query, params)

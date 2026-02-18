@@ -1,14 +1,22 @@
 """
 Admin Routes - Administrative endpoints for chatbot management
 """
-from typing import Optional
-from fastapi import APIRouter, Depends, status, Query
+from typing import Optional, List
+from uuid import UUID
+from datetime import datetime
+from fastapi import APIRouter, Depends, status, Query, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
 from apps.fastapi import logger
 from database import get_db
 from apps.fastapi.src.services.embedding_service import EmbeddingService
+from apps.fastapi.src.agents.agent_loader import (
+    get_agent_prompt,
+    get_all_agent_prompts,
+    refresh_prompts,
+    AgentPromptInfo
+)
 
 admin_route = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -29,6 +37,26 @@ class EmbeddingGenerationResponse(BaseModel):
     failed: int
     skipped: int
     message: str
+
+
+# Prompt Management Models (updated to not require DB fields)
+class PromptResponse(BaseModel):
+    """Response model for a single agent prompt"""
+    agent_key: str
+    agent_name: str
+    description: Optional[str]
+    current_prompt: str
+    model_name: Optional[str]
+    is_active: bool
+
+    class Config:
+        from_attributes = True
+
+
+class PromptListResponse(BaseModel):
+    """Response model for list of prompts"""
+    prompts: List[PromptResponse]
+    total: int
 
 
 # =====================================================
@@ -158,3 +186,117 @@ class AdminRoutes:
             return {
                 "error": str(e)
             }
+
+    @staticmethod
+    @admin_route.get(
+        "/prompts",
+        status_code=status.HTTP_200_OK,
+        response_model=PromptListResponse,
+        summary="List agent prompts",
+        description="Retrieve a list of all agent prompts from code"
+    )
+    def list_prompts(
+        agent_key: Optional[str] = Query(None, description="Filter by agent key"),
+        is_active: Optional[bool] = Query(None, description="Filter by active status (always true for code-based prompts)")
+    ):
+        """
+        List agent prompts
+
+        This endpoint retrieves prompts for all agents directly from the code.
+        Prompts are not stored in the database - they are loaded from agent files.
+        """
+        logger.info(f"Listing prompts (agent_key: {agent_key}, is_active: {is_active})")
+
+        try:
+            all_prompts = get_all_agent_prompts()
+
+            # Filter by agent_key if provided
+            if agent_key:
+                all_prompts = [p for p in all_prompts if p.agent_key == agent_key]
+
+            # Convert to response model
+            prompt_responses = [
+                PromptResponse(
+                    agent_key=p.agent_key,
+                    agent_name=p.agent_name,
+                    description=p.description,
+                    current_prompt=p.current_prompt,
+                    model_name=p.model_name,
+                    is_active=p.is_active
+                )
+                for p in all_prompts
+            ]
+
+            return PromptListResponse(prompts=prompt_responses, total=len(prompt_responses))
+
+        except Exception as e:
+            logger.error(f"Error listing prompts: {e}")
+            return PromptListResponse(prompts=[], total=0)
+
+    @staticmethod
+    @admin_route.get(
+        "/prompts/{agent_key}",
+        status_code=status.HTTP_200_OK,
+        response_model=PromptResponse,
+        summary="Get agent prompt",
+        description="Retrieve a specific agent prompt by key"
+    )
+    def get_prompt(agent_key: str):
+        """
+        Get agent prompt by key
+
+        This endpoint retrieves a specific prompt for an agent,
+        identified by the agent key. Prompts are loaded from code.
+        """
+        logger.info(f"Getting prompt for agent_key: {agent_key}")
+
+        try:
+            prompt_info = get_agent_prompt(agent_key)
+
+            if not prompt_info:
+                raise HTTPException(status_code=404, detail=f"Prompt not found for agent: {agent_key}")
+
+            return PromptResponse(
+                agent_key=prompt_info.agent_key,
+                agent_name=prompt_info.agent_name,
+                description=prompt_info.description,
+                current_prompt=prompt_info.current_prompt,
+                model_name=prompt_info.model_name,
+                is_active=prompt_info.is_active
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error getting prompt: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @staticmethod
+    @admin_route.post(
+        "/prompts/refresh",
+        status_code=status.HTTP_200_OK,
+        summary="Refresh prompts cache",
+        description="Refresh the prompts cache to load latest prompts from code"
+    )
+    def refresh_prompts_cache():
+        """
+        Refresh prompts cache
+
+        This endpoint refreshes the prompts cache, reloading all prompts
+        from the agent code files.
+        """
+        logger.info("Refreshing prompts cache")
+
+        try:
+            refresh_prompts()
+            all_prompts = get_all_agent_prompts()
+
+            return {
+                "success": True,
+                "message": f"Refreshed {len(all_prompts)} agent prompts",
+                "agents": [p.agent_key for p in all_prompts]
+            }
+
+        except Exception as e:
+            logger.error(f"Error refreshing prompts: {e}")
+            raise HTTPException(status_code=500, detail=str(e))

@@ -168,13 +168,17 @@ class ChatService:
         Returns:
             List containing the most recently active session with all its conversations
         """
+        logger.info(f"[CHAT SERVICE] get_user_sessions called for user: {user_uid}")
+
         # Validate user exists before loading conversation history
         self._validate_user_exists(user_uid)
 
         # Get all active sessions for user
         sessions = self.conversation_store.get_user_sessions(user_uid, limit=100)
+        logger.info(f"[CHAT SERVICE] Found {len(sessions)} active sessions for user {user_uid}")
 
         if not sessions:
+            logger.warning(f"[CHAT SERVICE] No sessions found for user {user_uid}")
             return []
 
         # Find the session with the most recent user message
@@ -182,36 +186,79 @@ class ChatService:
         most_recent_time = None
 
         for s in sessions:
+            logger.info(f"[CHAT SERVICE] Checking session {s.id}: is_active={s.is_active}")
+
+            # Verify session still exists and is active (defensive check)
+            if not s.is_active:
+                logger.info(f"[CHAT SERVICE] Session {s.id} is inactive, skipping")
+                continue
+
             messages = self.conversation_store.get_messages(str(s.id))
+            logger.info(f"[CHAT SERVICE] Session {s.id} has {len(messages)} total messages")
             user_msgs = [m for m in messages if m.role == "user"]
 
             if user_msgs:
                 last_user_msg_time = user_msgs[-1].created_at
+                logger.info(f"[CHAT SERVICE] Session {s.id} has {len(user_msgs)} user messages, last at {last_user_msg_time}")
                 if most_recent_time is None or (last_user_msg_time and last_user_msg_time > most_recent_time):
                     most_recent_time = last_user_msg_time
                     most_recent_session = s
 
+        # If no session with user messages, try to find any active session
+        if not most_recent_session and sessions:
+            logger.info(f"[CHAT SERVICE] No session with user messages found, looking for any active session")
+            for s in sessions:
+                if s.is_active:
+                    most_recent_session = s
+                    logger.info(f"[CHAT SERVICE] Found active session without user messages: {s.id}")
+                    break
+
         if not most_recent_session:
+            logger.warning(f"[CHAT SERVICE] No most_recent_session found for user {user_uid}")
             return []
 
-        # Get all messages for the most recent session
-        messages = self.conversation_store.get_messages(str(most_recent_session.id), limit=limit)
+        logger.info(f"[CHAT SERVICE] Most recent session: {most_recent_session.id}")
+
+        # Final verification that session exists in database (prevents race conditions)
+        verified_session = self.conversation_store.get_session(str(most_recent_session.id))
+        if not verified_session:
+            logger.warning(f"[CHAT SERVICE] Session {most_recent_session.id} disappeared during get_user_sessions")
+            return []
+
+        # Get all messages for the verified session
+        messages = self.conversation_store.get_messages(str(verified_session.id), limit=limit)
+        logger.info(f"[CHAT SERVICE] Retrieved {len(messages)} messages for verified session {verified_session.id}")
 
         if not messages:
+            logger.warning(f"[CHAT SERVICE] No messages found for session {verified_session.id}")
             return []
 
-        # Build the session response - maintain original structure
+        # Build the session response - use verified_session for consistency
         session_data = {
-            "session_id": str(most_recent_session.id),
-            "title": most_recent_session.title,
-            "created_at": most_recent_session.created_at.isoformat() if most_recent_session.created_at else None,
-            "updated_at": most_recent_session.updated_at.isoformat() if most_recent_session.updated_at else None,
-            "is_active": most_recent_session.is_active
+            "session_id": str(verified_session.id),
+            "title": verified_session.title,
+            "created_at": verified_session.created_at.isoformat() if verified_session.created_at else None,
+            "updated_at": verified_session.updated_at.isoformat() if verified_session.updated_at else None,
+            "is_active": verified_session.is_active
         }
 
         # Find first user message and last assistant message (original structure)
         user_msgs = [m for m in messages if m.role == "user"]
         assistant_msgs = [m for m in messages if m.role == "assistant"]
+
+        logger.info(f"[CHAT SERVICE] Building response: {len(user_msgs)} user msgs, {len(assistant_msgs)} assistant msgs")
+
+        # Add all messages as a flat array for frontend consumption
+        session_data["messages"] = [
+            {
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+                "metadata": m.meta if m.meta else None
+            }
+            for m in messages
+        ]
 
         if user_msgs:
             first_user_msg = user_msgs[0]
@@ -275,6 +322,7 @@ class ChatService:
                 conversations.append(conversation)
 
         session_data["conversations"] = conversations
+        logger.info(f"[CHAT SERVICE] Returning {len(conversations)} conversation pairs in response")
 
         return [session_data]
 
@@ -320,7 +368,8 @@ class ChatService:
         user_uid: Optional[str],
         message: str,
         language: Optional[str] = None,
-        new_session: bool = False
+        new_session: bool = False,
+        custom_prompts: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """
         Send a message and get AI response using the 10-stage pipeline
@@ -332,6 +381,7 @@ class ChatService:
             language: Optional language code (e.g., 'en', 'no') for filtering recipes
             new_session: If True, always create a new session (for "Start New Chat" button)
                         If False and no session_id, try to continue user's most recent session
+            custom_prompts: Optional dictionary of custom prompts for agents (key: agent_key, value: prompt text)
 
         Returns:
             Dictionary with response and updated session info
@@ -344,12 +394,42 @@ class ChatService:
         session = None
 
         if session_id:
-            # Explicit session_id provided - use it
+            # Explicit session_id provided - try to use it
             session = self.conversation_store.get_session(session_id)
             if not session:
-                return {"error": "Session not found", "code": "SESSION_NOT_FOUND"}
-            logger.info(f"[CHAT SERVICE] Using provided session: {session.id}")
-        elif not new_session and user_uid:
+                # Session not found - this can happen if it was cleaned up
+                # Instead of failing, try to continue user's most recent session or create new one
+                logger.warning(f"[CHAT SERVICE] Session {session_id} not found, attempting recovery for user {user_uid}")
+                if user_uid and not new_session:
+                    # Try to get user's most recent active session
+                    user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+                    if user_sessions:
+                        session = user_sessions[0]
+                        logger.info(f"[CHAT SERVICE] Recovered to most recent session: {session.id}")
+                # If still no session, will create new one below
+            elif not session.is_active:
+                # Session exists but is inactive - treat as not found and recover
+                logger.warning(f"[CHAT SERVICE] Session {session_id} is inactive, attempting recovery for user {user_uid}")
+                if user_uid and not new_session:
+                    user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+                    if user_sessions:
+                        session = user_sessions[0]
+                        logger.info(f"[CHAT SERVICE] Recovered to active session: {session.id}")
+                else:
+                    session = None  # Will create new session below
+            elif user_uid and session.user_uid and session.user_uid != user_uid:
+                # Session belongs to a different user - don't use it, recover instead
+                logger.warning(f"[CHAT SERVICE] Session {session_id} belongs to different user ({session.user_uid}), recovering for user {user_uid}")
+                user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
+                if user_sessions:
+                    session = user_sessions[0]
+                    logger.info(f"[CHAT SERVICE] Recovered to user's own session: {session.id}")
+                else:
+                    session = None  # Will create new session below
+            else:
+                logger.info(f"[CHAT SERVICE] Using provided session: {session.id}")
+
+        if not session and not new_session and user_uid:
             # No session_id, not forcing new session, and user_uid provided
             # Try to continue the user's most recent active session
             user_sessions = self.conversation_store.get_user_sessions(user_uid, limit=1, include_inactive=False)
@@ -377,11 +457,18 @@ class ChatService:
 
         # Step 3: Process through the 10-stage recipe search pipeline
         try:
+            # Log custom prompts being passed to pipeline
+            if custom_prompts:
+                logger.info(f"[CHAT SERVICE] Passing {len(custom_prompts)} custom prompt(s) to pipeline")
+                for agent_key in custom_prompts.keys():
+                    logger.info(f"[CHAT SERVICE] - Custom prompt for: {agent_key}")
+
             result = await self.pipeline.process_query(
                 query=message,
                 session_id=str(session.id),
                 user_uid=user_uid,
-                language=language or "en"  # Default to 'en' if not provided
+                language=language or "en",  # Default to 'en' if not provided
+                custom_prompts=custom_prompts
             )
         except Exception as e:
             # Ensure database is in clean state after pipeline error
@@ -434,6 +521,9 @@ class ChatService:
                         "bundle_name": r.get("bundle_name"),
                         "ingredients": r.get("ingredients", []),
                         "instructions": r.get("instructions", []),
+                        "recipe_cost": r.get("recipe_cost"),
+                        "nutritional_info": r.get("nutritional_info"),
+                        "seasonality": r.get("seasonality"),
                     }
                     for r in recipes
                 ]
@@ -554,4 +644,90 @@ class ChatService:
             "message_count": summary["total_messages"],
             "last_activity": summary["updated_at"],
             "is_active": summary["is_active"]
+        }
+
+    def get_session_filters(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get all active filters for a session.
+
+        Args:
+            session_id: Session UUID
+
+        Returns:
+            Dictionary of active filters or None if session not found
+        """
+        from apps.fastapi.src.services.session_memory_manager import SessionMemoryManager
+
+        session_manager = SessionMemoryManager(self.db)
+        session = session_manager.load_session(session_id)
+
+        if not session:
+            return None
+
+        filters = {
+            "tags": session.filters.tags if session.filters else [],
+            "cuisines": session.filters.cuisines if session.filters else [],
+            "excluded_ingredients": session.excluded_ingredients or [],
+            "excluded_recipe_ids": session.excluded_recipe_ids or [],
+            "difficulty": session.filters.difficulty if session.filters else None,
+            "max_time": session.filters.max_time if session.filters else None,
+            "last_vector_query": session.context_entities.last_vector_query if session.context_entities else None,
+            "last_intent": session.last_intent
+        }
+
+        # Count active filters
+        active_filter_count = sum([
+            len(filters["tags"]),
+            len(filters["cuisines"]),
+            len(filters["excluded_ingredients"]),
+            len(filters["excluded_recipe_ids"]),
+            1 if filters["difficulty"] else 0,
+            1 if filters["max_time"] else 0
+        ])
+        filters["active_filter_count"] = active_filter_count
+
+        return filters
+
+    def clear_session_filters(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Clear all filters for a session.
+
+        Args:
+            session_id: Session UUID
+
+        Returns:
+            Dictionary with cleared items list or None if session not found
+        """
+        from apps.fastapi.src.services.session_memory_manager import SessionMemoryManager
+
+        session_manager = SessionMemoryManager(self.db)
+        session = session_manager.load_session(session_id)
+
+        if not session:
+            return None
+
+        # Track what was cleared
+        cleared_items = []
+
+        if session.filters and session.filters.tags:
+            cleared_items.append(f"tags: {', '.join(session.filters.tags)}")
+        if session.filters and session.filters.cuisines:
+            cleared_items.append(f"cuisines: {', '.join(session.filters.cuisines)}")
+        if session.excluded_ingredients:
+            cleared_items.append(f"excluded ingredients: {', '.join(session.excluded_ingredients[:5])}")
+        if session.excluded_recipe_ids:
+            cleared_items.append(f"excluded recipes: {len(session.excluded_recipe_ids)} recipes")
+        if session.filters and session.filters.difficulty:
+            cleared_items.append(f"difficulty: {session.filters.difficulty}")
+        if session.filters and session.filters.max_time:
+            cleared_items.append(f"max time: {session.filters.max_time} minutes")
+
+        # Clear filters using session manager
+        session = session_manager.clear_filters(session)
+
+        logger.info(f"[CHAT SERVICE] Cleared filters for session {session_id}: {cleared_items}")
+
+        return {
+            "session_id": session_id,
+            "cleared_items": cleared_items
         }

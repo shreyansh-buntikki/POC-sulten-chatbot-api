@@ -393,3 +393,35 @@ class BundleRecipe(Base):
     order = Column(Integer, nullable=False)
     isFree = Column(Boolean, default=False, nullable=False)
     deletedAt = Column(DateTime(timezone=True))
+
+
+# =====================================================
+# Agent Prompt Management Models
+# =====================================================
+
+class AgentPrompt(Base):
+    """Agent prompt configuration - stores the current active prompt for each agent"""
+    __tablename__ = 'agent_prompt'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_key = Column(String(50), unique=True, nullable=False)  # e.g., "nlid_agent", "nlg_agent"
+    agent_name = Column(String(100), nullable=False)  # Human-readable name
+    description = Column(Text)  # What the agent does
+    current_prompt = Column(Text, nullable=False)  # The active prompt being used
+    model_name = Column(String(50))  # The model used (e.g., gpt-4o-mini)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AgentPromptHistory(Base):
+    """History of prompt changes for auditing"""
+    __tablename__ = 'agent_prompt_history'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_prompt_id = Column(UUID(as_uuid=True), ForeignKey('agent_prompt.id', ondelete='CASCADE'), nullable=False)
+    prompt_text = Column(Text, nullable=False)  # Full prompt text at this version
+    version = Column(Integer, nullable=False)  # Version number
+    changed_by_user_uid = Column(String)  # User who made the change (nullable for system)
+    change_reason = Column(Text)  # Optional reason for change
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
