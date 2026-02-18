@@ -3,22 +3,26 @@
 OpenAI-Powered Ingredient Enricher
 Uses OpenAI GPT to fetch nutritional data AND pricing for ingredients
 Handles Norwegian ingredient names automatically
+Uses OpenAI Agents SDK for consistent LLM calls
 """
 
 import csv
 import json
 import time
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 import os
 
 try:
     from openai import OpenAI
+    from agents import Agent, Runner
 except ImportError:
-    print("Installing openai package...")
+    print("Installing required packages...")
     import subprocess
-    subprocess.check_call(['pip', 'install', 'openai'])
+    subprocess.check_call(['pip', 'install', 'openai', 'agents'])
     from openai import OpenAI
+    from agents import Agent, Runner
 
 
 class OpenAIIngredientEnricher:
@@ -226,36 +230,34 @@ Important:
 - energyKj should be energyKcal × 4.184
 - Return ONLY the JSON, no explanations"""
     
-    def fetch_data_from_openai(self, ingredient_name: str, language: str = "no") -> Optional[Dict]:
-        """Fetch nutritional and pricing data using OpenAI"""
+    async def fetch_data_from_openai(self, ingredient_name: str, language: str = "no") -> Optional[Dict]:
+        """Fetch nutritional and pricing data using OpenAI Agents SDK"""
         print(f"  Querying OpenAI for: {ingredient_name}")
-        
+
         try:
             prompt = self.create_prompt(ingredient_name, language)
-            
-            response = self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Using cost-effective model
-                messages=[
-                    {"role": "system", "content": "You are a nutrition and food pricing expert. Always return valid JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,  # Lower temperature for more consistent results
-                max_tokens=1500
+
+            # Create agent for ingredient enrichment
+            enricher_agent = Agent(
+                name="IngredientEnricherAgent",
+                instructions="You are a nutrition and food pricing expert. Always return valid JSON only.",
+                model="gpt-4o-mini"
             )
-            
-            content = response.choices[0].message.content.strip()
-            
+
+            result = await Runner.run(enricher_agent, prompt)
+            content = result.final_output.strip()
+
             # Remove markdown code blocks if present
             if content.startswith('```'):
                 content = content.split('```')[1]
                 if content.startswith('json'):
                     content = content[4:]
                 content = content.strip()
-            
+
             data = json.loads(content)
             print(f"    ✓ Data retrieved successfully")
             return data
-            
+
         except json.JSONDecodeError as e:
             print(f"    ✗ JSON parsing error: {e}")
             print(f"    Response: {content[:200]}...")
@@ -264,13 +266,13 @@ Important:
             print(f"    ✗ Error: {e}")
             return None
     
-    def enrich_ingredient(self, ingredient: Dict) -> Dict:
+    async def enrich_ingredient(self, ingredient: Dict) -> Dict:
         """Enrich a single ingredient with all data using OpenAI"""
         name = ingredient['name']
         print(f"\n[{ingredient['index'] + 1}] Processing: {name}")
-        
+
         # Fetch data from OpenAI
-        ai_data = self.fetch_data_from_openai(name, ingredient['languageId'])
+        ai_data = await self.fetch_data_from_openai(name, ingredient['languageId'])
         
         # If OpenAI fails, create empty structure
         if not ai_data:
@@ -313,23 +315,23 @@ Important:
         
         return enriched
     
-    def process_batch(self, start: int = 0, limit: int = 20, batch_size: int = 10) -> List[Dict]:
+    async def process_batch(self, start: int = 0, limit: int = 20, batch_size: int = 10) -> List[Dict]:
         """Process a batch of ingredients"""
         print(f"\n{'='*70}")
         print(f"Reading ingredients {start+1} to {start+limit}...")
         print(f"{'='*70}")
-        
+
         ingredients = self.read_ingredients(start, limit)
-        
+
         print(f"\nProcessing {len(ingredients)} ingredients\n")
-        
+
         enriched_ingredients = []
         success_nutrition = 0
         success_pricing = 0
-        
+
         for i, ingredient in enumerate(ingredients):
             try:
-                enriched = self.enrich_ingredient(ingredient)
+                enriched = await self.enrich_ingredient(ingredient)
                 enriched_ingredients.append(enriched)
                 
                 if enriched['metadata']['hasNutritionData']:
@@ -382,16 +384,17 @@ Important:
         print(f"   Ingredients: {len(data)}")
 
 
-def main():
+async def main():
     print("\n" + "="*70)
     print("🤖 OpenAI-Powered Ingredient Enricher v3.0")
     print("   Fetches Nutrition Data + Pricing from OpenAI")
+    print("   Using OpenAI Agents SDK for consistent LLM calls")
     print("="*70)
-    
+
     # Get OpenAI API key
     # Option 1: Hardcode your key here (NOT recommended for security)
  
-    api_key = "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"  # <-- PUT YOUR KEY HERE
+    api_key = ""  # <-- PUT YOUR KEY HERE
     
     # Option 2: Enter when prompted (comment out line above and uncomment below)
     # api_key = input("\nEnter OpenAI API key (or press Enter to use env var OPENAI_API_KEY): ").strip()
@@ -402,30 +405,30 @@ def main():
     #         print("   Set OPENAI_API_KEY environment variable or enter key when prompted")
     #         return
     #     print("✓ Using API key from environment variable")
-    
+
     enricher = OpenAIIngredientEnricher(openai_api_key=api_key)
-    
+
     # Set defaults (modify these values as needed)
     start_index = 0
     num_ingredients = 2841  # Process all ingredients
-    
+
     print(f"\n📋 Processing {num_ingredients} ingredients starting from #{start_index}")
     print(f"   (Edit lines 409-410 in script to change these values)")
-    
+
     # Process ingredients
-    enriched_data = enricher.process_batch(start=start_index, limit=num_ingredients)
-    
+    enriched_data = await enricher.process_batch(start=start_index, limit=num_ingredients)
+
     # Save to JSON
     enricher.save_to_json(enriched_data, 'enriched_ingredients_openai.json')
-    
+
     print("\n" + "="*70)
     print("✅ Processing complete!")
     print("="*70)
-    
+
     # Show summary
     with_nutrition = sum(1 for ing in enriched_data if ing['metadata']['hasNutritionData'])
     with_pricing = sum(1 for ing in enriched_data if ing['metadata']['hasPricingData'])
-    
+
     print(f"\n📊 Summary:")
     print(f"   Total processed: {len(enriched_data)}")
     print(f"   With nutrition data: {with_nutrition} ({with_nutrition/len(enriched_data)*100:.1f}%)")
@@ -434,4 +437,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

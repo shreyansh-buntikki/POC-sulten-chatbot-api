@@ -15,7 +15,7 @@ from agents import Agent
 load_dotenv()
 
 # Model configuration from environment
-NLG_AGENT_MODEL = os.getenv('NLG_AGENT_MODEL', 'gpt-5-mini')
+NLG_AGENT_MODEL = os.getenv('NLG_AGENT_MODEL')
 
 # Agent key for database lookup
 AGENT_KEY = "nlg_agent"
@@ -146,7 +146,8 @@ nlg_agent = create_nlg_agent(DEFAULT_NLG_PROMPT)
 async def generate_recipe_response(
     query: str,
     recipes: List[Dict[str, Any]],
-    user_context: Optional[Dict[str, Any]] = None
+    user_context: Optional[Dict[str, Any]] = None,
+    agent: Optional[Agent] = None
 ) -> str:
     """
     Generate an engaging 2-3 line response that adds value to recipe search results.
@@ -159,6 +160,7 @@ async def generate_recipe_response(
         query: Original user query
         recipes: List of recipe dictionaries with details
         user_context: Optional user context (liked recipes, preferences)
+        agent: Optional custom agent to use (if None, uses default nlg_agent)
 
     Returns:
         Engaging 2-3 line natural language response (40-50 words)
@@ -166,6 +168,7 @@ async def generate_recipe_response(
     from agents import Runner
 
     recipe_count = len(recipes)
+    use_agent = agent if agent else nlg_agent
 
     prompt = f"""User query: "{query}"
 
@@ -188,7 +191,7 @@ Examples:
 
 Be confident, informative, and add value!"""
 
-    result = await Runner.run(nlg_agent, prompt)
+    result = await Runner.run(use_agent, prompt)
     return result.final_output
 
 
@@ -196,7 +199,8 @@ async def generate_no_results_response(
     query: str,
     intent: str,
     entities: Dict[str, Any],
-    filters: Dict[str, Any]
+    filters: Dict[str, Any],
+    agent: Optional[Agent] = None
 ) -> str:
     """
     Generate an informative response when no recipes match.
@@ -206,11 +210,14 @@ async def generate_no_results_response(
         intent: Detected intent
         entities: Extracted entities
         filters: Applied filters
+        agent: Optional custom agent to use (if None, uses default nlg_agent)
 
     Returns:
         Informative natural language response with alternatives
     """
     from agents import Runner
+
+    use_agent = agent if agent else nlg_agent
 
     prompt = f"""User query: "{query}"
 
@@ -232,7 +239,7 @@ Example: "I couldn't find an exact match for that combination, but similar ingre
 
 Be helpful and informative!"""
 
-    result = await Runner.run(nlg_agent, prompt)
+    result = await Runner.run(use_agent, prompt)
     return result.final_output
 
 
@@ -474,7 +481,8 @@ Be enthusiastic and make the meal sound delicious!"""
 async def generate_no_results_with_context_response(
     query: str,
     active_filters: Dict[str, Any],
-    excluded_recipe_count: int = 0
+    excluded_recipe_count: int = 0,
+    agent: Optional[Agent] = None
 ) -> str:
     """
     Generate an informative response when no recipes match, with filter context.
@@ -483,11 +491,14 @@ async def generate_no_results_with_context_response(
         query: Original user query
         active_filters: Dictionary of active filters limiting results
         excluded_recipe_count: Number of recipes excluded from previous negative feedback
+        agent: Optional custom agent to use (if None, uses default nlg_agent)
 
     Returns:
         Informative natural language response with suggestions
     """
     from agents import Runner
+
+    use_agent = agent if agent else nlg_agent
 
     # Build filter description
     filter_items = []
@@ -521,5 +532,5 @@ Generate a helpful response (2-3 sentences) that:
 
 Be helpful, not apologetic. Focus on solutions!"""
 
-    result = await Runner.run(nlg_agent, prompt)
+    result = await Runner.run(use_agent, prompt)
     return result.final_output

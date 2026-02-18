@@ -70,6 +70,7 @@ class MessageRequest(BaseModel):
     user_uid: Optional[str] = Field(None, description="Optional user identifier")
     message: str = Field(..., min_length=1, description="User's message content")
     new_session: bool = Field(False, description="Force creation of a new session (use when 'Start New Chat' is clicked)")
+    custom_prompts: Optional[Dict[str, str]] = Field(None, description="Optional custom prompts for agents (key: agent_key, value: prompt text)")
 
     class Config:
         json_schema_extra = {
@@ -77,7 +78,8 @@ class MessageRequest(BaseModel):
                 "session_id": None,
                 "user_uid": "user-123",
                 "message": "I need a quick chicken recipe for dinner",
-                "new_session": False
+                "new_session": False,
+                "custom_prompts": {"nlg_agent": "Custom prompt text..."}
             }
         }
 
@@ -146,6 +148,12 @@ class ChatRoutes:
         """
         logger.info(f"Message received - session: {request.session_id}, user: {request.user_uid}, new_session: {request.new_session}, language: {language}")
 
+        # Log custom prompts if provided
+        if request.custom_prompts:
+            logger.info(f"[CUSTOM PROMPTS] Received {len(request.custom_prompts)} custom prompt(s) from frontend")
+            for agent_key in request.custom_prompts.keys():
+                logger.info(f"[CUSTOM PROMPTS] - Agent: {agent_key}")
+
         # Check cache for identical queries (only for truly new sessions)
         if not request.session_id and request.new_session:
             cache_key = _get_cache_key(request.message, request.user_uid, language)
@@ -161,7 +169,8 @@ class ChatRoutes:
                 user_uid=request.user_uid,
                 message=request.message,
                 language=language,
-                new_session=request.new_session
+                new_session=request.new_session,
+                custom_prompts=request.custom_prompts
             )
 
             if "error" in result:

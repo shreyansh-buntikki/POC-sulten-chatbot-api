@@ -11,7 +11,7 @@ from agents import Agent, AgentOutputSchema
 load_dotenv()
 
 # Model configuration from environment
-NLID_AGENT_MODEL = os.getenv('NLID_AGENT_MODEL', 'gpt-5-mini')
+NLID_AGENT_MODEL = os.getenv('NLID_AGENT_MODEL')
 
 # Agent key for database lookup
 AGENT_KEY = "nlid_agent"
@@ -27,7 +27,7 @@ class IntentOutput(BaseModel):
         description="Whether the query is related to cooking, recipes, food, or kitchen activities"
     )
     intent: str = Field(
-        description="The primary intent category: recipe_search, nutritional_info, nutrition_filter, ingredient_substitution, recommendation, pricing_info, price_filter, general_chat, recipe_reference, negative_feedback, educational_info, festival_occasion, clear_filters, combined_meal_search"
+        description="The primary intent category: recipe_search, nutritional_info, nutrition_filter, ingredient_substitution, recommendation, pricing_info, price_filter, time_filter, general_chat, recipe_reference, negative_feedback, educational_info, festival_occasion, clear_filters, combined_meal_search, show_more"
     )
     entities: Dict[str, Any] = Field(
         default_factory=dict,
@@ -49,7 +49,7 @@ class IntentOutput(BaseModel):
     )
     requires_embedding: bool = Field(
         default=True,
-        description="Whether this query requires embedding search. Set to False for nutrition_filter, price_filter, recipe_reference, negative_feedback, and clear_filters intents."
+        description="Whether this query requires embedding search. Set to False for nutrition_filter, price_filter, time_filter, recipe_reference, negative_feedback, clear_filters, and show_more intents."
     )
 
 
@@ -87,6 +87,7 @@ Use both to understand follow-up queries and refinements:
 **Key patterns indicating refinements:**
 - "allergic to X", "allergy: X" → Add X to excluded_ingredients, preserve previous search intent
 - "without X", "no X", "except X" → Add X to excluded_ingredients
+- "don't have X", "dont have X", "I have no X", "ran out of X" → Add X to excluded_ingredients
 - "make it quick", "under 30 minutes" → Add time constraint, preserve ingredients/cuisine
 - "vegetarian", "vegan", "gluten-free" → Add dietary restriction, preserve other filters
 
@@ -170,13 +171,18 @@ Choose the most appropriate intent from the following categories:
    - Parameters: country/region (if specified), quantity
    - Filters: None
    - IMPORTANT: Use pricing_info intent when user asks about "cost", "price", "how much is" for ingredients
+   - **DEFAULT COUNTRY**: When no country or currency is specified, default to Norway (NOK/kr)
+     * "price of sugar" → Norway pricing (default)
+     * "price of sugar in India" → India pricing
+     * "price of sugar in all countries" → all countries
+   - Only return all countries when user explicitly asks (e.g., "all countries", "compare prices")
 
 5a. **price_filter**: User wants recipes based on price criteria (SKIP EMBEDDING SEARCH)
    - Examples: "recipes under 20 dollars", "budget meals", "expensive recipes", "cheap options"
    - Examples: "what can I make for under 10$", "affordable dinner ideas", "meals under 500 rupees"
    - Examples: "recipes under $20", "dishes below 100 kr"
    - Entities: price amounts, currency indicators ($, ₹, kr, rupees, dollars, etc.)
-   - Parameters: 
+   - Parameters:
      * max_price: the maximum price value
      * currency: detected currency (USD, INR, NOK)
      * country: mapped country (US, India, Norway) based on currency
@@ -186,10 +192,27 @@ Choose the most appropriate intent from the following categories:
      * cost.country: "US" for $, "India" for ₹/Rs, "Norway" for kr
    - Currency to country mapping:
      * $ / USD / dollars → US
-     * ₹ / INR / Rs / rupees → India  
+     * ₹ / INR / Rs / rupees → India
      * kr / NOK / krone → Norway
+   - **DEFAULT**: When no currency symbol is detected, default to Norway (NOK)
+     * "recipes under 100" → Norway (NOK 100)
+     * "budget meals for 50" → Norway (NOK 50)
    - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
    - **CRITICAL**: Return filters.cost with operator, value, and country
+
+5b. **time_filter**: User wants recipes based on cooking time criteria (SKIP EMBEDDING SEARCH)
+   - Examples: "quick recipes", "something quick", "fast meals", "short cooking time"
+   - Examples: "long recipes", "slow cooking", "meals that take time"
+   - Examples: "I want something quick", "quick dinner ideas", "fast to make"
+   - Entities: time_qualifier (quick, short, fast, long, slow)
+   - Parameters:
+     * time_sort: "quick"/"short"/"fast" → sort ASC (quickest first)
+     * time_sort: "long"/"slow" → sort DESC (longest first)
+   - Filters:
+     * time.sort_order: "ASC" for quick/short/fast, "DESC" for long/slow
+   - **CRITICAL**: This intent should NOT use embedding search. Set requires_embedding: false
+   - **CRITICAL**: Return filters.time with sort_order ("ASC" or "DESC")
+   - **NOTE**: If there's previous search context (e.g., "dessert recipes"), the system will combine that with time sorting
 
 6. **general_chat**: General conversation or greeting
    - Examples: "Hello", "How are you?", "Thanks!", "What can you do?"
@@ -256,6 +279,16 @@ Choose the most appropriate intent from the following categories:
       * combined_time: total time for all courses
     - Filters: Dietary restrictions apply to all courses
 
+13. **show_more**: User wants to see more results from the previous search
+    - Examples: "Show me more", "More recipes", "Show more options", "Any others?"
+    - Examples: "What else?", "More results", "Continue", "Next page"
+    - Entities: None (uses session context)
+    - Parameters: None
+    - Filters: None
+    - **CRITICAL**: Should retrieve additional results from cached embedding candidates or new search
+    - **CRITICAL**: This intent should NOT use embedding search directly. Set requires_embedding: false
+    - **CRITICAL**: Requires previous recipe search results in context
+
 ## Entity Extraction Guidelines
 
 Extract the following types of entities:
@@ -272,8 +305,29 @@ Extract the following types of entities:
 - **Meal Types**: breakfast, lunch, dinner, snack, dessert
 - **Quantities**: Numbers with units (2 cups, 500g, 1 tablespoon)
 - **Time**: Cooking/prep time expressions (30 minutes, 1 hour, quick)
-- **Difficulty**: easy, medium, hard, beginner, advanced
+- **Difficulty**: easy, medium, hard
+  - Easy synonyms: beginner, beginners, simple, basic, novice, starter, foolproof, first-time, entry-level
+  - Medium synonyms: moderate, intermediate, average, regular, standard
+  - Hard synonyms: advanced, expert, professional, challenging, complex, master, gourmet, sophisticated
 - **Servings**: Number of people (serves 4, for 2 people)
+- **Creator Name**: User/author name for recipe searches (e.g., "Shreyansh", "John")
+  - Patterns: "recipes by X", "recipes of X", "recipes created by X", "X's recipes"
+  - Examples: "recipes by Shreyansh" → creator_name: "Shreyansh"
+  - Examples: "show me John's recipes" → creator_name: "John"
+  - **IMPORTANT**: This is case-insensitive, exact match (no fuzzy matching)
+
+- **@username Pattern (CRITICAL)**: When user mentions a username with @ prefix
+  - Pattern: @ followed by a username (no spaces allowed in username)
+  - If there's a space after @something, only the part before the space is the username
+  - Examples:
+    * "recipes by @darshit" → creator_username: "darshit"
+    * "show me @john's recipes" → creator_username: "john"
+    * "@mammapia recipes" → creator_username: "mammapia"
+    * "suggest recipes by @darshit please" → creator_username: "darshit" (space after darshit, so it ends there)
+    * "@darshit123 quick meals" → creator_username: "darshit123"
+  - **IMPORTANT**: @username is ALWAYS a username (not a display name), case-insensitive
+  - **IMPORTANT**: Only extract the username part (without @ symbol)
+  - **IMPORTANT**: Username ends at first space or end of string
 
 ## Parameter Extraction Guidelines
 
@@ -303,14 +357,31 @@ Identify filters users want to apply to results:
 
 - **Ingredient Filters (CRITICAL)**:
   - "include_ingredients": Ingredients the recipe MUST contain
-  - "excluded_ingredients": Ingredients the recipe must NOT contain (allergies, dislikes)
+  - "excluded_ingredients": Ingredients the recipe must NOT contain (allergies, dislikes, unavailable)
   - When user says "using X" or "with X", put X in "include_ingredients"
   - When user says "without X" or "no X", put X in "excluded_ingredients"
   - When user says "allergic to X", put X in "excluded_ingredients"
+  - When user says "don't have X", "dont have X", "I have no X", "ran out of X", "out of X", put X in "excluded_ingredients"
+  - These all mean the same thing: exclude X from recipes
 
 - **Nutrition Filters**: calorie limits, macro requirements
 - **Time Filters**: max prep/cook time
 - **Difficulty Filters**: only easy recipes, etc.
+- **Creator Filter**: When user asks for recipes by a specific person
+  - Patterns: "recipes by X", "recipes of X", "X's recipes", "created by X", "made by X"
+  - Examples: "recipes by Shreyansh" → creator_name: "Shreyansh"
+  - Examples: "show me John's recipes" → creator_name: "John"
+  - Examples: "pasta recipes by Maria" → creator_name: "Maria", ingredients: ["pasta"]
+
+- **@username Filter (CRITICAL - HIGHEST PRIORITY)**: When user mentions @username
+  - Pattern: @username (no spaces in username)
+  - Examples:
+    * "recipes by @darshit" → creator_username: "darshit"
+    * "@john recipes" → creator_username: "john"
+    * "show me @mammapia's recipes" → creator_username: "mammapia"
+  - **IMPORTANT**: @username takes precedence over other creator patterns
+  - **IMPORTANT**: Extract username without the @ symbol
+  - **IMPORTANT**: Username ends at first space
 
 ## Summary Guidelines
 
@@ -353,6 +424,8 @@ Return a JSON object with the following structure:
     "recipes": [],
     "cuisines": [],
     "quantities": [],
+    "creator_name": null,
+    "creator_username": null,
     ...
   },
   "parameters": {
@@ -364,7 +437,9 @@ Return a JSON object with the following structure:
     "include_ingredients": [],
     "exclude_ingredients": [],
     "nutrition": {"sort_by": "protein", "order": "DESC", "level": "high"},
-    "cost": {"operator": "<=", "value": 20, "country": "US"},
+    "cost": {"operator": "<=", "value": 20, "country": "Norway"},
+    "creator_name": null,
+    "creator_username": null,
     ...
   },
   "summary": "Brief summary",
@@ -428,6 +503,118 @@ Example 4: "meals under 500 rupees"
   "summary": "User wants meals that cost 500 rupees or less in India",
   "confidence": "high",
   "requires_embedding": false
+}
+
+Example 5: "I want to make something quick" or "quick dinner ideas"
+{
+  "is_cooking_related": true,
+  "intent": "time_filter",
+  "entities": {"time_qualifier": "quick"},
+  "parameters": {"time_sort": "quick"},
+  "filters": {
+    "time": {"sort_order": "ASC"}
+  },
+  "summary": "User wants quick recipes sorted by cooking time (quickest first)",
+  "confidence": "high",
+  "requires_embedding": false
+}
+
+Example 6: "long slow cooking recipes"
+{
+  "is_cooking_related": true,
+  "intent": "time_filter",
+  "entities": {"time_qualifier": "long"},
+  "parameters": {"time_sort": "long"},
+  "filters": {
+    "time": {"sort_order": "DESC"}
+  },
+  "summary": "User wants long cooking recipes sorted by cooking time (longest first)",
+  "confidence": "high",
+  "requires_embedding": false
+}
+
+Example 7: "suggest me recipes by Shreyansh"
+{
+  "is_cooking_related": true,
+  "intent": "recipe_search",
+  "entities": {"creator_name": "Shreyansh"},
+  "parameters": {},
+  "filters": {
+    "creator_name": "Shreyansh"
+  },
+  "summary": "User wants recipes created by Shreyansh",
+  "confidence": "high",
+  "requires_embedding": true
+}
+
+Example 8: "pasta recipes by John"
+{
+  "is_cooking_related": true,
+  "intent": "recipe_search",
+  "entities": {"ingredients": ["pasta"], "creator_name": "John"},
+  "parameters": {},
+  "filters": {
+    "include_ingredients": ["pasta"],
+    "creator_name": "John"
+  },
+  "summary": "User wants pasta recipes created by John",
+  "confidence": "high",
+  "requires_embedding": true
+}
+
+Example 9: "beginner friendly pasta recipes" or "I'm new to cooking, suggest easy recipes"
+{
+  "is_cooking_related": true,
+  "intent": "recipe_search",
+  "entities": {"ingredients": ["pasta"]},
+  "parameters": {"difficulty": "easy"},
+  "filters": {
+    "include_ingredients": ["pasta"]
+  },
+  "summary": "User wants easy pasta recipes suitable for beginners",
+  "confidence": "high",
+  "requires_embedding": true
+}
+
+Example 10: "recipes by @darshit" or "@john recipes"
+{
+  "is_cooking_related": true,
+  "intent": "recipe_search",
+  "entities": {"creator_username": "darshit"},
+  "parameters": {},
+  "filters": {
+    "creator_username": "darshit"
+  },
+  "summary": "User wants recipes created by user @darshit",
+  "confidence": "high",
+  "requires_embedding": true
+}
+
+Example 11: "pasta recipes by @mammapia"
+{
+  "is_cooking_related": true,
+  "intent": "recipe_search",
+  "entities": {"ingredients": ["pasta"], "creator_username": "mammapia"},
+  "parameters": {},
+  "filters": {
+    "include_ingredients": ["pasta"],
+    "creator_username": "mammapia"
+  },
+  "summary": "User wants pasta recipes created by user @mammapia",
+  "confidence": "high",
+  "requires_embedding": true
+}
+
+Example 12: "expert level desserts" or "challenging recipes for experienced cooks"
+{
+  "is_cooking_related": true,
+  "intent": "recipe_search",
+  "entities": {"meal_types": ["dessert"]},
+  "parameters": {"difficulty": "hard"},
+  "filters": {},
+  "summary": "User wants challenging dessert recipes for advanced cooks",
+  "confidence": "high",
+  "requires_embedding": true
 }
 
 Analyze the user's query carefully and provide accurate structured output."""

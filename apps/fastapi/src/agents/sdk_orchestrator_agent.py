@@ -11,8 +11,8 @@ from agents import Agent, InputGuardrail, GuardrailFunctionOutput, Runner, Agent
 load_dotenv()
 
 # Model configuration from environment
-ORCHESTRATOR_AGENT_MODEL = os.getenv('ORCHESTRATOR_AGENT_MODEL', 'gpt-5-mini')
-COOKING_GUARDRAIL_MODEL = os.getenv('COOKING_GUARDRAIL_MODEL', 'gpt-5-mini')
+ORCHESTRATOR_AGENT_MODEL = os.getenv('ORCHESTRATOR_AGENT_MODEL')
+COOKING_GUARDRAIL_MODEL = os.getenv('COOKING_GUARDRAIL_MODEL')
 
 # Agent keys for database lookup
 ORCHESTRATOR_AGENT_KEY = "orchestrator_agent"
@@ -177,6 +177,7 @@ def create_cooking_guardrail_agent(prompt: Optional[str] = None) -> Agent:
 def create_orchestrator_agent(prompt: Optional[str] = None, guardrail_agent: Optional[Agent] = None) -> Agent:
     """
     Create an Orchestrator agent with the given prompt.
+    Uses default handoff agents (recipe_agent, nutritional_agent, nlid_agent).
     """
     instructions = prompt if prompt else DEFAULT_ORCHESTRATOR_PROMPT
 
@@ -200,6 +201,63 @@ def create_orchestrator_agent(prompt: Optional[str] = None, guardrail_agent: Opt
             recipe_agent,
             nutritional_agent,
             nlid_agent,
+        ],
+        input_guardrails=[
+            InputGuardrail(guardrail_function=cooking_guardrail_func),
+        ],
+        handoff_description="Main cooking assistant coordinator that routes queries to specialist agents",
+    )
+
+
+def create_orchestrator_with_custom_agents(
+    prompt: Optional[str] = None,
+    guardrail_agent: Optional[Agent] = None,
+    custom_recipe_agent: Optional[Agent] = None,
+    custom_nutritional_agent: Optional[Agent] = None,
+    custom_nlid_agent: Optional[Agent] = None
+) -> Agent:
+    """
+    Create an Orchestrator agent with custom handoff agents.
+
+    This allows using custom prompts for all agents in the handoff chain.
+
+    Args:
+        prompt: Custom orchestrator prompt (uses default if None)
+        guardrail_agent: Custom guardrail agent (creates default if None)
+        custom_recipe_agent: Custom recipe agent (uses default if None)
+        custom_nutritional_agent: Custom nutritional agent (uses default if None)
+        custom_nlid_agent: Custom NLID agent (uses default if None)
+
+    Returns:
+        Configured Orchestrator Agent with custom handoffs
+    """
+    instructions = prompt if prompt else DEFAULT_ORCHESTRATOR_PROMPT
+
+    # Use provided guardrail agent or create default
+    guardrail = guardrail_agent if guardrail_agent else create_cooking_guardrail_agent()
+
+    # Use provided custom agents or fall back to defaults
+    handoff_recipe = custom_recipe_agent if custom_recipe_agent else recipe_agent
+    handoff_nutritional = custom_nutritional_agent if custom_nutritional_agent else nutritional_agent
+    handoff_nlid = custom_nlid_agent if custom_nlid_agent else nlid_agent
+
+    async def cooking_guardrail_func(ctx, agent, input_data):
+        result = await Runner.run(guardrail, input_data, context=ctx.context)
+        output = result.final_output
+        final_output = output if isinstance(output, CookingRelatedOutput) else CookingRelatedOutput(**output)
+        return GuardrailFunctionOutput(
+            output_info=final_output,
+            tripwire_triggered=not final_output.is_cooking_related,
+        )
+
+    return Agent(
+        name="OrchestratorAgent",
+        model=ORCHESTRATOR_AGENT_MODEL,
+        instructions=instructions,
+        handoffs=[
+            handoff_recipe,
+            handoff_nutritional,
+            handoff_nlid,
         ],
         input_guardrails=[
             InputGuardrail(guardrail_function=cooking_guardrail_func),

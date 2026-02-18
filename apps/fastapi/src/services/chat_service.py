@@ -368,7 +368,8 @@ class ChatService:
         user_uid: Optional[str],
         message: str,
         language: Optional[str] = None,
-        new_session: bool = False
+        new_session: bool = False,
+        custom_prompts: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """
         Send a message and get AI response using the 10-stage pipeline
@@ -380,6 +381,7 @@ class ChatService:
             language: Optional language code (e.g., 'en', 'no') for filtering recipes
             new_session: If True, always create a new session (for "Start New Chat" button)
                         If False and no session_id, try to continue user's most recent session
+            custom_prompts: Optional dictionary of custom prompts for agents (key: agent_key, value: prompt text)
 
         Returns:
             Dictionary with response and updated session info
@@ -455,11 +457,18 @@ class ChatService:
 
         # Step 3: Process through the 10-stage recipe search pipeline
         try:
+            # Log custom prompts being passed to pipeline
+            if custom_prompts:
+                logger.info(f"[CHAT SERVICE] Passing {len(custom_prompts)} custom prompt(s) to pipeline")
+                for agent_key in custom_prompts.keys():
+                    logger.info(f"[CHAT SERVICE] - Custom prompt for: {agent_key}")
+
             result = await self.pipeline.process_query(
                 query=message,
                 session_id=str(session.id),
                 user_uid=user_uid,
-                language=language or "en"  # Default to 'en' if not provided
+                language=language or "en",  # Default to 'en' if not provided
+                custom_prompts=custom_prompts
             )
         except Exception as e:
             # Ensure database is in clean state after pipeline error

@@ -16,8 +16,13 @@ from apps.fastapi.src.services.session_memory_manager import (
     SessionMemoryManager, SessionState
 )
 from apps.fastapi.src.services.retrieval_strategy import RetrievalPlan, RetrievalStrategy
-from apps.fastapi.src.agents.sdk_nlid_agent import nlid_agent, IntentOutput
-from apps.fastapi.src.agents.sdk_orchestrator_agent import orchestrator_agent
+from apps.fastapi.src.agents.sdk_nlid_agent import nlid_agent, IntentOutput, create_nlid_agent
+from apps.fastapi.src.agents.sdk_orchestrator_agent import (
+    orchestrator_agent,
+    create_orchestrator_agent,
+    create_cooking_guardrail_agent,
+    create_orchestrator_with_custom_agents
+)
 from apps.fastapi.src.agents.sdk_nlg_agent import (
     nlg_agent,
     generate_recipe_response,
@@ -26,8 +31,11 @@ from apps.fastapi.src.agents.sdk_nlg_agent import (
     generate_recipe_detail_response,
     generate_educational_response,
     generate_combined_meal_response,
-    generate_no_results_with_context_response
+    generate_no_results_with_context_response,
+    create_nlg_agent
 )
+from apps.fastapi.src.agents.sdk_recipe_agent import recipe_agent, create_recipe_agent
+from apps.fastapi.src.agents.sdk_nutritional_agent import nutritional_agent, create_nutritional_agent
 from apps.fastapi.src.agents.agent_tools import (
     search_recipes_by_embedding,
     get_recipe_details,
@@ -58,9 +66,10 @@ from apps.fastapi.src.utils.sql_builders import (
     build_recipe_cost_filter_sql,
     build_recipe_nutrition_filter_sql,
     build_recipe_combined_filter_sql,
+    build_recipe_time_filter_sql,
     build_session_filter_conditions
 )
-from apps.fastapi.src.utils.ingredient_matcher import IntelligentIngredientMatcher
+from apps.fastapi.src.services.ingredient_matcher import IntelligentIngredientMatcher
 from models import Recipe, UserLikesRecipe
 
 
@@ -112,7 +121,8 @@ class RecipeSearchPipelineSDK:
         query: str,
         session_id: str,
         user_uid: Optional[str] = None,
-        language: str = "en"
+        language: str = "en",
+        custom_prompts: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:
         """
         Process a user query through the complete pipeline
@@ -122,6 +132,7 @@ class RecipeSearchPipelineSDK:
             session_id: Session identifier
             user_uid: Optional user identifier
             language: Language code
+            custom_prompts: Optional dictionary of custom prompts for agents
 
         Returns:
             Dictionary with response and metadata
@@ -129,13 +140,89 @@ class RecipeSearchPipelineSDK:
         pipeline_start_time = time.time()
         logger.info(f" [PIPELINE START] Query: {query[:100]} | Session: {session_id} | User: {user_uid}")
 
+        # Create agents with custom prompts if provided
+        current_nlid_agent = nlid_agent
+        current_nlg_agent = nlg_agent
+        current_recipe_agent = recipe_agent
+        current_nutritional_agent = nutritional_agent
+        current_orchestrator_agent = orchestrator_agent
+        current_guardrail_agent = None
+        use_agent_flow = False  # Flag to determine if we should use agent-based flow
+
+        if custom_prompts:
+            logger.info(f"[CUSTOM PROMPTS] Received {len(custom_prompts)} custom prompt(s)")
+            for agent_key, prompt_preview in custom_prompts.items():
+                preview = prompt_preview[:100] + "..." if len(prompt_preview) > 100 else prompt_preview
+                logger.info(f"[CUSTOM PROMPTS] Agent '{agent_key}': {preview}")
+
+            # Create custom agents based on provided prompts
+            if "nlid_agent" in custom_prompts:
+                current_nlid_agent = create_nlid_agent(custom_prompts["nlid_agent"])
+                logger.info("[CUSTOM PROMPTS] ✓ Created NLID agent with custom prompt")
+                use_agent_flow = True
+
+            if "nlg_agent" in custom_prompts:
+                current_nlg_agent = create_nlg_agent(custom_prompts["nlg_agent"])
+                logger.info("[CUSTOM PROMPTS] ✓ Created NLG agent with custom prompt")
+
+            if "recipe_agent" in custom_prompts:
+                current_recipe_agent = create_recipe_agent(custom_prompts["recipe_agent"])
+                logger.info("[CUSTOM PROMPTS] ✓ Created Recipe agent with custom prompt")
+                use_agent_flow = True
+
+            if "nutritional_agent" in custom_prompts:
+                current_nutritional_agent = create_nutritional_agent(custom_prompts["nutritional_agent"])
+                logger.info("[CUSTOM PROMPTS] ✓ Created Nutritional agent with custom prompt")
+                use_agent_flow = True
+
+            if "cooking_guardrail" in custom_prompts:
+                current_guardrail_agent = create_cooking_guardrail_agent(custom_prompts["cooking_guardrail"])
+                logger.info("[CUSTOM PROMPTS] ✓ Created Cooking Guardrail agent with custom prompt")
+                use_agent_flow = True
+
+            if "orchestrator_agent" in custom_prompts:
+                # Create orchestrator with custom agents as handoffs
+                current_orchestrator_agent = create_orchestrator_with_custom_agents(
+                    prompt=custom_prompts["orchestrator_agent"],
+                    guardrail_agent=current_guardrail_agent,
+                    custom_recipe_agent=current_recipe_agent if "recipe_agent" in custom_prompts else None,
+                    custom_nutritional_agent=current_nutritional_agent if "nutritional_agent" in custom_prompts else None,
+                    custom_nlid_agent=current_nlid_agent if "nlid_agent" in custom_prompts else None
+                )
+                logger.info("[CUSTOM PROMPTS] ✓ Created Orchestrator agent with custom prompt and handoffs")
+                use_agent_flow = True
+            elif current_guardrail_agent:
+                # Custom guardrail but default orchestrator prompt - still create new orchestrator
+                current_orchestrator_agent = create_orchestrator_with_custom_agents(
+                    guardrail_agent=current_guardrail_agent,
+                    custom_recipe_agent=current_recipe_agent if "recipe_agent" in custom_prompts else None,
+                    custom_nutritional_agent=current_nutritional_agent if "nutritional_agent" in custom_prompts else None,
+                    custom_nlid_agent=current_nlid_agent if "nlid_agent" in custom_prompts else None
+                )
+                logger.info("[CUSTOM PROMPTS] ✓ Created Orchestrator agent with custom guardrail and handoffs")
+
+            if use_agent_flow:
+                logger.info("[CUSTOM PROMPTS] 🔄 Agent-based flow will be used (custom agents detected)")
+
+        # If custom prompts provided, use agent-based flow for full agent testing
+        if use_agent_flow:
+            logger.info("[PIPELINE] Redirecting to agent-based flow...")
+            return await self.process_with_agent_flow(
+                query=query,
+                session_id=session_id,
+                user_uid=user_uid,
+                language=language,
+                orchestrator=current_orchestrator_agent,
+                nlg_agent_instance=current_nlg_agent if custom_prompts and "nlg_agent" in custom_prompts else None
+            )
+
         # Initialize retrieval_plan to None to avoid undefined variable errors
         retrieval_plan = None
 
         try:
             # ============ STAGE 1: Session Memory ============
             stage_start = time.time()
-            logger.info(f"[STAGE 1] Session Management - session: {session_id}, user: {user_uid}, language: {language}")
+            logger.info(f"[STAGE 1] Session Management - session: {session_id}, language: {language}")
             session = self.session_manager.get_or_create_session(
                 session_id, user_uid, language or "en", self.conversation_store
             )
@@ -173,7 +260,7 @@ class RecipeSearchPipelineSDK:
             async def run_nlid():
                 """Run NLID agent with conversation history and previous search context"""
                 return await Runner.run(
-                    nlid_agent,
+                    current_nlid_agent,
                     query,
                     context=enhanced_context
                 )
@@ -261,12 +348,12 @@ class RecipeSearchPipelineSDK:
                     query, nlid_result_dict, session, user_uid, language
                 )
 
-            # ============ SPECIAL HANDLING: Cost and Nutrition Filter Queries ============
-            # Handle price_filter and nutrition_filter intents with direct SQL (NO EMBEDDING)
-            # These queries filter recipes by recipe_metadata (pricing/nutrition)
-            if nlid_result_dict["intent"] in ["price_filter", "nutrition_filter"]:
+            # ============ SPECIAL HANDLING: Cost, Nutrition, and Time Filter Queries ============
+            # Handle price_filter, nutrition_filter, and time_filter intents with direct SQL (NO EMBEDDING)
+            # These queries filter/sort recipes by recipe_metadata (pricing/nutrition) or columns (time)
+            if nlid_result_dict["intent"] in ["price_filter", "nutrition_filter", "time_filter"]:
                 logger.info(f"[STAGE 3] Detected {nlid_result_dict['intent']} - routing to DIRECT SQL (skipping embedding search)")
-                return await self._handle_cost_nutrition_filter_query(
+                return await self._handle_filter_query(
                     query, nlid_result_dict, session, user_uid, language
                 )
 
@@ -283,6 +370,13 @@ class RecipeSearchPipelineSDK:
             if nlid_result_dict["intent"] == "negative_feedback":
                 logger.info(f"[STAGE 3] Detected negative_feedback - excluding recipes and re-searching")
                 return await self._handle_negative_feedback(
+                    query, nlid_result_dict, session, user_uid, language
+                )
+
+            # Handle show_more intent - user wants more results
+            if nlid_result_dict["intent"] == "show_more":
+                logger.info(f"[STAGE 3] Detected show_more - retrieving additional results")
+                return await self._handle_show_more(
                     query, nlid_result_dict, session, user_uid, language
                 )
 
@@ -338,6 +432,77 @@ class RecipeSearchPipelineSDK:
                         query, nlid_result_dict, session, user_uid, language
                     )
 
+            # ============ CREATOR USERNAME/NAME RESOLUTION ============
+            # Priority 1: @username pattern (exact username match)
+            # Priority 2: "by Name" pattern (fuzzy name/username match)
+            filters = nlid_result_dict.get("filters", {})
+            entities = nlid_result_dict.get("entities", {})
+
+            # Check for @username first (highest priority)
+            creator_username = filters.get("creator_username") or entities.get("creator_username")
+            creator_name = filters.get("creator_name") or entities.get("creator_name")
+
+            from apps.fastapi.src.services.user_service import UserService
+
+            if creator_username:
+                # @username pattern - exact username match only
+                logger.info(f"[CREATOR] Looking up user by @username: {creator_username}")
+
+                user, error = UserService.get_user_by_username(self.db, creator_username)
+
+                if user:
+                    # Found the user - add creator_uid to filters
+                    logger.info(f"[CREATOR] Found user by @username: {user.username} (uid: {user.uid})")
+                    nlid_result_dict["filters"]["creator_uid"] = user.uid
+                    # Also add to session context for display (use username for @username)
+                    nlid_result_dict["creator_resolved"] = {
+                        "name": user.name or user.username,
+                        "username": user.username,
+                        "uid": user.uid
+                    }
+                else:
+                    # User not found - return error response
+                    logger.info(f"[CREATOR] User not found with @username: {creator_username}")
+                    return {
+                        "response": f"Sorry, I couldn't find a user with the username '@{creator_username}'. Please check the spelling or try again with a different username.",
+                        "recipes": [],
+                        "metadata": {
+                            "intent": "recipe_search",
+                            "error": "user_not_found",
+                            "creator_username": creator_username,
+                        },
+                        "num_results": 0,
+                    }
+            elif creator_name:
+                # "by Name" pattern - check both username and name fields
+                logger.info(f"[CREATOR] Looking up user by name: {creator_name}")
+
+                user, error = UserService.get_user_by_name(self.db, creator_name)
+
+                if user:
+                    # Found the user - add creator_uid to filters
+                    logger.info(f"[CREATOR] Found user: {user.name} (uid: {user.uid})")
+                    nlid_result_dict["filters"]["creator_uid"] = user.uid
+                    # Also add to session context for display
+                    nlid_result_dict["creator_resolved"] = {
+                        "name": user.name,
+                        "username": user.username,
+                        "uid": user.uid
+                    }
+                else:
+                    # User not found - return error response
+                    logger.info(f"[CREATOR] User not found: {creator_name}")
+                    return {
+                        "response": f"Sorry, I couldn't find a user named '{creator_name}'. Please check the spelling and try again.",
+                        "recipes": [],
+                        "metadata": {
+                            "intent": "recipe_search",
+                            "error": "user_not_found",
+                            "creator_name": creator_name,
+                        },
+                        "num_results": 0,
+                    }
+
             # Update session state from NLID results
             session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
 
@@ -361,6 +526,7 @@ class RecipeSearchPipelineSDK:
             # ============ STAGE 3: Retrieval Strategy Decision ============
             stage_start = time.time()
             logger.info(f"[STAGE 3] Deciding retrieval strategy...")
+            logger.info(f"[STAGE 3] Session context filters: {session_context.get('filters', {})}")
             retrieval_plan = self.strategy_decider.decide_strategy(
                 query, nlid_result_dict, session_context
             )
@@ -474,15 +640,17 @@ class RecipeSearchPipelineSDK:
                             nlid_result_dict["filters"]["tags"].extend(mentioned_tags)
 
                         # Add allergies to excluded_ingredients if any
-                        # Use intelligent ingredient matcher to expand allergens
+                        # Use SMART ingredient expansion (no LLM calls for specific ingredients)
                         expanded_allergens = excluded_ingredients  # Default to original list
                         if excluded_ingredients:
                             try:
                                 # Initialize ingredient matcher
-                                ingredient_matcher = IntelligentIngredientMatcher(self.db, self.openai_client)
-                                # Get expanded allergen variants (e.g., "chocolate" -> ["chocolate", "cocoa", "cacao", ...])
-                                expanded_allergens = await ingredient_matcher._llm_expand_and_normalize(excluded_ingredients)
-                                logger.info(f"[ALLERGY] Expanded allergens: {excluded_ingredients} -> {expanded_allergens}")
+                                ingredient_matcher = IntelligentIngredientMatcher(self.db, self.client)
+                                # SMART expansion: categories -> full expansion, specific -> singular/plural only
+                                # e.g., "nuts" -> ["walnut", "almond", ...] but "garlic" -> ["garlic"]
+                                #       "tomato" -> ["tomato", "tomatoes"] (NOT 30+ varieties)
+                                expanded_allergens = ingredient_matcher.smart_expand_for_exclusions(excluded_ingredients)
+                                logger.info(f"[ALLERGY] Smart expanded allergens: {excluded_ingredients} -> {expanded_allergens}")
 
                                 # Store expanded allergens in session for persistence
                                 for original_allergen in excluded_ingredients:
@@ -561,15 +729,15 @@ class RecipeSearchPipelineSDK:
                             if tag not in session.filters.tags:
                                 session.filters.tags.append(tag)
 
-                        # Use intelligent ingredient matcher to expand allergens
+                        # Use SMART ingredient expansion (no LLM calls for specific ingredients)
                         expanded_allergens = excluded_ingredients  # Default to original list
                         if excluded_ingredients:
                             try:
                                 # Initialize ingredient matcher
-                                ingredient_matcher = IntelligentIngredientMatcher(self.db, self.openai_client)
-                                # Get expanded allergen variants (e.g., "chocolate" -> ["chocolate", "cocoa", "cacao", ...])
-                                expanded_allergens = await ingredient_matcher._llm_expand_and_normalize(excluded_ingredients)
-                                logger.info(f"[ALLERGY] Expanded allergens: {excluded_ingredients} -> {expanded_allergens}")
+                                ingredient_matcher = IntelligentIngredientMatcher(self.db, self.client)
+                                # SMART expansion: categories -> full expansion, specific -> singular/plural only
+                                expanded_allergens = ingredient_matcher.smart_expand_for_exclusions(excluded_ingredients)
+                                logger.info(f"[ALLERGY] Smart expanded allergens: {excluded_ingredients} -> {expanded_allergens}")
 
                                 # Store expanded allergens in session for persistence
                                 for original_allergen in excluded_ingredients:
@@ -647,28 +815,38 @@ class RecipeSearchPipelineSDK:
 
             # ============ ALLERGEN EXPANSION FOR NORMAL RECIPE SEARCH ============
             # If this is a normal recipe search with excluded_ingredients (not special case),
-            # we need to expand the allergens for better filtering
-            if not is_special_case and filters.get("excluded_ingredients"):
-                raw_allergens = filters.get("excluded_ingredients", [])
+            # we need to expand the allergens for better filtering using SMART expansion
+            # Support both key variants: "excluded_ingredients" and "exclude_ingredients"
+            raw_allergens = filters.get("excluded_ingredients") or filters.get("exclude_ingredients")
+            if not is_special_case and raw_allergens:
                 logger.info(f"[ALLERGY] Normal search with allergens detected: {raw_allergens}")
 
                 try:
                     # Initialize ingredient matcher
-                    ingredient_matcher = IntelligentIngredientMatcher(self.db, self.openai_client)
-                    # Get expanded allergen variants
-                    expanded_allergens = await ingredient_matcher._llm_expand_and_normalize(raw_allergens)
-                    logger.info(f"[ALLERGY] Expanded allergens: {raw_allergens} -> {expanded_allergens}")
+                    ingredient_matcher = IntelligentIngredientMatcher(self.db, self.client)
+                    # SMART expansion: categories -> full expansion, specific -> singular/plural only
+                    new_expanded_allergens = ingredient_matcher.smart_expand_for_exclusions(raw_allergens)
+                    logger.info(f"[ALLERGY] Smart expanded new allergens: {raw_allergens} -> {new_expanded_allergens}")
 
-                    # Store expanded allergens in session for persistence
+                    # Store new allergens in session for persistence
                     for original_allergen in raw_allergens:
-                        session = self.session_manager.add_allergy(session, original_allergen, expanded_allergens)
+                        session = self.session_manager.add_allergy(session, original_allergen, new_expanded_allergens)
 
-                    # Update the NLID result with expanded allergens
-                    nlid_result_dict["filters"]["excluded_ingredients"] = expanded_allergens
+                    # Merge with existing session exclusions
+                    existing_exclusions = session.excluded_ingredients or []
+                    all_exclusions = list(set(existing_exclusions + new_expanded_allergens))
+                    logger.info(f"[ALLERGY] Merged exclusions: existing={len(existing_exclusions)} + new={len(new_expanded_allergens)} = total={len(all_exclusions)}")
+
+                    # Update session's excluded_ingredients with merged list
+                    session.excluded_ingredients = all_exclusions
+                    self.session_manager.save_session(session)
+
+                    # Update the NLID result with ALL exclusions (existing + new)
+                    nlid_result_dict["filters"]["excluded_ingredients"] = all_exclusions
 
                     # Also update retrieval_plan if it has sql_filters
                     if retrieval_plan.sql_filters and "excluded_ingredients" in retrieval_plan.sql_filters:
-                        retrieval_plan.sql_filters["excluded_ingredients"] = expanded_allergens
+                        retrieval_plan.sql_filters["excluded_ingredients"] = all_exclusions
 
                     # Increase top_k to handle semantic dominance of allergens in embedding results
                     if retrieval_plan.top_k < 50:
@@ -719,7 +897,7 @@ class RecipeSearchPipelineSDK:
                 # SQL generation for filter-only queries
                 logger.info(f"[FILTER-ONLY] Generating SQL for direct filtering...")
                 logger.info(f"[FILTER-ONLY] Passing sql_filters to generator: {retrieval_plan.sql_filters}")
-                sql_result = self.sql_generator.generate_sql(
+                sql_result = await self.sql_generator.generate_sql(
                     query,
                     nlid_result_dict,
                     retrieval_plan.sql_filters,
@@ -745,6 +923,23 @@ class RecipeSearchPipelineSDK:
                 similarity_scores = {str(r.id): s for r, s in embedding_results}
                 logger.info(f"[HYBRID] ✓ Embedding search: {len(embedding_results)} candidates")
 
+                # Initialize search cache for "show more" feature
+                # Store embedding candidates and search context
+                if candidate_ids:
+                    from apps.fastapi.src.services.session_memory_manager import EMBEDDING_BATCH_SIZE
+                    self.session_manager.init_search_cache(
+                        session,
+                        vector_query=retrieval_plan.vector_query or query,
+                        sql_filters=retrieval_plan.sql_filters or {},
+                        original_intent=nlid_result_dict.get("intent")
+                    )
+                    self.session_manager.store_embedding_candidates(
+                        session,
+                        candidate_ids,
+                        offset=0  # Initial search starts at offset 0
+                    )
+                    logger.info(f"[SEARCH CACHE] Initialized with {len(candidate_ids)} candidates for 'show more'")
+
                 # Step 2: Schema fetch (cached, fast)
                 relevant_schema = self.schema_understanding.get_relevant_schema(
                     nlid_result_dict["intent"],
@@ -755,7 +950,7 @@ class RecipeSearchPipelineSDK:
                 # Step 3: SQL generation WITH candidate_ids (filters the embedding candidates)
                 logger.info(f"[HYBRID] Generating SQL to filter {len(candidate_ids)} embedding candidates...")
                 logger.info(f"[HYBRID] Passing sql_filters to generator: {retrieval_plan.sql_filters}")
-                sql_result = self.sql_generator.generate_sql(
+                sql_result = await self.sql_generator.generate_sql(
                     query,
                     nlid_result_dict,
                     retrieval_plan.sql_filters,
@@ -800,7 +995,7 @@ class RecipeSearchPipelineSDK:
 
                     # SQL generation (expensive, ~3s)
                     # For non-hybrid queries, pass None for candidate_ids
-                    gen_sql_result = self.sql_generator.generate_sql(
+                    gen_sql_result = await self.sql_generator.generate_sql(
                         query,
                         nlid_result_dict,
                         retrieval_plan.sql_filters,
@@ -826,6 +1021,21 @@ class RecipeSearchPipelineSDK:
                 if embedding_result and not isinstance(embedding_result, Exception):
                     candidate_ids, similarity_scores = embedding_result
                     logger.info(f"[STAGE 4] ✓ Found {len(candidate_ids)} candidates via embeddings (parallel)")
+
+                    # Initialize search cache for "show more" feature (parallel path)
+                    if candidate_ids:
+                        self.session_manager.init_search_cache(
+                            session,
+                            vector_query=retrieval_plan.vector_query or query,
+                            sql_filters=retrieval_plan.sql_filters or {},
+                            original_intent=nlid_result_dict.get("intent")
+                        )
+                        self.session_manager.store_embedding_candidates(
+                            session,
+                            candidate_ids,
+                            offset=0
+                        )
+                        logger.info(f"[SEARCH CACHE] Initialized with {len(candidate_ids)} candidates (parallel path)")
                 else:
                     candidate_ids = None
                     similarity_scores = {}
@@ -924,7 +1134,8 @@ class RecipeSearchPipelineSDK:
                 response = await self._generate_natural_language_response(
                     query,
                     execution_result["rows"][:self.MAX_RECIPES],  # Use SQL results directly
-                    nlid_result_dict
+                    nlid_result_dict,
+                    current_nlg_agent  # Pass the custom agent
                 )
 
                 return response
@@ -961,6 +1172,12 @@ class RecipeSearchPipelineSDK:
             # Store recipe results for reference queries ("Explain the 1st recipe")
             if final_recipes:
                 self.session_manager.update_last_recipe_results(session, final_recipes, query)
+
+                # Mark these recipes as shown in search cache (for "show more" feature)
+                shown_recipe_ids = [str(r.get("id")) for r in final_recipes if r.get("id")]
+                if shown_recipe_ids:
+                    self.session_manager.add_shown_recipes(session, shown_recipe_ids)
+                    logger.info(f"[SEARCH CACHE] Marked {len(shown_recipe_ids)} recipes as shown")
 
             self.session_manager.save_session(session)
 
@@ -1075,13 +1292,107 @@ class RecipeSearchPipelineSDK:
                 "pipeline_metadata": {}
             }
 
+    async def process_with_agent_flow(
+        self,
+        query: str,
+        session_id: str,
+        user_uid: Optional[str] = None,
+        language: str = "en",
+        orchestrator: Optional[Any] = None,
+        nlg_agent_instance: Optional[Any] = None
+    ) -> Dict[str, Any]:
+        """
+        Process a query using the multi-agent handoff flow.
+
+        This uses the OrchestratorAgent to route queries to specialist agents
+        (RecipeAgent, NutritionalAgent, NLIDAgent) based on the query type.
+
+        Args:
+            query: User's query text
+            session_id: Session identifier
+            user_uid: Optional user identifier
+            language: Language code
+            orchestrator: Optional custom orchestrator agent
+            nlg_agent_instance: Optional custom NLG agent for final response
+
+        Returns:
+            Dictionary with response and metadata
+        """
+        pipeline_start_time = time.time()
+        logger.info(f"[AGENT FLOW START] Query: {query[:100]} | Session: {session_id}")
+
+        try:
+            # Use provided orchestrator or default
+            orch_agent = orchestrator if orchestrator else orchestrator_agent
+
+            # Run the orchestrator agent
+            logger.info("[AGENT FLOW] Running orchestrator agent...")
+            result = await Runner.run(
+                orch_agent,
+                query,
+                context={"user_uid": user_uid, "session_id": session_id, "language": language}
+            )
+
+            agent_response = result.final_output
+            logger.info(f"[AGENT FLOW] ✓ Orchestrator completed in {time.time() - pipeline_start_time:.3f}s")
+
+            # Generate final NLG response if custom NLG agent provided
+            if nlg_agent_instance:
+                logger.info("[AGENT FLOW] Generating final response with custom NLG agent...")
+                # Wrap the agent response for NLG
+                final_response = await generate_recipe_response(
+                    query,
+                    [],  # No recipes - agent already handled the search
+                    None,
+                    nlg_agent_instance
+                )
+            else:
+                final_response = str(agent_response)
+
+            logger.info(f"[AGENT FLOW COMPLETE] Total time: {time.time() - pipeline_start_time:.3f}s")
+
+            return {
+                "response": final_response,
+                "metadata": {
+                    "intent": "agent_handoff",
+                    "is_cooking_related": True,
+                    "retrieval_strategy": "agent_handoff",
+                    "num_results": 0,
+                    "pipeline_duration_ms": round((time.time() - pipeline_start_time) * 1000, 2),
+                    "recipes": [],
+                    "used_agent_flow": True
+                },
+                "pipeline_metadata": {}
+            }
+
+        except Exception as e:
+            import traceback
+            error_time = time.time() - pipeline_start_time
+            logger.error("=" * 80)
+            logger.error(f"[AGENT FLOW ERROR] Failed after {error_time:.3f}s")
+            logger.error(f"[AGENT FLOW ERROR] Error: {str(e)}")
+            for line in traceback.format_exc().split('\n'):
+                logger.error(f"  {line}")
+            logger.error("=" * 80)
+
+            # Fallback to standard pipeline
+            logger.info("[AGENT FLOW] Falling back to standard pipeline due to error")
+            return await self.process_query(
+                query=query,
+                session_id=session_id,
+                user_uid=user_uid,
+                language=language,
+                custom_prompts=None  # Don't pass custom prompts to avoid infinite loop
+            )
+
     async def _generate_sdk_response(
         self,
         query: str,
         recipes: List[Dict[str, Any]],
         nlid_result: Dict[str, Any],
         session_id: str,
-        user_uid: Optional[str] = None
+        user_uid: Optional[str] = None,
+        nlg_agent_instance = None
     ) -> str:
         """
         Generate natural language response using SDK NLG agent
@@ -1097,7 +1408,7 @@ class RecipeSearchPipelineSDK:
             logger.info(f"[NLG] User context: has_liked_recipes={user_context.get('has_liked_recipes', False)}")
 
         # Use SDK NLG agent to generate response
-        response = await generate_recipe_response(query, recipes, user_context)
+        response = await generate_recipe_response(query, recipes, user_context, nlg_agent_instance)
         logger.info(f"[NLG] ✓ SDK response generated ({len(response)} chars)")
         return response
 
@@ -1485,22 +1796,24 @@ class RecipeSearchPipelineSDK:
         self,
         query: str,
         recipes: List[Dict[str, Any]],
-        nlid_result: Dict[str, Any]
+        nlid_result: Dict[str, Any],
+        nlg_agent_instance = None
     ) -> str:
         """Generate natural language response from recipe results using SDK"""
         if not recipes:
             logger.warning(f"[NLG] No recipes found, generating no-results response")
-            return await self._generate_no_results_response(query, nlid_result)
+            return await self._generate_no_results_response(query, nlid_result, nlg_agent_instance)
 
         # Use SDK NLG agent to generate response
-        response = await generate_recipe_response(query, recipes)
+        response = await generate_recipe_response(query, recipes, None, nlg_agent_instance)
         logger.info(f"[NLG] ✓ Response generated ({len(response)} chars)")
         return response
 
     async def _generate_no_results_response(
         self,
         query: str,
-        nlid_result: Dict[str, Any]
+        nlid_result: Dict[str, Any],
+        nlg_agent = None
     ) -> str:
         """Generate response when no recipes are found using SDK"""
         logger.info(f"[NLG] Generating no-results response for intent: {nlid_result.get('intent', 'unknown')}")
@@ -1508,7 +1821,8 @@ class RecipeSearchPipelineSDK:
             query,
             nlid_result.get("intent", "unknown"),
             nlid_result.get("entities", {}),
-            nlid_result.get("filters", {})
+            nlid_result.get("filters", {}),
+            nlg_agent
         )
         logger.info(f"[NLG] ✓ No-results response generated ({len(response)} chars)")
         return response
@@ -1605,12 +1919,56 @@ class RecipeSearchPipelineSDK:
         }
 
         difficulty_patterns = {
+            # Easy difficulty mappings
             r'\beasy\b': 'easy',
             r'\bsimple\b': 'easy',
+            r'\bquick\b': 'easy',  # quick recipes are often easy
+            r'\bbasic\b': 'easy',
+            r'\bbeginner\b': 'easy',
+            r'\bbeginners\b': 'easy',
+            r'\bbeginner-friendly\b': 'easy',
+            r'\bnew to cooking\b': 'easy',
+            r'\bjust starting\b': 'easy',
+            r'\bstarter\b': 'easy',
+            r'\bnovice\b': 'easy',
+            r'\bfirst.?time\b': 'easy',
+            r'\bentry.?level\b': 'easy',
+            r'\bfoolproof\b': 'easy',
+            r'\bidiot.?proof\b': 'easy',
+            r'\bno.?brainer\b': 'easy',
+            r'\bfor.?kids\b': 'easy',
+            r'\bchild.?friendly\b': 'easy',
+
+            # Medium difficulty mappings
             r'\bmedium\b': 'medium',
+            r'\bmoderate\b': 'medium',
+            r'\bintermediate\b': 'medium',
+            r'\baverage\b': 'medium',
+            r'\bregular\b': 'medium',
+            r'\bstandard\b': 'medium',
+            r'\bnormal\b': 'medium',
+
+            # Hard difficulty mappings
             r'\bhard\b': 'hard',
             r'\bdifficult\b': 'hard',
             r'\bcomplex\b': 'hard',
+            r'\badvanced\b': 'hard',
+            r'\bexpert\b': 'hard',
+            r'\bexperts\b': 'hard',
+            r'\bprofessional\b': 'hard',
+            r'\bpro\b': 'hard',
+            r'\bmaster\b': 'hard',
+            r'\bmastery\b': 'hard',
+            r'\bchef.?level\b': 'hard',
+            r'\bchallenging\b': 'hard',
+            r'\belaborate\b': 'hard',
+            r'\bintricate\b': 'hard',
+            r'\bsophisticated\b': 'hard',
+            r'\bfancy\b': 'hard',
+            r'\bgourmet\b': 'hard',
+            r'\bfine.?dining\b': 'hard',
+            r'\brestaurant.?quality\b': 'hard',
+            r'\bimpressive\b': 'hard',
         }
 
         meal_type_patterns = {
@@ -1737,7 +2095,7 @@ class RecipeSearchPipelineSDK:
 
         return contextual_query
 
-    async def _handle_cost_nutrition_filter_query(
+    async def _handle_filter_query(
         self,
         query: str,
         nlid_result: Dict[str, Any],
@@ -1746,10 +2104,11 @@ class RecipeSearchPipelineSDK:
         language: Optional[str]
     ) -> Dict[str, Any]:
         """
-        Handle price_filter and nutrition_filter intents with DIRECT SQL queries.
+        Handle price_filter, nutrition_filter, and time_filter intents.
 
-        These queries bypass embedding search entirely and query recipe_metadata directly.
-        This provides accurate filtering by cost and nutrition values stored in the database.
+        If there's a previous search context (e.g., "dessert recipes"), this will
+        combine that with the filter as a refinement (embedding search + filter).
+        If no previous context, falls back to direct SQL query (no embedding).
 
         Args:
             query: User's query text
@@ -1767,21 +2126,67 @@ class RecipeSearchPipelineSDK:
         intent = nlid_result.get("intent", "")
         filters = nlid_result.get("filters", {})
 
-        logger.info(f"[COST/NUTRITION FILTER] Processing intent: {intent}")
-        logger.info(f"[COST/NUTRITION FILTER] Filters from NLID: {filters}")
+        logger.info(f"[FILTER QUERY] Processing intent: {intent}")
+        logger.info(f"[FILTER QUERY] Filters from NLID: {filters}")
 
-        # Extract cost and nutrition filters
+        # Extract cost, nutrition, and time filters
         cost_filter = filters.get("cost")
         nutrition_filter = filters.get("nutrition")
+        time_filter = filters.get("time")
 
         # Fallback: try to extract from query if NLID didn't provide them
         if not cost_filter and intent == "price_filter":
             cost_filter = extract_cost_filter(query)
-            logger.info(f"[COST/NUTRITION FILTER] Extracted cost filter from query: {cost_filter}")
+            logger.info(f"[FILTER QUERY] Extracted cost filter from query: {cost_filter}")
 
         if not nutrition_filter and intent == "nutrition_filter":
             nutrition_filter = extract_nutrition_filter(query)
-            logger.info(f"[COST/NUTRITION FILTER] Extracted nutrition filter from query: {nutrition_filter}")
+            logger.info(f"[FILTER QUERY] Extracted nutrition filter from query: {nutrition_filter}")
+
+        if not time_filter and intent == "time_filter":
+            # Extract time qualifier from query
+            query_lower = query.lower()
+            if any(word in query_lower for word in ["quick", "short", "fast"]):
+                time_filter = {"sort_order": "ASC"}
+            elif any(word in query_lower for word in ["long", "slow"]):
+                time_filter = {"sort_order": "DESC"}
+            logger.info(f"[FILTER QUERY] Extracted time filter from query: {time_filter}")
+
+        # ============ REFINEMENT MODE: Check for previous search context ============
+        # If user previously searched for something (e.g., "dessert recipes") and now
+        # adds a filter, we should refine the previous search, not start fresh
+        previous_vector_query = None
+
+        # Debug: Log the session context_entities state
+        logger.info(f"[FILTER QUERY DEBUG] session.context_entities exists: {session.context_entities is not None}")
+        if session.context_entities:
+            logger.info(f"[FILTER QUERY DEBUG] last_vector_query: '{session.context_entities.last_vector_query}'")
+            logger.info(f"[FILTER QUERY DEBUG] search_cache type: {type(session.context_entities.search_cache)}")
+            logger.info(f"[FILTER QUERY DEBUG] search_cache has vector_query: {'vector_query' in session.context_entities.search_cache if session.context_entities.search_cache else False}")
+            previous_vector_query = session.context_entities.last_vector_query
+
+        # Also check search cache for the original vector query
+        has_cache = self.session_manager.has_search_cache(session)
+        logger.info(f"[FILTER QUERY DEBUG] has_search_cache: {has_cache}")
+        if has_cache:
+            cache = self.session_manager.get_search_cache(session)
+            logger.info(f"[FILTER QUERY DEBUG] cache keys: {list(cache.keys()) if cache else 'empty'}")
+            logger.info(f"[FILTER QUERY DEBUG] cache vector_query: '{cache.get('vector_query')}'")
+            if cache.get("vector_query"):
+                previous_vector_query = cache.get("vector_query")
+                logger.info(f"[FILTER QUERY] Found previous search context from cache: {previous_vector_query}")
+
+        if previous_vector_query:
+            logger.info(f"[FILTER QUERY] Found previous search context: '{previous_vector_query}'")
+            logger.info(f"[FILTER QUERY] Treating as refinement to previous search")
+            # Route to refinement handler which will do embedding search + filter
+            return await self._handle_filter_refinement(
+                query, nlid_result, session, user_uid, language,
+                previous_vector_query, cost_filter, nutrition_filter, time_filter
+            )
+
+        # ============ STANDALONE MODE: No previous context, use direct SQL ============
+        logger.info(f"[FILTER QUERY] No previous search context, using direct SQL")
 
         # Get session context for additional filters (dietary restrictions, allergies, etc.)
         session_context = self.session_manager.get_user_context(session, {})
@@ -1810,7 +2215,7 @@ class RecipeSearchPipelineSDK:
 
         if cost_filter and nutrition_filter:
             # Combined cost + nutrition filter
-            logger.info(f"[COST/NUTRITION FILTER] Building combined cost + nutrition SQL")
+            logger.info(f"[FILTER QUERY] Building combined cost + nutrition SQL")
             sql_query = build_recipe_combined_filter_sql(
                 cost_filter=cost_filter,
                 nutrition_filter=nutrition_filter,
@@ -1821,7 +2226,7 @@ class RecipeSearchPipelineSDK:
             )
         elif cost_filter:
             # Cost-only filter
-            logger.info(f"[COST/NUTRITION FILTER] Building cost filter SQL: {cost_filter}")
+            logger.info(f"[FILTER QUERY] Building cost filter SQL: {cost_filter}")
             sql_query = build_recipe_cost_filter_sql(
                 cost_filter=cost_filter,
                 user_uid=user_uid or "",
@@ -1831,7 +2236,7 @@ class RecipeSearchPipelineSDK:
             )
         elif nutrition_filter:
             # Nutrition-only filter
-            logger.info(f"[COST/NUTRITION FILTER] Building nutrition filter SQL: {nutrition_filter}")
+            logger.info(f"[FILTER QUERY] Building nutrition filter SQL: {nutrition_filter}")
             sql_query = build_recipe_nutrition_filter_sql(
                 nutrition_filter=nutrition_filter,
                 user_uid=user_uid or "",
@@ -1839,10 +2244,20 @@ class RecipeSearchPipelineSDK:
                 additional_conditions=additional_conditions,
                 limit=20
             )
+        elif time_filter:
+            # Time-only filter (sort by prep + cook time)
+            logger.info(f"[FILTER QUERY] Building time filter SQL: {time_filter}")
+            sql_query = build_recipe_time_filter_sql(
+                time_filter=time_filter,
+                user_uid=user_uid or "",
+                language=language or "en",
+                additional_conditions=additional_conditions,
+                limit=20
+            )
         else:
             # No valid filters found - fall back to error message
-            logger.warning(f"[COST/NUTRITION FILTER] No valid filters found, returning guidance")
-            error_response = "I couldn't understand the cost or nutrition filter you're looking for. Try queries like 'recipes under $20' or 'high protein meals'."
+            logger.warning(f"[FILTER QUERY] No valid filters found, returning guidance")
+            error_response = "I couldn't understand the filter you're looking for. Try queries like 'recipes under $20', 'high protein meals', or 'quick recipes'."
             session.add_to_history("assistant", error_response)
             self.session_manager.save_session(session)
             return {
@@ -1856,15 +2271,15 @@ class RecipeSearchPipelineSDK:
                 }
             }
 
-        logger.info(f"[COST/NUTRITION FILTER] Generated SQL:\n{sql_query}")
+        logger.info(f"[FILTER QUERY] Generated SQL:\n{sql_query}")
 
         # Execute the SQL query
         try:
             result = self.db.execute(text(sql_query))
             rows = [dict(row._mapping) for row in result.fetchall()]
-            logger.info(f"[COST/NUTRITION FILTER] ✓ SQL executed, {len(rows)} results")
+            logger.info(f"[FILTER QUERY] ✓ SQL executed, {len(rows)} results")
         except Exception as e:
-            logger.error(f"[COST/NUTRITION FILTER] SQL execution error: {e}")
+            logger.error(f"[FILTER QUERY] SQL execution error: {e}")
             error_response = "I encountered an error while searching for recipes. Please try again."
             session.add_to_history("assistant", error_response)
             self.session_manager.save_session(session)
@@ -1896,7 +2311,7 @@ class RecipeSearchPipelineSDK:
                 query, final_recipes, intent, cost_filter, nutrition_filter
             )
         else:
-            response = await self._generate_no_results_response(query, nlid_result)
+            response = await self._generate_no_results_response(query, nlid_result, current_nlg_agent)
 
         # Save to session
         session.add_to_history("assistant", response)
@@ -1935,12 +2350,319 @@ class RecipeSearchPipelineSDK:
             ]
         }
 
-        logger.info(f"[COST/NUTRITION FILTER] ✓ Pipeline completed in {time.time() - pipeline_start_time:.3f}s | Results: {len(final_recipes)}")
+        logger.info(f"[FILTER QUERY] ✓ Pipeline completed in {time.time() - pipeline_start_time:.3f}s | Results: {len(final_recipes)}")
 
         return {
             "response": response,
             "metadata": metadata
         }
+
+    async def _handle_filter_refinement(
+        self,
+        query: str,
+        nlid_result: Dict[str, Any],
+        session: SessionState,
+        user_uid: Optional[str],
+        language: Optional[str],
+        previous_vector_query: str,
+        cost_filter: Optional[Dict[str, Any]],
+        nutrition_filter: Optional[Dict[str, Any]],
+        time_filter: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Handle cost/nutrition/time filter as a refinement to a previous search.
+
+        This runs embedding search with the previous query and applies filters
+        via SQL, combining both constraints.
+
+        Args:
+            query: User's current query (e.g., "My budget is 200$")
+            nlid_result: NLID detection result
+            session: Session state
+            user_uid: User identifier
+            language: Language code
+            previous_vector_query: Previous search query (e.g., "dessert recipes")
+            cost_filter: Cost filter dict with operator, value, country
+            nutrition_filter: Nutrition filter dict
+            time_filter: Time filter dict with sort_order ("ASC" or "DESC")
+
+        Returns:
+            Response dictionary with recipes and metadata
+        """
+        from apps.fastapi.src.agents.agent_tools import search_recipes_by_embedding
+        from apps.fastapi.src.services.session_memory_manager import EMBEDDING_BATCH_SIZE
+        from sqlalchemy import text
+        import json
+
+        pipeline_start_time = time.time()
+
+        logger.info(f"[FILTER REFINEMENT] Previous query: '{previous_vector_query}'")
+        logger.info(f"[FILTER REFINEMENT] Cost filter: {cost_filter}")
+        logger.info(f"[FILTER REFINEMENT] Nutrition filter: {nutrition_filter}")
+        logger.info(f"[FILTER REFINEMENT] Time filter: {time_filter}")
+
+        # Get session context for allergen exclusions
+        session_context = self.session_manager.get_user_context(session, {})
+        excluded_ingredients = session_context.get("excluded_ingredients", [])
+
+        # Step 1: Run embedding search with previous query
+        logger.info(f"[FILTER REFINEMENT] Running embedding search for: '{previous_vector_query}'")
+
+        embedding_results = search_recipes_by_embedding(
+            self.db,
+            query_text=previous_vector_query,
+            limit=EMBEDDING_BATCH_SIZE,
+            threshold=0.35,
+            language_id=language or "en",
+            offset=0
+        )
+
+        if not embedding_results:
+            logger.info("[FILTER REFINEMENT] No embedding results found")
+            return {
+                "response": f"I couldn't find any {previous_vector_query} matching your criteria. Would you like to try a different search?",
+                "metadata": {
+                    "intent": nlid_result.get("intent", "filter"),
+                    "is_cooking_related": True,
+                    "num_results": 0,
+                    "recipes": []
+                }
+            }
+
+        candidate_ids = [str(r.id) for r, _ in embedding_results]
+        logger.info(f"[FILTER REFINEMENT] Found {len(candidate_ids)} embedding candidates")
+
+        # Step 2: Build SQL with cost/nutrition filter + allergen exclusions
+        country_key_map = {"US": "usa", "India": "india", "Norway": "norway"}
+
+        # Build cost filter condition
+        cost_condition = ""
+        if cost_filter:
+            country = cost_filter.get("country", "US")
+            country_key = country_key_map.get(country, "usa")
+            operator = cost_filter.get("operator", "<=")
+            value = cost_filter.get("value", 0)
+
+            cost_condition = f"""
+            AND r."recipe_metadata" IS NOT NULL
+            AND r."recipe_metadata"->'pricing' IS NOT NULL
+            AND r."recipe_metadata"->'pricing'->'{country_key}' IS NOT NULL
+            AND r."recipe_metadata"->'pricing'->'{country_key}'->>'total' IS NOT NULL
+            AND CAST(r."recipe_metadata"->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}
+            """
+
+        # Build allergen exclusion conditions
+        allergen_conditions = ""
+        if excluded_ingredients:
+            for ingredient in excluded_ingredients[:10]:  # Limit to prevent huge queries
+                escaped = ingredient.replace("'", "''").replace("%", "\\%")
+                allergen_conditions += f"""
+            AND (
+                LOWER(r."name") NOT LIKE '%{escaped.lower()}%'
+                AND LOWER(r."ingress") NOT LIKE '%{escaped.lower()}%'
+                AND NOT EXISTS (
+                    SELECT 1 FROM recipe_ingredient ri
+                    JOIN ingredient i ON ri."ingredientId" = i."id"
+                    WHERE ri."recipeId" = r."id"
+                    AND LOWER(i."name") LIKE '%{escaped.lower()}%'
+                )
+            )
+                """
+
+        # Build time-based ORDER BY clause
+        time_order_clause = "ORDER BY r.name"  # Default
+        if time_filter:
+            sort_order = time_filter.get("sort_order", "ASC").upper()
+            time_order_clause = f"ORDER BY (r.\"prepTime\" + r.\"cookTime\") {sort_order}"
+            logger.info(f"[FILTER REFINEMENT] Using time-based ORDER BY: {sort_order}")
+
+        # Build the full SQL query
+        candidate_list = ", ".join([f"'{cid}'" for cid in candidate_ids])
+
+        sql_query = f"""
+        SELECT DISTINCT r.id, r.name, r.ingress,
+               r.difficulty, r."prepTime" as prep_time, r."cookTime" as cook_time,
+               r.image, r.servings, r."userUid" as creator_uid,
+               r."private", r."deletedAt", r.recipe_metadata
+        FROM recipe r
+        WHERE r.id IN ({candidate_list})
+          AND r."deletedAt" IS NULL
+          AND r."status" = 'published'
+          {cost_condition}
+          {allergen_conditions}
+        {time_order_clause}
+        LIMIT 20
+        """
+
+        logger.info(f"[FILTER REFINEMENT] Executing filtered SQL")
+
+        try:
+            result = self.db.execute(text(sql_query))
+            rows = result.fetchall()
+
+            if not rows:
+                logger.info("[FILTER REFINEMENT] No results after filtering")
+                return {
+                    "response": f"I couldn't find any {previous_vector_query} matching your criteria and dietary restrictions. Would you like to try different criteria?",
+                    "metadata": {
+                        "intent": nlid_result.get("intent", "filter"),
+                        "is_cooking_related": True,
+                        "num_results": 0,
+                        "recipes": []
+                    }
+                }
+
+            logger.info(f"[FILTER REFINEMENT] Found {len(rows)} results after filtering")
+
+            # Step 3: Process results (similar to _process_cached_candidates)
+            recipe_ids = [str(row[0]) for row in rows]
+
+            # Batch fetch ingredients
+            ingredients_map = {}
+            if recipe_ids:
+                ingredient_results = self.db.execute(text("""
+                    SELECT ri."recipeId", ri.amount, ri."unitId", i.name as ing_name, mut.name as unit_name
+                    FROM recipe_ingredient ri
+                    JOIN ingredient i ON ri."ingredientId" = i.id
+                    LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+                    WHERE ri."recipeId" = ANY(CAST(:recipe_ids AS uuid[]))
+                    AND ri."deletedAt" IS NULL
+                    ORDER BY ri."recipeId", ri.order
+                """), {"recipe_ids": [str(rid) for rid in recipe_ids]}).fetchall()
+
+                for ir in ingredient_results:
+                    rid = str(ir[0])
+                    if rid not in ingredients_map:
+                        ingredients_map[rid] = []
+                    ingredients_map[rid].append({
+                        "name": ir[3],
+                        "amount": ir[1],
+                        "unit": ir[4],
+                        "unit_id": str(ir[2]) if ir[2] else None
+                    })
+
+            # Batch fetch instructions
+            instructions_map = {}
+            if recipe_ids:
+                instruction_results = self.db.execute(text("""
+                    SELECT "recipeId", "order", description, image
+                    FROM recipe_instruction
+                    WHERE "recipeId" = ANY(CAST(:recipe_ids AS uuid[]))
+                    AND "deletedAt" IS NULL
+                    ORDER BY "recipeId", "order"
+                """), {"recipe_ids": [str(rid) for rid in recipe_ids]}).fetchall()
+
+                for instr in instruction_results:
+                    rid = str(instr[0])
+                    if rid not in instructions_map:
+                        instructions_map[rid] = []
+                    instructions_map[rid].append({
+                        "order": instr[1],
+                        "description": instr[2],
+                        "image": instr[3]
+                    })
+
+            # Build recipe list
+            recipes = []
+            for row in rows:
+                recipe_id = str(row[0])
+                recipe_metadata = row[11]
+
+                # Extract recipe_cost from metadata
+                recipe_cost = None
+                if recipe_metadata:
+                    metadata = recipe_metadata
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except Exception:
+                            metadata = {}
+                    if "pricing" in metadata:
+                        pricing = metadata["pricing"]
+                        recipe_cost = {
+                            "usa": {
+                                "total": pricing.get("usa", {}).get("total"),
+                                "currency": pricing.get("usa", {}).get("currency", "USD")
+                            },
+                            "india": {
+                                "total": pricing.get("india", {}).get("total"),
+                                "currency": pricing.get("india", {}).get("currency", "INR")
+                            },
+                            "norway": {
+                                "total": pricing.get("norway", {}).get("total"),
+                                "currency": pricing.get("norway", {}).get("currency", "NOK")
+                            }
+                        }
+
+                prep_time = row[4]
+                cook_time = row[5]
+
+                recipes.append({
+                    "id": recipe_id,
+                    "name": row[1],
+                    "ingress": row[2],
+                    "description": row[2],
+                    "difficulty": row[3],
+                    "prep_time": prep_time,
+                    "cook_time": cook_time,
+                    "total_time": (prep_time or 0) + (cook_time or 0),
+                    "image": row[6],
+                    "servings": row[7],
+                    "similarity": 0.7,
+                    "priority_score": 0,
+                    "access_level": "full",
+                    "is_liked": False,
+                    "is_created": False,
+                    "is_bundle_recipe": False,
+                    "is_bundle_free_recipe": False,
+                    "bundle_name": None,
+                    "ingredients": ingredients_map.get(recipe_id, []),
+                    "instructions": instructions_map.get(recipe_id, []),
+                    "recipe_cost": recipe_cost,
+                    "nutritional_info": None,
+                    "seasonality": {"weather": [], "festival": []},
+                })
+
+            # Step 4: Generate response
+            response = await generate_recipe_response(
+                query,
+                {"intent": "price_filter"},
+                recipes,
+                {}
+            )
+
+            # Update session with shown recipes
+            recipe_ids_to_show = [r["id"] for r in recipes[:5]]
+            self.session_manager.add_shown_recipes(session, recipe_ids_to_show)
+            self.session_manager.update_last_recipe_results(session, recipes[:5], "cost_nutrition_refinement")
+            self.session_manager.save_session(session)
+
+            logger.info(f"[FILTER REFINEMENT] ✓ Completed in {time.time() - pipeline_start_time:.3f}s | Results: {len(recipes)}")
+
+            return {
+                "response": response,
+                "metadata": {
+                    "intent": "price_filter",
+                    "is_cooking_related": True,
+                    "num_results": len(recipes),
+                    "refined_query": previous_vector_query,
+                    "recipes": recipes[:5]
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"[FILTER REFINEMENT] Error: {e}")
+            import traceback
+            logger.error(f"[FILTER REFINEMENT] Traceback: {traceback.format_exc()}")
+            return {
+                "response": "I encountered an error while filtering recipes by price. Please try again.",
+                "metadata": {
+                    "intent": "price_filter",
+                    "num_results": 0,
+                    "error": str(e),
+                    "recipes": []
+                }
+            }
 
     async def _post_process_cost_nutrition_results(
         self,
@@ -1995,7 +2717,7 @@ class RecipeSearchPipelineSDK:
                         "unit_id": str(ir[2]) if ir[2] else None
                     })
             except Exception as e:
-                logger.warning(f"[COST/NUTRITION FILTER] Failed to fetch ingredients: {e}")
+                logger.warning(f"[FILTER QUERY] Failed to fetch ingredients: {e}")
 
         # Batch fetch instructions
         instructions_map = {}
@@ -2019,7 +2741,7 @@ class RecipeSearchPipelineSDK:
                         "image": instr[3]
                     })
             except Exception as e:
-                logger.warning(f"[COST/NUTRITION FILTER] Failed to fetch instructions: {e}")
+                logger.warning(f"[FILTER QUERY] Failed to fetch instructions: {e}")
 
         # Batch fetch seasonality
         seasonality_map = {}
@@ -2045,7 +2767,7 @@ class RecipeSearchPipelineSDK:
                     if se[2] == "en":
                         seasonality_map[recipe_id][seasonality_type].append(se[1])
             except Exception as e:
-                logger.warning(f"[COST/NUTRITION FILTER] Failed to fetch seasonality: {e}")
+                logger.warning(f"[FILTER QUERY] Failed to fetch seasonality: {e}")
 
         for row in rows:
             recipe_id = str(row.get("id"))
@@ -2173,7 +2895,7 @@ class RecipeSearchPipelineSDK:
         Uses the standard NLG agent for consistent, natural responses.
         """
         if not recipes:
-            return await self._generate_no_results_response(query, {"intent": intent})
+            return await self._generate_no_results_response(query, {"intent": intent}, None)
 
         # Use the standard NLG agent for generating response
         # This provides consistent, natural language responses
@@ -2235,7 +2957,20 @@ class RecipeSearchPipelineSDK:
                 if country_list:
                     country_code = country_list[0]
 
-            logger.info(f"[SPECIAL QUERY] Parsed - ingredients: {ingredients}, recipes: {recipes}, country: {country_code}")
+            # Check if user explicitly asks for all countries
+            query_lower = query.lower()
+            asks_for_all_countries = any(pattern in query_lower for pattern in [
+                "all countries", "every country", "all regions", "each country",
+                "compare prices", "price comparison", "in all", "for all",
+                "alle land", "sammenligne priser"  # Norwegian phrases
+            ])
+
+            # Default to Norway if no country specified and not asking for all
+            if not country_code and not asks_for_all_countries:
+                country_code = "Norway"
+                logger.info(f"[PRICING] No country specified - defaulting to Norway")
+
+            logger.info(f"[SPECIAL QUERY] Parsed - ingredients: {ingredients}, recipes: {recipes}, country: {country_code}, all_countries: {asks_for_all_countries}")
 
             # Check if this is explicitly a recipe cost query (patterns like "price to make X", "cost of making X")
             query_lower = query.lower()
@@ -2766,7 +3501,6 @@ class RecipeSearchPipelineSDK:
 
         # Use the NLG agent to generate a helpful response
         try:
-            from openai import OpenAI
             import os
 
             api_key = os.getenv("OPENAI_API_KEY")
@@ -2782,20 +3516,17 @@ class RecipeSearchPipelineSDK:
                 else:
                     return "I don't have specific information in my database, but I can help with recipe suggestions and cooking tips!"
 
-            client = OpenAI(api_key=api_key)
-            system_prompt = "\n".join(context_parts)
+            # Create agent for fallback response generation
+            from agents import Agent, Runner
 
-            response = client.chat.completions.create(
-                model=os.getenv("NLG_AGENT_MODEL", "gpt-4o-mini"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": query}
-                ],
-                max_tokens=300,
-                temperature=0.7
+            fallback_agent = Agent(
+                name="FallbackResponseAgent",
+                instructions="\n".join(context_parts),
+                model=os.getenv("NLG_AGENT_MODEL", "gpt-4o-mini")
             )
 
-            return response.choices[0].message.content
+            result = await Runner.run(fallback_agent, query)
+            return result.final_output
 
         except Exception as e:
             logger.error(f"[LLM FALLBACK] Error generating response: {e}")
@@ -2906,6 +3637,11 @@ class RecipeSearchPipelineSDK:
         """
         Handle negative_feedback intent - exclude shown recipes and search again.
 
+        Uses search cache for efficient re-search:
+        1. Mark shown recipes as excluded in cache
+        2. Try remaining cached candidates first (Tier 1)
+        3. If exhausted, do new embedding search (Tier 2)
+
         Examples: "I don't like these", "Show me different ones"
         """
         # Get IDs of shown recipes
@@ -2918,10 +3654,15 @@ class RecipeSearchPipelineSDK:
                 "metadata": {"intent": "negative_feedback", "num_results": 0}
             }
 
-        # Add to excluded list
+        # Add to session's excluded recipes list (persistent)
         session = self.session_manager.add_excluded_recipes(session, shown_ids)
 
         logger.info(f"[NEGATIVE_FEEDBACK] Excluding {len(shown_ids)} recipes: {shown_ids[:3]}...")
+
+        # Mark these as shown in the search cache as well
+        if self.session_manager.has_search_cache(session):
+            self.session_manager.add_shown_recipes(session, shown_ids)
+            logger.info(f"[NEGATIVE_FEEDBACK] Marked {len(shown_ids)} recipes as shown in cache")
 
         # Get the last search query
         last_query = session.context_entities.last_vector_query
@@ -2932,11 +3673,25 @@ class RecipeSearchPipelineSDK:
                 "metadata": {"intent": "negative_feedback", "num_results": 0, "excluded_count": len(shown_ids)}
             }
 
-        # Re-run the search with excluded recipes
         # Clear the last recipe results so the new search doesn't reference old ones
         session.context_entities.last_recipe_results = []
         self.session_manager.save_session(session)
 
+        # Try to use remaining cached candidates first (efficient)
+        remaining = self.session_manager.get_remaining_candidates(session)
+        if remaining:
+            logger.info(f"[NEGATIVE_FEEDBACK] Using {len(remaining)} remaining cached candidates")
+            cache = self.session_manager.get_search_cache(session)
+            return await self._process_cached_candidates(
+                remaining,
+                cache,
+                session,
+                user_uid,
+                language,
+                is_tier1=True
+            )
+
+        # Re-run the search with excluded recipes
         # Recursively call process_query with the last query
         return await self.process_query(
             query=last_query,
@@ -3224,3 +3979,585 @@ class RecipeSearchPipelineSDK:
                 "recipes": list(meal_recipes.values())
             }
         }
+
+    async def _handle_show_more(
+        self,
+        query: str,
+        nlid_result: Dict[str, Any],
+        session: SessionState,
+        user_uid: Optional[str],
+        language: Optional[str]
+    ) -> Dict[str, Any]:
+        """
+        Handle show_more intent - retrieve additional results from cached candidates or new search.
+
+        Multi-tier fallback:
+        - Tier 1: Use remaining cached embedding candidates
+        - Tier 2: Fetch new embedding candidates (if offset < max)
+        - Tier 3: No more results available
+
+        Examples: "Show me more", "More recipes", "Any others?"
+        """
+        from apps.fastapi.src.agents.agent_tools import search_recipes_by_embedding
+
+        # Check if cache is expired
+        if self.session_manager.is_cache_expired(session):
+            logger.info("[SHOW_MORE] Cache expired, starting fresh search")
+            return await self._start_fresh_search(session, user_uid, language)
+
+        # Check if we have cached candidates
+        if not self.session_manager.has_search_cache(session):
+            logger.info("[SHOW_MORE] No search cache found, starting fresh search")
+            return await self._start_fresh_search(session, user_uid, language)
+
+        # Get cache info
+        cache = self.session_manager.get_search_cache(session)
+        logger.info(f"[SHOW_MORE] Found cache with {len(cache.get('embedding_candidates', []))} candidates")
+
+        # Get remaining candidates that haven't been shown
+        remaining_candidates = self.session_manager.get_remaining_candidates(session)
+        all_shown_ids = self.session_manager.get_all_shown_recipe_ids(session)
+
+        logger.info(f"[SHOW_MORE] Remaining candidates: {len(remaining_candidates)}, Already shown: {len(all_shown_ids)}")
+
+        # TIER 1: Use remaining cached candidates
+        if remaining_candidates:
+            logger.info(f"[SHOW_MORE] TIER 1: Using {len(remaining_candidates)} remaining cached candidates")
+            return await self._process_cached_candidates(
+                remaining_candidates,
+                cache,
+                session,
+                user_uid,
+                language,
+                is_tier1=True
+            )
+
+        # TIER 2: Fetch new embedding candidates if possible
+        if self.session_manager.can_fetch_more(session):
+            logger.info("[SHOW_MORE] TIER 2: Cache exhausted, fetching new embedding candidates")
+            return await self._fetch_new_candidates(
+                cache,
+                session,
+                user_uid,
+                language
+            )
+
+        # TIER 3: No more results
+        logger.info("[SHOW_MORE] TIER 3: No more results available")
+        return {
+            "response": "I've shown you all the available recipes matching your criteria. Would you like to try a different search or adjust your preferences?",
+            "metadata": {
+                "intent": "show_more",
+                "is_cooking_related": True,
+                "num_results": 0,
+                "tier": 3,
+                "message": "no_more_results",
+                "recipes": []
+            }
+        }
+
+    async def _start_fresh_search(
+        self,
+        session: SessionState,
+        user_uid: Optional[str],
+        language: Optional[str]
+    ) -> Dict[str, Any]:
+        """Start a fresh search when no cache is available."""
+        # Clear the old cache
+        self.session_manager.clear_search_cache(session)
+
+        # Get the last user query if available
+        last_query = session.context_entities.last_user_query or session.context_entities.last_vector_query
+
+        if not last_query:
+            return {
+                "response": "I don't have any previous search context. What recipes would you like me to find?",
+                "metadata": {"intent": "show_more", "num_results": 0, "message": "no_context", "recipes": []}
+            }
+
+        # Re-run the search
+        return await self.process_query(
+            query=last_query,
+            session_id=session.session_id,
+            user_uid=user_uid,
+            language=language or "en"
+        )
+
+    async def _process_cached_candidates(
+        self,
+        candidate_ids: List[str],
+        cache: Dict[str, Any],
+        session: SessionState,
+        user_uid: Optional[str],
+        language: Optional[str],
+        is_tier1: bool = True
+    ) -> Dict[str, Any]:
+        """Process cached candidates with SQL filtering and full recipe enrichment."""
+        from apps.fastapi.src.utils.sql_builders import build_session_filter_conditions
+        import json
+
+        # Get SQL filters from cache
+        sql_filters = cache.get("sql_filters", {})
+        excluded_ingredients = sql_filters.get("excluded_ingredients", [])
+
+        # Add currently shown recipes to exclusion
+        shown_ids = self.session_manager.get_all_shown_recipe_ids(session)
+        excluded_recipe_ids = session.excluded_recipe_ids + shown_ids
+
+        # Build SQL to filter candidates - fetch full recipe data including metadata
+        candidate_list = ", ".join([f"'{cid}'" for cid in candidate_ids])
+
+        base_query = f"""
+            SELECT DISTINCT r.id, r.name, r.ingress,
+                   r.difficulty, r."prepTime" as prep_time, r."cookTime" as cook_time,
+                   r.image, r.servings, r."userUid" as creator_uid,
+                   r."private", r."deletedAt", r.recipe_metadata
+            FROM recipe r
+            WHERE r.id IN ({candidate_list})
+              AND r."deletedAt" IS NULL
+              AND r."status" = 'published'
+        """
+
+        # Add exclusion conditions
+        conditions = []
+
+        # Exclude already shown recipes
+        if excluded_recipe_ids:
+            excluded_list = ", ".join([f"'{rid}'" for rid in excluded_recipe_ids])
+            conditions.append(f"r.id NOT IN ({excluded_list})")
+
+        # Add allergen exclusions
+        if excluded_ingredients:
+            for ingredient in excluded_ingredients[:20]:  # Limit to prevent huge queries
+                escaped = ingredient.replace("'", "''")
+                conditions.append(f"r.ingredients_text NOT ILIKE '%{escaped}%'")
+
+        # Add session filters
+        session_filters_dict = {
+            "included_ingredients": [],
+            "excluded_ingredients": session.excluded_ingredients or [],
+            "tags": [],
+            "cuisines": [],
+            "categories": [],
+            "max_time": session.filters.max_time if hasattr(session, 'filters') else None,
+            "difficulty": session.filters.difficulty if hasattr(session, 'filters') else None,
+        }
+        session_conditions = build_session_filter_conditions(session_filters_dict)
+        conditions.extend(session_conditions)
+
+        if conditions:
+            base_query += " AND " + " AND ".join(conditions)
+
+        base_query += " ORDER BY r.name LIMIT 5"
+
+        logger.info(f"[SHOW_MORE] Executing SQL for {len(candidate_ids)} candidates")
+
+        try:
+            result = self.db.execute(text(base_query))
+            rows = result.fetchall()
+
+            if not rows:
+                # No results from cached candidates, try Tier 2
+                logger.info("[SHOW_MORE] No results from cached candidates, trying Tier 2")
+                if self.session_manager.can_fetch_more(session):
+                    return await self._fetch_new_candidates(cache, session, user_uid, language)
+                return {
+                    "response": "I couldn't find more recipes matching your criteria. Would you like to try a different search?",
+                    "metadata": {"intent": "show_more", "num_results": 0, "message": "filtered_out", "recipes": []}
+                }
+
+            # Collect unique recipe IDs for batch queries (keep as UUIDs for PostgreSQL)
+            from uuid import UUID
+            recipe_ids = [row[0] if isinstance(row[0], UUID) else UUID(row[0]) for row in rows]
+
+            # =====================================================
+            # BATCH QUERY: Load all ingredients at once
+            # =====================================================
+            ingredients_map = {}
+            ingredient_results = self.db.execute(text("""
+                SELECT
+                    ri."recipeId", ri.amount, ri."unitId", ri.order as ri_order,
+                    i.id as ing_id, i.name as ing_name,
+                    mut.name as unit_name
+                FROM recipe_ingredient ri
+                JOIN ingredient i ON ri."ingredientId" = i.id
+                LEFT JOIN measuring_unit_translation mut ON ri."unitId" = mut."measuringUnitId" AND mut."languageId" = 'en'
+                WHERE ri."recipeId" = ANY(CAST(:recipe_ids AS uuid[]))
+                AND ri."deletedAt" IS NULL
+                ORDER BY ri."recipeId", ri.order
+            """), {"recipe_ids": [str(rid) for rid in recipe_ids]}).fetchall()
+
+            for ir in ingredient_results:
+                rid = str(ir[0])
+                if rid not in ingredients_map:
+                    ingredients_map[rid] = []
+                ingredients_map[rid].append({
+                    "name": ir[5],
+                    "amount": ir[1],
+                    "unit": ir[6],
+                    "unit_id": str(ir[2]) if ir[2] else None
+                })
+
+            # =====================================================
+            # BATCH QUERY: Load all instructions at once
+            # =====================================================
+            instructions_map = {}
+            instruction_results = self.db.execute(text("""
+                SELECT "recipeId", "order", description, image
+                FROM recipe_instruction
+                WHERE "recipeId" = ANY(CAST(:recipe_ids AS uuid[]))
+                AND "deletedAt" IS NULL
+                ORDER BY "recipeId", "order"
+            """), {"recipe_ids": [str(rid) for rid in recipe_ids]}).fetchall()
+
+            for instr in instruction_results:
+                rid = str(instr[0])
+                if rid not in instructions_map:
+                    instructions_map[rid] = []
+                instructions_map[rid].append({
+                    "order": instr[1],
+                    "description": instr[2],
+                    "image": instr[3]
+                })
+
+            # =====================================================
+            # BATCH QUERY: Load all seasonality info at once
+            # =====================================================
+            seasonality_map = {}
+            seasonality_results = self.db.execute(text("""
+                SELECT rs."recipeId", st.name, st."languageId", s.type
+                FROM recipe_seasonality rs
+                JOIN seasonality s ON rs."seasonalityId" = s.id
+                JOIN seasonality_translation st ON s.id = st."seasonalityId"
+                WHERE rs."recipeId" = ANY(CAST(:recipe_ids AS uuid[]))
+                ORDER BY rs."recipeId", s.type, st."languageId"
+            """), {"recipe_ids": [str(rid) for rid in recipe_ids]}).fetchall()
+
+            for se in seasonality_results:
+                rid = str(se[0])
+                if rid not in seasonality_map:
+                    seasonality_map[rid] = {"weather": [], "festival": []}
+                seasonality_type = "weather" if se[3] == "WEATHER" else "festival"
+                if se[2] == "en":
+                    seasonality_map[rid][seasonality_type].append(se[1])
+
+            # =====================================================
+            # BATCH QUERY: Load bundle info
+            # =====================================================
+            bundle_info_map = {}
+            bundle_results = self.db.execute(text("""
+                SELECT br."recipeId", br."bundleId", b.name, br."isFree", b."userUid"
+                FROM bundle_recipe br
+                JOIN bundle b ON br."bundleId" = b.id
+                WHERE br."recipeId" = ANY(CAST(:recipe_ids AS uuid[]))
+            """), {"recipe_ids": [str(rid) for rid in recipe_ids]}).fetchall()
+
+            for br in bundle_results:
+                rid = str(br[0])
+                if rid not in bundle_info_map:
+                    bundle_info_map[rid] = []
+                bundle_info_map[rid].append({
+                    "bundle_id": str(br[1]),
+                    "bundle_name": br[2],
+                    "is_free": br[3],
+                    "bundle_owner": br[4]
+                })
+
+            # =====================================================
+            # FETCH USER CONTEXT
+            # =====================================================
+            user_ctx = None
+            if user_uid:
+                user_ctx = self.user_context_service.get_user_context(user_uid)
+
+            # =====================================================
+            # PROCESS RECIPES WITH FULL ENRICHMENT
+            # =====================================================
+            recipes = []
+            recipe_ids_to_show = []
+            seen_ids = set()
+
+            for row in rows:
+                recipe_id = str(row[0])
+
+                # Skip duplicates
+                if recipe_id in seen_ids:
+                    continue
+                seen_ids.add(recipe_id)
+
+                # Access control: exclude private recipes (unless owner)
+                # Column indices: 0=id, 1=name, 2=ingress, 3=difficulty, 4=prep_time, 5=cook_time
+                #                 6=image, 7=servings, 8=creator_uid, 9=private, 10=deletedAt, 11=recipe_metadata
+                is_private = row[9]
+                creator_uid = str(row[8]) if row[8] else None
+                if is_private:
+                    if user_uid and creator_uid == user_uid:
+                        pass  # Owner can access
+                    else:
+                        logger.info(f"[SHOW_MORE] Skipping private recipe: {recipe_id}")
+                        continue
+
+                # Check bundle access
+                bundle_entries = bundle_info_map.get(recipe_id, [])
+                is_bundle_recipe = len(bundle_entries) > 0
+                is_bundle_free_recipe = any(b["is_free"] for b in bundle_entries)
+
+                bundle_name = None
+                if bundle_entries:
+                    free_bundle = next((b for b in bundle_entries if b["is_free"]), None)
+                    bundle_to_show = free_bundle if free_bundle else bundle_entries[0]
+                    bundle_name = bundle_to_show["bundle_name"]
+
+                # Check if user owns bundle (for access control)
+                should_show_name_only = False
+                if is_bundle_recipe and not is_bundle_free_recipe:
+                    user_owns_any_bundle = False
+                    if user_ctx:
+                        user_owns_any_bundle = any(
+                            b["bundle_owner"] == user_uid
+                            for b in bundle_entries
+                        )
+                    if not user_owns_any_bundle:
+                        should_show_name_only = True
+
+                if should_show_name_only:
+                    # Name-only access for bundle recipes user doesn't own
+                    recipes.append({
+                        "id": recipe_id,
+                        "name": row[1],
+                        "image": row[6],
+                        "access_level": "name_only",
+                        "is_bundle_recipe": True,
+                        "is_bundle_free_recipe": False,
+                        "bundle_name": bundle_name,
+                        "ingress": None,
+                        "description": None,
+                        "difficulty": None,
+                        "total_time": None,
+                        "prep_time": None,
+                        "cook_time": None,
+                        "servings": None,
+                        "ingredients": [],
+                        "instructions": [],
+                        "similarity": 0.7,
+                        "priority_score": 0,
+                        "is_liked": False,
+                        "is_created": False,
+                        "recipe_cost": None,
+                        "nutritional_info": None,
+                        "seasonality": {"weather": [], "festival": []},
+                    })
+                    recipe_ids_to_show.append(recipe_id)
+                    continue
+
+                # Calculate priority score
+                priority_score = 0
+                is_created = False
+                is_liked = False
+
+                if user_ctx:
+                    liked_ids = user_ctx.get("liked_recipe_ids", set())
+                    created_ids = user_ctx.get("created_recipe_ids", set())
+
+                    if recipe_id in liked_ids:
+                        priority_score = 100
+                        is_liked = True
+                    if recipe_id in created_ids:
+                        is_created = True
+                        if priority_score == 0:
+                            priority_score = 50
+
+                # Extract recipe_cost and nutritional_info from metadata
+                recipe_cost = None
+                nutritional_info = None
+                recipe_metadata = row[11]  # recipe_metadata column (index 11)
+
+                if recipe_metadata:
+                    metadata = recipe_metadata
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except Exception:
+                            metadata = {}
+
+                    if "pricing" in metadata:
+                        pricing = metadata["pricing"]
+                        recipe_cost = {
+                            "usa": {
+                                "total": pricing.get("usa", {}).get("total"),
+                                "currency": pricing.get("usa", {}).get("currency", "USD")
+                            },
+                            "india": {
+                                "total": pricing.get("india", {}).get("total"),
+                                "currency": pricing.get("india", {}).get("currency", "INR")
+                            },
+                            "norway": {
+                                "total": pricing.get("norway", {}).get("total"),
+                                "currency": pricing.get("norway", {}).get("currency", "NOK")
+                            }
+                        }
+
+                    if "totalNutrition" in metadata:
+                        nutrition = metadata["totalNutrition"]
+                        nutritional_info = {
+                            "macros": nutrition.get("macros", {}),
+                            "micros": nutrition.get("micros", {})
+                        }
+
+                # Get pre-loaded data
+                ingredient_list = ingredients_map.get(recipe_id, [])
+                instruction_list = instructions_map.get(recipe_id, [])
+                seasonality = seasonality_map.get(recipe_id, {"weather": [], "festival": []})
+
+                prep_time = row[4]
+                cook_time = row[5]
+                total_time = (prep_time or 0) + (cook_time or 0)
+
+                recipes.append({
+                    "id": recipe_id,
+                    "name": row[1],
+                    "ingress": row[2],
+                    "description": row[2],
+                    "difficulty": row[3],
+                    "prep_time": prep_time,
+                    "cook_time": cook_time,
+                    "total_time": total_time,
+                    "image": row[6],
+                    "servings": row[7],
+                    "similarity": 0.7,
+                    "priority_score": priority_score,
+                    "access_level": "full",
+                    "is_liked": is_liked,
+                    "is_created": is_created,
+                    "is_bundle_recipe": is_bundle_recipe,
+                    "is_bundle_free_recipe": is_bundle_free_recipe,
+                    "bundle_name": bundle_name,
+                    "ingredients": ingredient_list,
+                    "instructions": instruction_list,
+                    "recipe_cost": recipe_cost,
+                    "nutritional_info": nutritional_info,
+                    "seasonality": seasonality,
+                })
+                recipe_ids_to_show.append(recipe_id)
+
+            # Sort by priority_score (desc), then similarity (desc)
+            recipes.sort(key=lambda x: (x["priority_score"], x["similarity"]), reverse=True)
+
+            # Mark these recipes as shown
+            self.session_manager.add_shown_recipes(session, recipe_ids_to_show)
+
+            # Update last_recipe_results for reference queries
+            self.session_manager.update_last_recipe_results(session, recipes, "show more")
+            self.session_manager.save_session(session)
+
+            logger.info(f"[SHOW_MORE] Returning {len(recipes)} enriched recipes from cache (Tier 1)")
+
+            # Generate response
+            response = await generate_recipe_response(
+                "Show me more recipes",
+                {"intent": "show_more"},
+                recipes,
+                {}
+            )
+
+            return {
+                "response": response,
+                "metadata": {
+                    "intent": "show_more",
+                    "is_cooking_related": True,
+                    "num_results": len(recipes),
+                    "tier": 1 if is_tier1 else 2,
+                    "source": "cached_candidates",
+                    "recipes": recipes
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"[SHOW_MORE] Error processing cached candidates: {e}")
+            import traceback
+            logger.error(f"[SHOW_MORE] Traceback: {traceback.format_exc()}")
+            return {
+                "response": "I encountered an error while fetching more recipes. Please try again.",
+                "metadata": {"intent": "show_more", "num_results": 0, "error": str(e), "recipes": []}
+            }
+
+    async def _fetch_new_candidates(
+        self,
+        cache: Dict[str, Any],
+        session: SessionState,
+        user_uid: Optional[str],
+        language: Optional[str]
+    ) -> Dict[str, Any]:
+        """Fetch new embedding candidates when cache is exhausted."""
+        from apps.fastapi.src.agents.agent_tools import search_recipes_by_embedding
+        from apps.fastapi.src.services.session_memory_manager import EMBEDDING_BATCH_SIZE
+
+        vector_query = cache.get("vector_query")
+        current_offset = cache.get("embedding_offset", 0)
+        sql_filters = cache.get("sql_filters", {})
+
+        if not vector_query:
+            return {
+                "response": "I don't have enough context to find more recipes. What would you like to search for?",
+                "metadata": {"intent": "show_more", "num_results": 0, "message": "no_query", "recipes": []}
+            }
+
+        # Fetch new batch of embedding candidates
+        new_offset = current_offset + EMBEDDING_BATCH_SIZE
+        logger.info(f"[SHOW_MORE] Fetching new embeddings with offset {new_offset}")
+
+        try:
+            # Get more candidates - fetch a larger batch
+            embedding_results = search_recipes_by_embedding(
+                self.db,
+                query_text=vector_query,
+                limit=EMBEDDING_BATCH_SIZE,
+                threshold=0.35,  # Slightly lower threshold for "more" results
+                language_id=language or "en",
+                offset=new_offset
+            )
+
+            if not embedding_results:
+                logger.info("[SHOW_MORE] No new embedding candidates found")
+                return {
+                    "response": "I've searched but couldn't find more recipes matching your criteria. Would you like to try different filters or a new search?",
+                    "metadata": {
+                        "intent": "show_more",
+                        "is_cooking_related": True,
+                        "num_results": 0,
+                        "tier": 2,
+                        "message": "no_new_candidates",
+                        "recipes": []
+                    }
+                }
+
+            # Store new candidates in cache
+            new_candidate_ids = [str(r.id) for r, _ in embedding_results]
+            self.session_manager.store_embedding_candidates(session, new_candidate_ids, new_offset)
+
+            # Update SQL filters with current exclusions
+            all_exclusions = session.excluded_ingredients or []
+            if sql_filters.get("excluded_ingredients"):
+                all_exclusions = list(set(all_exclusions + sql_filters["excluded_ingredients"]))
+            sql_filters["excluded_ingredients"] = all_exclusions
+            self.session_manager.update_sql_filters(session, sql_filters)
+
+            logger.info(f"[SHOW_MORE] Stored {len(new_candidate_ids)} new candidates at offset {new_offset}")
+
+            # Process the new candidates
+            return await self._process_cached_candidates(
+                new_candidate_ids,
+                cache,
+                session,
+                user_uid,
+                language,
+                is_tier1=False
+            )
+
+        except Exception as e:
+            logger.error(f"[SHOW_MORE] Error fetching new candidates: {e}")
+            return {
+                "response": "I encountered an error while searching for more recipes. Please try again.",
+                "metadata": {"intent": "show_more", "num_results": 0, "error": str(e), "recipes": []}
+            }
+

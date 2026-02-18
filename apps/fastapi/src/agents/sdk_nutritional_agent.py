@@ -13,7 +13,7 @@ from apps.fastapi.src.agents.sdk_nutrition_tools import nutrition_tools
 load_dotenv()
 
 # Model configuration from environment
-NUTRITIONAL_AGENT_MODEL = os.getenv('NUTRITIONAL_AGENT_MODEL', 'gpt-5-mini')
+NUTRITIONAL_AGENT_MODEL = os.getenv('NUTRITIONAL_AGENT_MODEL')
 
 # Agent key for database lookup
 AGENT_KEY = "nutritional_agent"

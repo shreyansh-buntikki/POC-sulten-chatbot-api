@@ -11,6 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from dotenv import load_dotenv
+from agents import Agent, Runner
 
 from apps.fastapi import logger
 from apps.fastapi.src.services.schema_understanding import get_schema_service, RelevantSchema
@@ -18,7 +19,7 @@ from apps.fastapi.src.services.schema_understanding import get_schema_service, R
 load_dotenv()
 
 # Model configuration from environment
-SQL_GENERATOR_MODEL = os.getenv('SQL_GENERATOR_MODEL', 'gpt-5-mini')
+SQL_GENERATOR_MODEL = os.getenv('SQL_GENERATOR_MODEL')
 
 
 @dataclass
@@ -189,7 +190,7 @@ class SQLGenerator:
         self.validator = SQLValidator()
         self.schema_service = get_schema_service()
 
-    def generate_sql(
+    async def generate_sql(
         self,
         query: str,
         nlid_result: Dict[str, Any],
@@ -234,24 +235,15 @@ class SQLGenerator:
         logger.info(f"[SQL GENERATOR] pricing filters: {sql_filters.get('pricing_filters', {})}")
         logger.info(f"[SQL GENERATOR] currency: {sql_filters.get('currency', 'USD')}")
 
-        # Generate SQL using LLM
-        response = self.client.chat.completions.create(
-            model=SQL_GENERATOR_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": self._get_system_prompt()
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=0.1,  # Low temperature for consistent SQL
-            max_completion_tokens=800  # GPT-5+ uses max_completion_tokens
+        # Generate SQL using Agents SDK
+        sql_agent = Agent(
+            name="SQLGeneratorAgent",
+            instructions=self._get_system_prompt(),
+            model=SQL_GENERATOR_MODEL
         )
 
-        generated_text = response.choices[0].message.content
+        result = await Runner.run(sql_agent, prompt)
+        generated_text = result.final_output
 
         # Extract SQL from response
         sql = self._extract_sql_from_response(generated_text)
@@ -262,8 +254,11 @@ class SQLGenerator:
         # Fix common SQL syntax errors (e.g., single-quoted table names)
         sql = self._fix_common_sql_errors(sql)
 
-        # Substitute placeholders with actual values
+        # Substitute placeholders with actual values (includes allergen injection)
         sql = self._substitute_placeholders(sql, candidate_ids, session_context, sql_filters)
+
+        # Final validation: ensure SQL is syntactically correct
+        sql = self._ensure_valid_sql(sql)
 
         # DEBUG: Log final SQL after substitution
         logger.info(f"[SQL GENERATOR] Final SQL (after substitution): {sql[:300]}...")
@@ -304,16 +299,18 @@ CRITICAL RULES:
 5. CORRECT: LEFT JOIN "bundle" b  OR  LEFT JOIN bundle b  ← Double quotes or no quotes for lowercase tables
 6. ALWAYS include: r."deletedAt" IS NULL AND r."status" = 'published'
 7. Access control: r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL
-8. ALWAYS add LIMIT clause (default 20)
+8. ALWAYS add LIMIT clause (default 20) at the very end
 9. CRITICAL: When candidate_ids placeholder (:recipe_ids) is present:
    - DO NOT add included_ingredients EXISTS clauses (embedding search already handled ingredient matching semantically)
-   - BUT: ALWAYS add excluded_ingredients (allergies) NOT EXISTS clauses, even with candidate_ids! This filters out allergens from the embedding results.
-10. For allergies (exclude ingredients): NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%allergen%')
-11. For included ingredients (ONLY when NO candidate_ids): EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%ingredient%')
-12. For tags (vegetarian, vegan, etc.): EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name = 'tag_name')
-13. When filtering by multiple tags, use OR within EXISTS: EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name = 'vegetarian' OR t.name = 'vegan'))
-14. Return ONLY SQL in ```sql blocks, no explanations
-15. IMPORTANT: Use :placeholder format for ALL parameters (e.g., :max_time, :user_uid, :language_id) - NOT %(max_time)s format
+   - DO NOT add excluded_ingredients (allergies) - these are handled programmatically
+10. For tags (vegetarian, vegan, dessert, etc.): AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%tag_name%')
+11. When filtering by multiple tags, use OR: AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name ILIKE '%vegetarian%' OR t.name ILIKE '%vegan%'))
+
+SUPER IMPORTANT - PARENTHESES BALANCE:
+- EVERY opening parenthesis ( MUST have a matching closing parenthesis )
+- EXISTS clauses MUST be closed: AND EXISTS (SELECT ... WHERE ...)  ← the ) at the end closes EXISTS
+- Example CORRECT: AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt WHERE rtt."recipeId" = r."id")
+- Example WRONG: AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt WHERE rtt."recipeId" = r."id"   ← missing closing )
 
 QUOTING CHEATSHEET:
 - Mixed-case columns: r."id", r."name", r."userUid"  ← double quotes
@@ -331,10 +328,11 @@ LEFT JOIN "bundle" b ON br."bundleId" = b."id"
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
+  AND r."id" IN (:recipe_ids)
 LIMIT 20
 ```
 
-TAG FILTERING TEMPLATE (for vegetarian, vegan, etc.):
+TAG FILTERING TEMPLATE (for dessert, vegetarian, etc.):
 ```sql
 SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
 FROM recipe r
@@ -343,7 +341,8 @@ LEFT JOIN "bundle" b ON br."bundleId" = b."id"
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
-  AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name = 'vegetarian')
+  AND r."id" IN (:recipe_ids)
+  AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%dessert%')
 LIMIT 20
 ```
 
@@ -508,18 +507,12 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         original_sql = sql
 
         # Fix 1: Single-quoted table names in JOIN/FROM clauses
-        # Pattern: FROM 'table_name' or JOIN 'table_name' -> FROM "table_name" or JOIN "table_name"
-        # This is a common error where LLM uses single quotes for table identifiers
-        # We need to be careful not to affect string literals in WHERE clauses
         def fix_single_quoted_table(match):
-            quote_type = match.group(1)  # FROM or JOIN type
-            table_name = match.group(2)  # table name
-            alias = match.group(3) if match.group(3) else ""  # optional alias
-            # Convert single quotes to double quotes for table identifier
+            quote_type = match.group(1)
+            table_name = match.group(2)
+            alias = match.group(3) if match.group(3) else ""
             return f'{quote_type} "{table_name}"{alias}'
 
-        # Match FROM 'tablename' or FROM 'tablename' alias or JOIN 'tablename' alias
-        # Negative lookahead to avoid matching string literals in expressions
         sql = re.sub(
             r'\b(FROM|JOIN)\s+\'([a-zA-Z_][a-zA-Z0-9_]*)\'(\s+[a-zA-Z_][a-zA-Z0-9_]*)?(?!\s*AS)',
             fix_single_quoted_table,
@@ -528,11 +521,10 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         )
 
         # Fix 2: Single-quoted table names in LEFT/RIGHT/INNER JOIN
-        # Pattern: LEFT JOIN 'table' alias -> LEFT JOIN "table" alias
         def fix_join_single_quotes(match):
-            join_type = match.group(1)  # LEFT, RIGHT, INNER, etc.
-            table_name = match.group(2)  # table name
-            alias = match.group(3) if match.group(3) else ""  # optional alias
+            join_type = match.group(1)
+            table_name = match.group(2)
+            alias = match.group(3) if match.group(3) else ""
             return f'{join_type} "{table_name}"{alias}'
 
         sql = re.sub(
@@ -542,16 +534,364 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             flags=re.IGNORECASE
         )
 
-        # Fix 3: Remove any trailing semicolon before LIMIT (LLM sometimes adds this)
+        # Fix 3: Remove any trailing semicolon before LIMIT
         sql = re.sub(r';\s*LIMIT', '\nLIMIT', sql, flags=re.IGNORECASE)
 
-        # Fix 4: Ensure LIMIT is on its own line for readability (optional)
-        # sql = re.sub(r'(\S)\s+LIMIT', r'\1\nLIMIT', sql, flags=re.IGNORECASE)
+        # Fix 4: Remove stray empty parentheses
+        sql = re.sub(r'\bAND\s*\(\s*\)', '', sql, flags=re.IGNORECASE)
+
+        # Fix 5: Remove orphaned closing parentheses
+        sql = re.sub(r'\)\s*\n\s*\)', ')', sql)
+        sql = re.sub(r'\)\s{2,}\)', ')', sql)
 
         if sql != original_sql:
             logger.info(f"[SQL FIXER] Applied fixes to SQL syntax")
-            logger.debug(f"[SQL FIXER] Before: {original_sql[:200]}...")
-            logger.debug(f"[SQL FIXER] After: {sql[:200]}...")
+
+        return sql
+
+    def _ensure_valid_sql(self, sql: str) -> str:
+        """
+        Ensure SQL is syntactically valid by fixing any remaining issues.
+        This is the final validation step before execution.
+        """
+        import re
+
+        # Find LIMIT clause
+        limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
+        if not limit_match:
+            return sql
+
+        sql_before_limit = sql[:limit_match.start()].rstrip()
+
+        # Check if there are unclosed parentheses by counting
+        depth = 0
+        in_string = False
+
+        for char in sql_before_limit:
+            if char == "'" and not in_string:
+                in_string = True
+            elif char == "'" and in_string:
+                in_string = False
+            elif not in_string:
+                if char == '(':
+                    depth += 1
+                elif char == ')':
+                    depth -= 1
+
+        if depth == 0:
+            # Parentheses are balanced, return as-is
+            return sql
+
+        if depth > 0:
+            # Unclosed parentheses - most likely an unclosed EXISTS clause
+            # Find the last AND EXISTS or AND NOT EXISTS and close it properly
+            logger.warning(f"[SQL FIXER] Found {depth} unclosed parentheses, attempting to fix")
+
+            # Simple fix: add closing parentheses before LIMIT
+            sql = sql_before_limit + '\n' + ')' * depth + '\n' + sql[limit_match.start():]
+
+        elif depth < 0:
+            # Too many closing parentheses - remove extras
+            logger.warning(f"[SQL FIXER] Found {-depth} extra closing parentheses, removing")
+
+            # Find and remove extra ) before LIMIT
+            extra_count = -depth
+            result = []
+            close_removed = 0
+
+            for char in sql_before_limit:
+                if char == ')' and close_removed < extra_count:
+                    close_removed += 1
+                    continue
+                result.append(char)
+
+            sql = ''.join(result) + '\n' + sql[limit_match.start():]
+
+        return sql
+
+    def _build_allergen_exclusion_clause(
+        self,
+        excluded_ingredients: List[str]
+    ) -> str:
+        """
+        Build a complete allergen exclusion SQL clause programmatically.
+        This ensures ALL expanded allergen variants are included.
+
+        Generates a clause like:
+        AND (
+            r."name" NOT ILIKE '%apple%' AND r."ingress" NOT ILIKE '%apple%'
+            AND NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%apple%')
+        )
+        AND (
+            r."name" NOT ILIKE '%strawberry%' AND r."ingress" NOT ILIKE '%strawberry%'
+            AND NOT EXISTS (SELECT 1 FROM recipe_ingredient ri JOIN ingredient i ON ri."ingredientId" = i."id" WHERE ri."recipeId" = r."id" AND i."name" ILIKE '%strawberry%')
+        )
+        ...
+        """
+        if not excluded_ingredients:
+            return ""
+
+        clauses = []
+        for ingredient in excluded_ingredients:
+            # Escape single quotes in ingredient name
+            safe_ing = ingredient.replace("'", "''")
+            clause = f"""(
+    r."name" NOT ILIKE '%{safe_ing}%'
+    AND r."ingress" NOT ILIKE '%{safe_ing}%'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM recipe_ingredient ri
+      JOIN ingredient i ON ri."ingredientId" = i."id"
+      WHERE ri."recipeId" = r."id"
+        AND i."name" ILIKE '%{safe_ing}%'
+    )
+  )"""
+            clauses.append(clause)
+
+        return "AND " + "\n  AND ".join(clauses)
+
+    def _inject_allergen_exclusion(
+        self,
+        sql: str,
+        excluded_ingredients: List[str]
+    ) -> str:
+        """
+        Inject allergen exclusion clause into SQL.
+
+        IMPORTANT: First removes ALL existing LLM-generated exclusion patterns to prevent
+        duplicate conditions. Then injects only the programmatic conditions.
+
+        This ensures clean, non-duplicated SQL with proper allergen filtering.
+        """
+        import re
+
+        if not excluded_ingredients:
+            return sql
+
+        # Step 1: Remove ALL existing LLM-generated allergen exclusion patterns
+        # This prevents duplicate conditions when LLM generates some and we inject more
+
+        # Pattern 1: Combined NOT conditions with name/ingress/EXISTS (most common LLM pattern)
+        # Matches: AND (r."name" NOT ILIKE '%X%' AND r."ingress" NOT ILIKE '%X%' AND NOT EXISTS (...))
+        pattern_combined = r"AND\s*\(\s*r\.\"name\"\s+NOT\s+ILIKE\s+'%[^']+%'\s+AND\s+r\.\"ingress\"\s+NOT\s+ILIKE\s+'%[^']+%'\s+AND\s+NOT\s+EXISTS\s*\([^)]+\)\s*\)"
+
+        # Remove all matches of combined pattern
+        sql_cleaned = re.sub(pattern_combined, "", sql, flags=re.IGNORECASE | re.DOTALL)
+
+        # Pattern 2: Standalone NOT EXISTS with ILIKE
+        pattern_exists = r"AND\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+recipe_ingredient\s+ri\s+JOIN\s+ingredient\s+i\s+ON\s+ri\.\"ingredientId\"\s*=\s*i\.\"id\"\s+WHERE\s+ri\.\"recipeId\"\s*=\s*r\.\"id\"\s+AND\s+\([^)]+\)\s*\)"
+        sql_cleaned = re.sub(pattern_exists, "", sql_cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+        # Pattern 3: Standalone NOT ILIKE conditions for ingredients
+        # Matches: AND r."name" NOT ILIKE '%tomato%' etc.
+        pattern_not_ilike = r"AND\s+\(?r\.\"name\"\s+NOT\s+ILIKE\s+'%[^']+%'\)?"
+        sql_cleaned = re.sub(pattern_not_ilike, "", sql_cleaned, flags=re.IGNORECASE)
+
+        # Pattern 4: More general pattern for ANY exclusion-like conditions with ILIKE
+        # Matches: AND ( ... NOT ILIKE '%something%' ... ) where something looks like an ingredient
+        pattern_general_exclusion = r"AND\s*\([^)]*NOT\s+ILIKE\s+'%[^']+%[^)]*\)"
+        sql_cleaned = re.sub(pattern_general_exclusion, "", sql_cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+        # Pattern 5: Clean up any AND (NOT EXISTS ...) patterns
+        pattern_not_exists = r"AND\s*\(\s*NOT\s+EXISTS\s*\([^)]+\)\s*\)"
+        sql_cleaned = re.sub(pattern_not_exists, "", sql_cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+        # Clean up leftover empty parentheses and extra whitespace
+        sql_cleaned = re.sub(r'\bAND\s*\(\s*\)', '', sql_cleaned, flags=re.IGNORECASE)
+        sql_cleaned = re.sub(r'\)\s*\n\s*\)', ')', sql_cleaned)
+        sql_cleaned = re.sub(r'\n\s*\n', '\n', sql_cleaned)
+
+        if sql_cleaned != sql:
+            logger.info("[ALLERGEN INJECTION] Removed existing LLM-generated exclusion patterns to prevent duplicates")
+            sql = sql_cleaned
+
+        # Step 2: Build the complete exclusion clause with our programmatic conditions
+        exclusion_clause = self._build_allergen_exclusion_clause(excluded_ingredients)
+        logger.info(f"[ALLERGEN INJECTION] Built exclusion clause for {len(excluded_ingredients)} ingredients")
+
+        # Step 3: Inject before LIMIT
+        limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
+        if limit_match:
+            sql = sql[:limit_match.start()] + exclusion_clause + "\n" + sql[limit_match.start():]
+            logger.info("[ALLERGEN INJECTION] Injected allergen exclusion before LIMIT")
+        else:
+            # Append at the end if no LIMIT
+            sql = sql.rstrip() + "\n" + exclusion_clause
+            logger.info("[ALLERGEN INJECTION] Appended allergen exclusion at end")
+
+        return sql
+
+    def _inject_creator_filter(
+        self,
+        sql: str,
+        creator_uid: str
+    ) -> str:
+        """
+        Inject creator filter into SQL WHERE clause.
+        This ensures recipes are filtered by the specified creator.
+
+        IMPORTANT: Also removes any LLM-generated incorrect filters:
+        - Recipe name filters (r."name" ILIKE '%username%')
+        - Incorrect userUid filters with non-UUID values (r."userUid" = '@username')
+
+        Args:
+            sql: The SQL query to modify
+            creator_uid: The user UID of the recipe creator (must be a UUID)
+
+        Returns:
+            Modified SQL with creator filter
+        """
+        import re
+
+        if not creator_uid:
+            return sql
+
+        # Step 1: Remove any LLM-generated recipe name filters
+        # When user asks "recipes by mammapia", LLM might generate:
+        # AND r."name" ILIKE '%mammapia%' (WRONG - mammapia is a username, not a recipe name)
+        recipe_name_filter_pattern = r'AND\s+r\."name"\s+(I?LIKE)\s+\'%[^%\']+%\''
+        sql_cleaned = re.sub(recipe_name_filter_pattern, '', sql, flags=re.IGNORECASE)
+
+        if sql_cleaned != sql:
+            logger.info("[CREATOR INJECTION] Removed LLM-generated recipe name filter (r.name ILIKE)")
+            sql = sql_cleaned
+
+        # Step 2: Remove any LLM-generated userUid filters with non-UUID values
+        # The LLM might generate: AND r."userUid" = '@mammapia' (WRONG - username is not a UID)
+        # We only keep userUid filters that look like UUIDs or are part of access control
+
+        # UUID pattern: 8-4-4-4-12 hex characters
+        uuid_pattern = r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
+
+        # Find all standalone userUid = 'value' patterns (not part of OR access control)
+        # We need to preserve the access control pattern: (r."private" = false OR r."userUid" = 'value')
+        def remove_invalid_useruid_filters(match):
+            full_match = match.group(0)
+            value = match.group(1)
+
+            # Check if the value looks like a UUID (case insensitive)
+            if re.match(uuid_pattern, value, re.IGNORECASE):
+                # Keep it - it's a valid UUID
+                return full_match
+
+            # Remove it - it's not a valid UUID (probably a username)
+            logger.info(f"[CREATOR INJECTION] Removed invalid userUid filter with value: {value}")
+            return ''
+
+        # Pattern to match: AND r."userUid" = 'value' (standalone, not in OR clause)
+        # We need to be careful not to match the access control pattern
+        # First, let's check if there's an access control pattern
+        access_control_pattern = r'\(r\."private"\s*=\s*false\s+OR\s+r\."userUid"\s*=\s*\'[^\']+\'\)'
+
+        # Find and protect access control patterns
+        access_control_matches = list(re.finditer(access_control_pattern, sql, re.IGNORECASE))
+
+        # Replace standalone userUid filters that aren't UUIDs
+        # Pattern: AND r."userUid" = 'value' where value is NOT a UUID
+        standalone_useruid_pattern = r"AND\s+r\.\"userUid\"\s*=\s*'([^']+)'"
+
+        # Process each match
+        sql_cleaned = re.sub(standalone_useruid_pattern, remove_invalid_useruid_filters, sql, flags=re.IGNORECASE)
+
+        if sql_cleaned != sql:
+            sql = sql_cleaned
+            logger.info("[CREATOR INJECTION] Cleaned up invalid userUid filters")
+
+        # Clean up any resulting double spaces or empty AND clauses
+        sql = re.sub(r'\bAND\s+AND\b', 'AND', sql, flags=re.IGNORECASE)
+        sql = re.sub(r'\s+', ' ', sql)  # Normalize whitespace
+
+        # Step 3: Check if we already have the correct creator filter
+        correct_filter = f"r.\"userUid\" = '{creator_uid}'"
+        if correct_filter in sql:
+            logger.info(f"[CREATOR INJECTION] Correct creator filter already exists in SQL")
+            return sql
+
+        # Step 4: Inject the correct creator filter
+        safe_uid = creator_uid.replace("'", "''")
+        creator_clause = f'AND r."userUid" = \'{safe_uid}\''
+        logger.info(f"[CREATOR INJECTION] Adding creator filter for uid: {creator_uid}")
+
+        # Inject before LIMIT clause
+        limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
+        if limit_match:
+            sql = sql[:limit_match.start()] + creator_clause + "\n" + sql[limit_match.start():]
+            logger.info("[CREATOR INJECTION] Injected creator filter before LIMIT")
+        else:
+            # Append at the end if no LIMIT
+            sql = sql.rstrip() + "\n" + creator_clause
+            logger.info("[CREATOR INJECTION] Appended creator filter at end")
+
+        return sql
+
+    def _inject_time_order_by(
+        self,
+        sql: str,
+        sort_order: str
+    ) -> str:
+        """
+        Inject ORDER BY clause for time-based sorting.
+
+        When user asks for "quick" or "long" recipes, we sort by total_time
+        instead of filtering by a hard time limit.
+
+        Args:
+            sql: The SQL query to modify
+            sort_order: "ASC" for quickest first, "DESC" for longest first
+
+        Returns:
+            Modified SQL with time-based ORDER BY
+        """
+        import re
+
+        # Validate sort_order
+        if sort_order.upper() not in ["ASC", "DESC"]:
+            return sql
+
+        sort_order = sort_order.upper()
+        logger.info(f"[TIME ORDER] Injecting ORDER BY total_time {sort_order}")
+
+        # Remove any existing max_time filter clause (since we're sorting, not filtering)
+        # Pattern: AND (r."prepTime" + r."cookTime") <= X
+        sql = re.sub(
+            r'AND\s+\(r\."prepTime"\s*\+\s*r\."cookTime"\)\s*<=\s*\d+',
+            '',
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # Also remove any time comparison in WHERE clause
+        sql = re.sub(
+            r'AND\s+\(r\."prepTime"\s*\+\s*r\."cookTime"\)\s*[<>=]+\s*\d+',
+            '',
+            sql,
+            flags=re.IGNORECASE
+        )
+
+        # Build the ORDER BY clause
+        order_clause = f'ORDER BY (r."prepTime" + r."cookTime") {sort_order}'
+
+        # Find LIMIT clause
+        limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
+
+        if limit_match:
+            # Check if there's already an ORDER BY clause
+            existing_order_match = re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE)
+
+            if existing_order_match:
+                # Replace existing ORDER BY with our time-based one
+                # Find everything between ORDER BY and LIMIT
+                pattern = r'\bORDER\s+BY\s+[^L]+?(?=LIMIT)'
+                sql = re.sub(pattern, f'{order_clause}\n', sql, flags=re.IGNORECASE)
+                logger.info(f"[TIME ORDER] Replaced existing ORDER BY with time sorting")
+            else:
+                # Insert ORDER BY before LIMIT
+                sql = sql[:limit_match.start()] + order_clause + "\n" + sql[limit_match.start():]
+                logger.info(f"[TIME ORDER] Inserted ORDER BY before LIMIT")
+        else:
+            # No LIMIT, append at the end
+            sql = sql.rstrip() + "\n" + order_clause
+            logger.info(f"[TIME ORDER] Appended ORDER BY at end")
 
         return sql
 
@@ -587,14 +927,16 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
         # Substitute :max_time placeholder (or %(max_time)s fallback)
         max_time = sql_filters.get("max_time")
+
+        # Handle list values (from filter merging) - take the last non-None value
+        if isinstance(max_time, list):
+            # Filter out None values and take the last one
+            non_none_values = [v for v in max_time if v is not None]
+            max_time = non_none_values[-1] if non_none_values else None
+
         # Handle None case by using a very large default value (effectively no limit)
         # This is simpler than removing the entire AND clause
         actual_max_time = max_time if max_time else 999999
-
-        # Handle string values like "short", "quick" - convert to minutes
-        if isinstance(actual_max_time, str):
-            time_map = {"quick": 20, "short": 30, "medium": 45, "long": 90}
-            actual_max_time = time_map.get(actual_max_time.lower(), 30)
 
         # Try :max_time format first
         if ":max_time" in sql:
@@ -603,6 +945,12 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         # Note: No \b at end since ) is not a word character
         elif "%(max_time)" in sql:
             sql = re.sub(r"%\(max_time\)s?", str(actual_max_time), sql)
+
+        # Handle time_sort_order (for "quick", "short", "long" queries)
+        # Instead of filtering by max_time, we ORDER BY total_time
+        time_sort_order = sql_filters.get("time_sort_order")
+        if time_sort_order:
+            sql = self._inject_time_order_by(sql, time_sort_order)
 
         # Substitute :language_id placeholder (or %(language_id)s fallback)
         language = session_context.get("language")
@@ -664,6 +1012,17 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             sql,
             flags=re.IGNORECASE
         )
+
+        # Inject programmatically-built allergen exclusion clause
+        # This ensures ALL expanded allergen variants are included
+        excluded_ingredients = sql_filters.get("excluded_ingredients") or sql_filters.get("exclude_ingredients")
+        if excluded_ingredients:
+            sql = self._inject_allergen_exclusion(sql, excluded_ingredients)
+
+        # Inject creator filter (filter recipes by specific user)
+        creator_uid = sql_filters.get("creator_uid")
+        if creator_uid:
+            sql = self._inject_creator_filter(sql, creator_uid)
 
         return sql
 

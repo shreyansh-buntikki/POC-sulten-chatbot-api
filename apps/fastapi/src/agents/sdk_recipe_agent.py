@@ -11,7 +11,7 @@ from agents import Agent
 load_dotenv()
 
 # Model configuration from environment
-RECIPE_AGENT_MODEL = os.getenv('RECIPE_AGENT_MODEL', 'gpt-5-mini')
+RECIPE_AGENT_MODEL = os.getenv('RECIPE_AGENT_MODEL')
 
 # Agent key for database lookup
 AGENT_KEY = "recipe_agent"

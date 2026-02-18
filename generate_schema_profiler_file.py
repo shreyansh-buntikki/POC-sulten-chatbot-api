@@ -22,8 +22,8 @@ DB_USER = os.getenv('DB_USER')
 DB_PASSWORD = os.getenv('DB_PASSWORD')
 
 # Create database URL
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
+# DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL = "postgres://avnadmin:AVNS_W21XoZtF54diSVAN6ks@sulten-pg-3976ed47-sulten-ebb4.j.aivencloud.com:17534/defaultdb?sslmode=require"
 
 # Intelligent column description mappings
 COLUMN_DESCRIPTIONS = {

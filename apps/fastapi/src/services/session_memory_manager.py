@@ -7,12 +7,18 @@ from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import json
+import time
 
 from apps.fastapi import logger
 
 # Module-level cache for session state persistence across requests
 # This ensures context is preserved when SessionMemoryManager is instantiated multiple times
 _MODULE_MEMORY_CACHE: Dict[str, Any] = {}  # Will hold SessionState objects
+
+# Constants for "show more" feature
+EMBEDDING_BATCH_SIZE = 20
+MAX_EMBEDDING_OFFSET = 100
+SEARCH_CACHE_TTL_SECONDS = 1800  # 30 minutes
 
 
 class SkillLevel(str, Enum):
@@ -32,6 +38,35 @@ class SessionFilters:
     difficulty: Optional[str] = None  # easy, medium, hard
     season: Optional[str] = None  # summer, winter, etc.
     region: Optional[str] = None  # regional preference
+    creator_uid: Optional[str] = None  # filter by recipe creator
+
+
+@dataclass
+class SearchCache:
+    """
+    Cached search data for 'show more' feature.
+    Stores embedding candidates and pagination state for efficient "show more" requests.
+    """
+    # Embedding candidates from current/last search
+    embedding_candidates: List[str] = field(default_factory=list)
+
+    # All recipe IDs shown to user (cumulative across "show more" requests)
+    shown_recipe_ids: List[str] = field(default_factory=list)
+
+    # SQL filters used (allergies, tags, etc.)
+    sql_filters: Dict[str, Any] = field(default_factory=dict)
+
+    # Original vector query for re-search
+    vector_query: Optional[str] = None
+
+    # Pagination offset for next embedding search
+    embedding_offset: int = 0
+
+    # Timestamp for cache invalidation
+    created_at: Optional[float] = None
+
+    # Intent of original search (for context)
+    original_intent: Optional[str] = None
 
 
 @dataclass
@@ -43,9 +78,12 @@ class ContextEntities:
     active_timers: List[Dict[str, Any]] = field(default_factory=list)  # [{"recipe": "X", "time": 300, "started_at": ...}]
     last_vector_query: Optional[str] = None  # Last search query for embedding search context
     last_search_filters: Optional[Dict[str, Any]] = None  # Last search filters for context
-    # NEW: For recipe reference queries ("Explain the 1st recipe")
+    # For recipe reference queries ("Explain the 1st recipe")
     last_recipe_results: List[Dict[str, Any]] = field(default_factory=list)  # [{"id": "uuid", "name": "Recipe Name"}, ...]
     last_user_query: Optional[str] = None  # The actual user message (for re-search after clear)
+
+    # NEW: Search cache for "show more" feature
+    search_cache: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -585,6 +623,10 @@ class SessionMemoryManager:
         if filters.get('regional'):
             session.filters.region = filters['regional'][0]  # Take first
 
+        # Handle creator_uid filter (resolved from creator_name in pipeline)
+        if filters.get('creator_uid'):
+            session.filters.creator_uid = filters['creator_uid']
+
         # Save and return
         session.increment_turn()
         self.save_session(session)
@@ -621,6 +663,7 @@ class SessionMemoryManager:
                 "difficulty": session.filters.difficulty,
                 "season": session.filters.season,
                 "region": session.filters.region,
+                "creator_uid": session.filters.creator_uid,
             },
             "context_entities": {
                 "last_referenced_recipe_id": session.context_entities.last_referenced_recipe_id,
@@ -631,6 +674,8 @@ class SessionMemoryManager:
                 "last_search_filters": session.context_entities.last_search_filters,
                 "last_recipe_results": session.context_entities.last_recipe_results,
                 "last_user_query": session.context_entities.last_user_query,
+                # Search cache for "show more" feature
+                "search_cache": session.context_entities.search_cache,
             },
         }
 
@@ -872,3 +917,272 @@ class SessionMemoryManager:
         logger.info(f"[SESSION] Cleared all filters for session {session.session_id}")
 
         return session
+
+    # ========================================================================
+    # SEARCH CACHE METHODS (for "show more" feature)
+    # ========================================================================
+
+    def init_search_cache(
+        self,
+        session: SessionState,
+        vector_query: str,
+        sql_filters: Dict[str, Any] = None,
+        original_intent: str = None
+    ) -> SessionState:
+        """
+        Initialize search cache for a new query.
+        Call this when starting a fresh search (not "show more").
+
+        Args:
+            session: Current session state
+            vector_query: The embedding search query
+            sql_filters: SQL filters to apply (allergies, etc.)
+            original_intent: The intent of the original search
+
+        Returns:
+            Updated session state
+        """
+        session.context_entities.search_cache = {
+            "embedding_candidates": [],
+            "shown_recipe_ids": [],
+            "sql_filters": sql_filters or {},
+            "vector_query": vector_query,
+            "embedding_offset": 0,
+            "created_at": time.time(),
+            "original_intent": original_intent
+        }
+        self.save_session(session)
+        logger.info(f"[SEARCH CACHE] Initialized for query: '{vector_query}'")
+        return session
+
+    def store_embedding_candidates(
+        self,
+        session: SessionState,
+        candidates: List[str],
+        offset: int = None
+    ) -> SessionState:
+        """
+        Store embedding candidates in cache.
+
+        Args:
+            session: Current session state
+            candidates: List of recipe IDs from embedding search
+            offset: Optional offset value (defaults to current + batch size)
+
+        Returns:
+            Updated session state
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            cache = {}
+            session.context_entities.search_cache = cache
+
+        cache["embedding_candidates"] = candidates
+        if offset is not None:
+            cache["embedding_offset"] = offset
+
+        self.save_session(session)
+        logger.info(f"[SEARCH CACHE] Stored {len(candidates)} embedding candidates, offset={cache.get('embedding_offset', 0)}")
+        return session
+
+    def add_shown_recipes(
+        self,
+        session: SessionState,
+        recipe_ids: List[str]
+    ) -> SessionState:
+        """
+        Add recipes to the "already shown" list.
+
+        Args:
+            session: Current session state
+            recipe_ids: Recipe IDs to mark as shown
+
+        Returns:
+            Updated session state
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            cache = {}
+            session.context_entities.search_cache = cache
+
+        existing_shown = cache.get("shown_recipe_ids", [])
+        # Add new IDs without duplicates
+        all_shown = list(set(existing_shown + recipe_ids))
+        cache["shown_recipe_ids"] = all_shown
+
+        self.save_session(session)
+        logger.info(f"[SEARCH CACHE] Added {len(recipe_ids)} shown recipes, total shown: {len(all_shown)}")
+        return session
+
+    def get_remaining_candidates(self, session: SessionState) -> List[str]:
+        """
+        Get embedding candidates that haven't been shown yet.
+
+        Args:
+            session: Current session state
+
+        Returns:
+            List of candidate recipe IDs not yet shown
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            return []
+
+        candidates = cache.get("embedding_candidates", [])
+        shown = set(cache.get("shown_recipe_ids", []))
+
+        remaining = [c for c in candidates if c not in shown]
+        logger.info(f"[SEARCH CACHE] Remaining candidates: {len(remaining)} (candidates={len(candidates)}, shown={len(shown)})")
+        return remaining
+
+    def get_all_shown_recipe_ids(self, session: SessionState) -> List[str]:
+        """
+        Get all recipe IDs shown so far (cumulative).
+
+        Args:
+            session: Current session state
+
+        Returns:
+            List of all shown recipe IDs
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            return []
+        return cache.get("shown_recipe_ids", [])
+
+    def get_search_cache(self, session: SessionState) -> Dict[str, Any]:
+        """
+        Get entire search cache.
+
+        Args:
+            session: Current session state
+
+        Returns:
+            Search cache dictionary
+        """
+        return session.context_entities.search_cache or {}
+
+    def update_embedding_offset(self, session: SessionState, offset: int) -> SessionState:
+        """
+        Update offset for next embedding search.
+
+        Args:
+            session: Current session state
+            offset: New offset value
+
+        Returns:
+            Updated session state
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            cache = {}
+            session.context_entities.search_cache = cache
+
+        cache["embedding_offset"] = offset
+        self.save_session(session)
+        logger.info(f"[SEARCH CACHE] Updated offset to {offset}")
+        return session
+
+    def update_sql_filters(self, session: SessionState, sql_filters: Dict[str, Any]) -> SessionState:
+        """
+        Update SQL filters in cache (e.g., when new allergies added).
+
+        Args:
+            session: Current session state
+            sql_filters: New SQL filters
+
+        Returns:
+            Updated session state
+        """
+        cache = session.context_entities.search_cache
+        if cache:
+            cache["sql_filters"] = sql_filters
+            self.save_session(session)
+            logger.info(f"[SEARCH CACHE] Updated SQL filters")
+        return session
+
+    def is_cache_expired(self, session: SessionState) -> bool:
+        """
+        Check if search cache has expired (TTL).
+
+        Args:
+            session: Current session state
+
+        Returns:
+            True if cache is expired or doesn't exist
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            return True
+
+        created_at = cache.get("created_at")
+        if not created_at:
+            return True
+
+        elapsed = time.time() - created_at
+        is_expired = elapsed > SEARCH_CACHE_TTL_SECONDS
+
+        if is_expired:
+            logger.info(f"[SEARCH CACHE] Cache expired (elapsed: {elapsed:.0f}s > TTL: {SEARCH_CACHE_TTL_SECONDS}s)")
+
+        return is_expired
+
+    def is_cache_exhausted(self, session: SessionState) -> bool:
+        """
+        Check if cached candidates are exhausted (all shown).
+
+        Args:
+            session: Current session state
+
+        Returns:
+            True if no remaining candidates
+        """
+        remaining = self.get_remaining_candidates(session)
+        return len(remaining) == 0
+
+    def can_fetch_more(self, session: SessionState) -> bool:
+        """
+        Check if we can fetch more results (offset < max).
+
+        Args:
+            session: Current session state
+
+        Returns:
+            True if we haven't reached max offset
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            return False
+
+        current_offset = cache.get("embedding_offset", 0)
+        return current_offset < MAX_EMBEDDING_OFFSET
+
+    def clear_search_cache(self, session: SessionState) -> SessionState:
+        """
+        Clear search cache (for new topic or fresh search).
+
+        Args:
+            session: Current session state
+
+        Returns:
+            Updated session state
+        """
+        session.context_entities.search_cache = {}
+        self.save_session(session)
+        logger.info(f"[SEARCH CACHE] Cleared for session {session.session_id}")
+        return session
+
+    def has_search_cache(self, session: SessionState) -> bool:
+        """
+        Check if session has valid search cache.
+
+        Args:
+            session: Current session state
+
+        Returns:
+            True if cache exists and has candidates
+        """
+        cache = session.context_entities.search_cache
+        if not cache:
+            return False
+        return len(cache.get("embedding_candidates", [])) > 0
