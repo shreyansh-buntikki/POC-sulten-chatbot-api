@@ -143,8 +143,8 @@ def detect_country_from_currency(query: str) -> Tuple[str, str]:
         if keyword in query_lower:
             return country, CURRENCY_SYMBOLS[country]
 
-    # Default to US
-    return "US", "$"
+    # Default to Norway (primary market)
+    return "Norway", "kr"
 
 
 def extract_cost_filter(query: str) -> Optional[Dict[str, Any]]:
@@ -317,7 +317,7 @@ def extract_ingredient_query_info(query: str) -> Optional[Dict[str, Any]]:
                     "america": "US",
                     "norway": "Norway"
                 }
-                result["country"] = country_map.get(country_lower, "US")
+                result["country"] = country_map.get(country_lower, "Norway")
             return result
 
     # Nutrition query patterns for ingredients

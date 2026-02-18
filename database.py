@@ -15,8 +15,7 @@ DB_NAME = os.getenv('DB_NAME')
 
 # Create database URL
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-# DATABASE_URL = ("postgresql://avnadmin:AVNS_Roa_CF0J1F6VpriDnmB@sulten-pg-18db3400-sulten-ebb4.f.aivencloud.com:17534"
-#                 "/defaultdb?sslmode=require")
+
 # Create engine with optimized connection pooling
 engine = create_engine(
     DATABASE_URL,
