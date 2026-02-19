@@ -161,11 +161,22 @@ def build_recipe_multi_filter_sql(
     user_uid: str = "",
     language: str = "en",
     additional_conditions: Optional[List[str]] = None,
+    candidate_ids: Optional[List[str]] = None,
     limit: int = 20
 ) -> str:
     """
     Build a single SQL query combining any combination of cost, time, and nutrition filters.
     Used when multiple filters are active from multi-turn context management.
+
+    Args:
+        cost_filter: Cost filter dict with operator, value, country
+        time_filter: Time filter dict with sort_order
+        nutrition_filter: Nutrition filter dict with sort_by, order
+        user_uid: User identifier
+        language: Language code
+        additional_conditions: Additional WHERE conditions
+        candidate_ids: Optional list of recipe IDs to restrict search to (from embedding)
+        limit: Max results
 
     ORDER BY priority: cost > time > nutrition > default (name)
     """
@@ -184,6 +195,11 @@ WHERE r."deletedAt" IS NULL
   AND r."languageId" = '{language}'
   AND (r."private" = false OR r."userUid" = '{user_uid}' OR br."bundleId" IS NOT NULL)
 """
+
+    # Add candidate_ids restriction if provided (from embedding search)
+    if candidate_ids:
+        ids_list = ", ".join([f"'{cid}'" for cid in candidate_ids])
+        base_query += f"  AND r.\"id\" IN ({ids_list})\n"
 
     # Add cost filter WHERE conditions
     cost_order = None

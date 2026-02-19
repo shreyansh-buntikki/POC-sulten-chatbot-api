@@ -975,6 +975,39 @@ class RecipeSearchPipelineSDK:
             # For other strategies: Can run in parallel
             parallel2_start = time.time()
 
+            # ============ MULTI-TURN CONTEXT: Merge session-persisted filters ============
+            # Carry forward persisted filters (cost, time, nutrition) from previous turns
+            # so that follow-up queries maintain ALL accumulated constraints.
+            # This ensures "I don't like garlic" (Q5) still respects "budget is 50$" from (Q4).
+            session_cost = session.filters.cost_filter
+            session_time = session.filters.time_filter
+            session_nutrition = session.filters.nutrition_filter
+
+            if session_cost or session_time or session_nutrition:
+                merged_sql_filters = dict(retrieval_plan.sql_filters) if retrieval_plan.sql_filters else {}
+
+                # Only add session filters if not already present in current query
+                if session_cost and "cost" not in merged_sql_filters:
+                    merged_sql_filters["cost"] = session_cost
+                    logger.info(f"[MULTI-TURN] Carrying forward cost_filter: {session_cost}")
+
+                if session_time and "time" not in merged_sql_filters:
+                    merged_sql_filters["time"] = session_time
+                    logger.info(f"[MULTI-TURN] Carrying forward time_filter: {session_time}")
+
+                if session_nutrition and "nutrition" not in merged_sql_filters:
+                    merged_sql_filters["nutrition"] = session_nutrition
+                    logger.info(f"[MULTI-TURN] Carrying forward nutrition_filter: {session_nutrition}")
+
+                # Update retrieval plan with merged filters
+                retrieval_plan = RetrievalPlan(
+                    strategy=retrieval_plan.strategy,
+                    reasoning=retrieval_plan.reasoning,
+                    vector_query=retrieval_plan.vector_query,
+                    sql_filters=merged_sql_filters,
+                    top_k=retrieval_plan.top_k
+                )
+
             # Initialize variables for all paths
             candidate_ids = None
             similarity_scores = {}
@@ -983,21 +1016,88 @@ class RecipeSearchPipelineSDK:
 
             if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
                 # FILTER-ONLY queries: Skip embedding search, run schema + SQL directly
-                relevant_schema = self.schema_understanding.get_relevant_schema(
-                    nlid_result_dict["intent"],
-                    retrieval_plan.sql_filters,
-                    session_context
-                )
 
-                # SQL generation for filter-only queries
-                sql_result = await self.sql_generator.generate_sql(
-                    query,
-                    nlid_result_dict,
-                    retrieval_plan.sql_filters,
-                    session_context,
-                    None  # No candidate_ids for filter-only queries
-                )
-                logger.info(f"[FILTER-ONLY] ✓ SQL generated in {time.time() - parallel2_start:.3f}s")
+                # Check if we have session-persisted cost/time/nutrition filters
+                # If so, use direct SQL builders instead of LLM for proper handling
+                sql_filters = retrieval_plan.sql_filters or {}
+                has_cost = sql_filters.get("cost")
+                has_time = sql_filters.get("time")
+                has_nutrition = sql_filters.get("nutrition")
+
+                if has_cost or has_time or has_nutrition:
+                    # Build SQL directly using sql_builders for cost/time/nutrition filters
+                    # This ensures proper handling of session-persisted filters
+                    logger.info(f"[SQL_ONLY] Using direct SQL builder with persisted filters")
+
+                    # Build additional conditions from session context (exclusions, tags, etc.)
+                    session_filter_conditions = build_session_filter_conditions(sql_filters)
+
+                    # Count active filters
+                    active_filter_count = sum(1 for f in [has_cost, has_time, has_nutrition] if f)
+
+                    if active_filter_count >= 2:
+                        # Use combined builder for multiple filters
+                        from apps.fastapi.src.utils.sql_builders import build_recipe_multi_filter_sql
+                        direct_sql = build_recipe_multi_filter_sql(
+                            cost_filter=has_cost,
+                            time_filter=has_time,
+                            nutrition_filter=has_nutrition,
+                            user_uid=user_uid or "",
+                            language=language or "en",
+                            additional_conditions=session_filter_conditions,
+                            limit=20
+                        )
+                    elif has_cost:
+                        direct_sql = build_recipe_cost_filter_sql(
+                            cost_filter=has_cost,
+                            user_uid=user_uid or "",
+                            language=language or "en",
+                            additional_conditions=session_filter_conditions,
+                            limit=20
+                        )
+                    elif has_time:
+                        direct_sql = build_recipe_time_filter_sql(
+                            time_filter=has_time,
+                            user_uid=user_uid or "",
+                            language=language or "en",
+                            additional_conditions=session_filter_conditions,
+                            limit=20
+                        )
+                    elif has_nutrition:
+                        direct_sql = build_recipe_nutrition_filter_sql(
+                            nutrition_filter=has_nutrition,
+                            user_uid=user_uid or "",
+                            language=language or "en",
+                            additional_conditions=session_filter_conditions,
+                            limit=20
+                        )
+
+                    # Create SQLGenerationResult from direct SQL
+                    sql_result = SQLGenerationResult(
+                        sql=direct_sql,
+                        explanation="Direct SQL with session-persisted filters",
+                        params={},
+                        estimated_rows=20,
+                        is_safe=True
+                    )
+                    logger.info(f"[SQL_ONLY] ✓ Direct SQL built with persisted filters in {time.time() - parallel2_start:.3f}s")
+                else:
+                    # No session-persisted filters, use LLM-based SQL generation
+                    relevant_schema = self.schema_understanding.get_relevant_schema(
+                        nlid_result_dict["intent"],
+                        retrieval_plan.sql_filters,
+                        session_context
+                    )
+
+                    # SQL generation for filter-only queries
+                    sql_result = await self.sql_generator.generate_sql(
+                        query,
+                        nlid_result_dict,
+                        retrieval_plan.sql_filters,
+                        session_context,
+                        None  # No candidate_ids for filter-only queries
+                    )
+                    logger.info(f"[FILTER-ONLY] ✓ SQL generated in {time.time() - parallel2_start:.3f}s")
 
             elif retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
                 # SEQUENTIAL for hybrid: Embedding first, then SQL with candidate_ids
@@ -1065,13 +1165,47 @@ class RecipeSearchPipelineSDK:
                 )
 
                 # Step 3: SQL generation WITH candidate_ids (filters the embedding candidates)
-                sql_result = await self.sql_generator.generate_sql(
-                    query,
-                    nlid_result_dict,
-                    retrieval_plan.sql_filters,
-                    session_context,
-                    candidate_ids  # Pass candidate_ids so SQL only searches within them
-                )
+                # Check if we have session-persisted cost/time/nutrition filters - if so,
+                # use direct SQL builder with candidate_ids constraint instead of LLM
+                sql_filters = retrieval_plan.sql_filters or {}
+                has_cost = sql_filters.get("cost")
+                has_time = sql_filters.get("time")
+                has_nutrition = sql_filters.get("nutrition")
+
+                if has_cost or has_time or has_nutrition:
+                    # Build SQL directly with combined filters + candidate_ids
+                    logger.info(f"[HYBRID] Using direct SQL builder with persisted filters + candidates")
+                    session_filter_conditions = build_session_filter_conditions(sql_filters)
+
+                    # Build combined SQL with candidate_ids restriction
+                    from apps.fastapi.src.utils.sql_builders import build_recipe_multi_filter_sql
+                    direct_sql = build_recipe_multi_filter_sql(
+                        cost_filter=has_cost,
+                        time_filter=has_time,
+                        nutrition_filter=has_nutrition,
+                        user_uid=user_uid or "",
+                        language=language or "en",
+                        additional_conditions=session_filter_conditions,
+                        candidate_ids=candidate_ids,
+                        limit=20
+                    )
+
+                    sql_result = SQLGenerationResult(
+                        sql=direct_sql,
+                        explanation="Direct SQL with session-persisted filters + candidate restriction",
+                        params={},
+                        estimated_rows=20,
+                        is_safe=True
+                    )
+                else:
+                    # No session-persisted cost/time/nutrition filters - use LLM-based SQL generation
+                    sql_result = await self.sql_generator.generate_sql(
+                        query,
+                        nlid_result_dict,
+                        retrieval_plan.sql_filters,
+                        session_context,
+                        candidate_ids  # Pass candidate_ids so SQL only searches within them
+                    )
                 logger.info(f"[HYBRID] ✓ Embedding + SQL completed in {time.time() - parallel2_start:.3f}s")
 
             else:
