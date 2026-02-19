@@ -136,6 +136,82 @@ class RetrievalStrategyDecider:
     # Intents that typically indicate refinement vs new search
     REFINEMENT_INTENTS = ["ingredient_substitution", "nutritional_info"]
 
+    def _extract_positive_vector_query(
+        self,
+        query: str,
+        filters: Dict[str, Any]
+    ) -> str:
+        """
+        Strip negative/exclusion language from the query so that the embedding
+        search targets what the user *wants*, not what they want to avoid.
+
+        Examples:
+          "I dont like chicken, suggest me something"  → "suggest something"
+          "vegetarian recipes without dairy"           → "vegetarian recipes"
+          "something sweet but no nuts"                → "something sweet"
+          "easy quick, vegetarian, allergic to dairy"  → "easy quick vegetarian"
+        """
+        import re
+
+        q = query.lower()
+
+        # Ordered from most-specific to least-specific so broad patterns
+        # don't swallow more specific ones.
+        STRIP_PATTERNS = [
+            # "remember I am a vegetarian" → keep "vegetarian" but strip the frame
+            r"remember\s+i\s+(?:'?m|am)\s+",
+            # "I am / I'm allergic to X", "I am intolerant to X"
+            r"(?:i\s+)?(?:i'?m|i\s+am)\s+(?:allergic|intolerant)\s+to\s+[\w\s]{1,30}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "allergic to X"
+            r"\ballergic\s+to\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "I don't like/want/eat/have/use X"
+            r"(?:i\s+)?(?:don'?t|do\s+not)\s+(?:like|want|eat|have|use)\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "without X"
+            r"\bwithout\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "but no X / except X / avoid X"
+            r"\b(?:but\s+no|except|avoid(?:ing)?)\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "I hate X"
+            r"(?:i\s+)?hate\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "can't eat X"
+            r"can'?t\s+eat\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # Standalone "no X"
+            r"\bno\s+[\w]+(?:\s+[\w]+)?(?=\s+|,|\.|$)",
+        ]
+
+        for pat in STRIP_PATTERNS:
+            q = re.sub(pat, " ", q, flags=re.IGNORECASE)
+
+        # Clean up punctuation and whitespace
+        q = re.sub(r'[,;]+', ' ', q)
+        q = re.sub(r'\s+', ' ', q).strip().strip('.,;:!?')
+
+        # Remove pure stop-words to check meaningful residual content
+        STOP_WORDS = {
+            'i', 'me', 'my', 'can', 'you', 'suggest', 'please', 'a', 'an', 'the',
+            'and', 'or', 'but', 'that', 'some', 'is', 'are', 'was', 'be',
+            'do', 'does', 'did', 'have', 'has', 'will', 'would', 'could', 'should',
+            'tell', 'give', 'show', 'get', 'make', 'want', 'need',
+            'something', 'anything', 'everything', 'it', 'its',
+            'with', 'for', 'from', 'to', 'at', 'by', 'on', 'in',
+        }
+        tokens = [w for w in q.split() if w not in STOP_WORDS and len(w) > 1]
+
+        if len(tokens) >= 2:
+            return ' '.join(tokens)
+
+        # Fallback: build from positive filter context
+        positive_parts: List[str] = []
+        if filters.get("tags"):
+            positive_parts.extend(filters["tags"])
+        if filters.get("included_ingredients"):
+            positive_parts.extend(filters["included_ingredients"][:2])
+        if filters.get("difficulty"):
+            positive_parts.append(filters["difficulty"])
+        if positive_parts:
+            return ' '.join(positive_parts) + ' recipes'
+
+        return 'recipe suggestions'
+
     def _is_query_refinement(
         self,
         query: str,
@@ -208,29 +284,47 @@ class RetrievalStrategyDecider:
         # Get fresh filters from current NLID detection
         fresh_filters = (nlid_result or {}).get("filters", {})
 
+        # Scalar-only filter keys: these must never be accumulated into a list.
+        # Using the freshest value (from current NLID output) always wins.
+        # List-type keys (tags, cuisines, excluded_ingredients, etc.) are merged/extended.
+        SCALAR_FILTER_KEYS = {
+            "creator_uid", "creator_name", "creator_username",
+            "cost_filter", "time_filter", "nutrition_filter",
+            "cost", "time", "nutrition",
+            "difficulty", "max_time", "season", "region",
+        }
+
         # Merge fresh filters with existing filters
         # This ensures refinements like "I am allergic to tomatoes" add to previous filters
         # instead of replacing them
         if existing_filters and fresh_filters:
             # Merge: Add new filters to existing ones
             for key, value in fresh_filters.items():
-                if key in existing_filters:
-                    # Key exists - merge values
+                if key in SCALAR_FILTER_KEYS:
+                    # Scalar field: always overwrite with the fresh value (no accumulation)
+                    if value is not None and value != [] and value != "":
+                        existing_filters[key] = value
+                elif key in existing_filters:
+                    # List-type key - merge values
                     if isinstance(existing_filters[key], list) and isinstance(value, list):
-                        # Both are lists - extend
-                        existing_filters[key].extend(value)
+                        # Both are lists - extend (deduplicate)
+                        for v in value:
+                            if v not in existing_filters[key]:
+                                existing_filters[key].append(v)
                     elif isinstance(existing_filters[key], list):
-                        # Existing is list, value is single - append
-                        existing_filters[key].append(value)
+                        # Existing is list, value is single - append if not duplicate
+                        if value not in existing_filters[key]:
+                            existing_filters[key].append(value)
                     elif isinstance(value, list):
-                        # Existing is single, value is list - extend
-                        existing_filters[key].extend(value)
+                        # Existing is single, value is list - combine into list
+                        combined = [existing_filters[key]] + value
+                        existing_filters[key] = list(dict.fromkeys(combined))  # dedupe, preserve order
                     else:
-                        # Both are single values - combine
-                        existing_filters[key] = [existing_filters[key], value]
+                        # Both are single non-scalar values - keep fresh
+                        existing_filters[key] = value
                 else:
                     # New key - just add it
-                    existing_filters[key] = value if not isinstance(value, list) else [value]
+                    existing_filters[key] = value
             logger.info(f"[REFINEMENT] Merging filters - existing: {existing_filters}, fresh: {fresh_filters}")
             filters = existing_filters
         else:
@@ -358,6 +452,9 @@ class RetrievalStrategyDecider:
             r'\bdinner\b': 'dinner',
             r'\bsupper\b': 'dinner',
             r'\bdessert\b': 'dessert',
+            r'\bsweet\b': 'dessert',
+            r'\bsweets\b': 'dessert',
+            r'\bsugary\b': 'dessert',
             r'\bsnack\b': 'snack',
             r'\bappetizer\b': 'appetizer',
             r'\bmain course\b': 'main course',
@@ -479,12 +576,9 @@ class RetrievalStrategyDecider:
             last_query = context_entities.get("last_vector_query", "")
             contextual_query = last_query if last_query else query
 
-        # Add allergies at the end
-        if mentioned_allergies:
-            allergy_list = list(mentioned_allergies)
-            contextual_query += f" without {allergy_list[0]}"
-            if len(allergy_list) > 1:
-                contextual_query += f" or {' or '.join(allergy_list[1:])}"
+        # NOTE: Allergens are handled exclusively via SQL filters (WHERE NOT EXISTS / excluded_ingredients).
+        # Do NOT add allergens to the embedding query - they would bias the vector search
+        # *towards* those ingredients (the embedding model finds similar things, not excludes them).
 
         return contextual_query
 
@@ -527,6 +621,22 @@ class RetrievalStrategyDecider:
         else:
             # For new searches, use the contextual query (may include constraints)
             vector_query = query
+
+        # If the query contains exclusion language ("I dont like X", "allergic to X",
+        # "without X", etc.), strip those negative phrases so the embedding target
+        # reflects what the user *wants*, not what they want to avoid.
+        has_exclusions = bool(
+            filters.get("excluded_ingredients")
+            or filters.get("exclude_ingredients")
+        )
+        if has_exclusions and not is_refinement:
+            clean_query = self._extract_positive_vector_query(vector_query, filters)
+            if clean_query and clean_query != vector_query:
+                logger.info(
+                    f"[RETRIEVAL STRATEGY] Cleaned vector query: "
+                    f"'{vector_query}' → '{clean_query}'"
+                )
+                vector_query = clean_query
 
         # Check for direct recipe search
         if self._is_direct_recipe_search(query):
@@ -902,6 +1012,42 @@ class RetrievalStrategyDecider:
             existing = sql_filters.get("excluded_ingredients", [])
             sql_filters["excluded_ingredients"] = list(set(existing + session_excluded))
 
+        # Vegetarian ingredient-based expansion:
+        # Replace (or supplement) the "vegetarian" tag filter with ingredient exclusion
+        # so that egg/dairy-containing recipes (which ARE vegetarian) are not missed
+        # when they happen to lack the "vegetarian" tag in the database.
+        _tags = sql_filters.get("tags", [])
+        if "vegetarian" in _tags:
+            NON_VEGETARIAN = [
+                # Poultry
+                "chicken", "chickens", "turkey", "duck", "goose", "quail",
+                # Red meat
+                "beef", "pork", "lamb", "mutton", "goat", "veal", "venison",
+                # Processed meat
+                "bacon", "ham", "sausage", "salami", "pepperoni", "lard",
+                "prosciutto", "chorizo", "hotdog", "hot dog",
+                # Fish & seafood
+                "fish", "seafood", "shellfish", "prawn", "prawns",
+                "shrimp", "shrimps", "crab", "lobster", "oyster",
+                "mussel", "scallop", "clam", "anchovy", "anchovies",
+                "tuna", "salmon", "cod", "halibut", "tilapia", "trout",
+                "sardine", "sardines", "mackerel", "herring",
+                # Animal-derived fats/stock used in cooking
+                "gelatin", "lard", "bone broth", "chicken broth", "beef broth",
+                "chicken stock", "beef stock", "fish sauce",
+            ]
+            existing_excluded = sql_filters.get("excluded_ingredients", [])
+            existing_lower = {e.lower() for e in existing_excluded}
+            additional = [m for m in NON_VEGETARIAN if m not in existing_lower]
+            sql_filters["excluded_ingredients"] = existing_excluded + additional
+            # Remove the generic "vegetarian" tag so the LLM does not generate
+            # a tag-only SQL filter (which would miss egg/dairy-tagged recipes).
+            sql_filters["tags"] = [t for t in _tags if t != "vegetarian"]
+            logger.info(
+                f"[VEGETARIAN] Replaced tag filter with ingredient exclusion "
+                f"({len(additional)} non-veg ingredients added to excluded_ingredients)"
+            )
+
         # Session included ingredients - skip for HYBRID_VECTOR_TO_SQL
         # because embeddings already handle semantic ingredient matching
         if strategy != RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
@@ -910,9 +1056,14 @@ class RetrievalStrategyDecider:
                 sql_filters["included_ingredients"] = session_included
 
         # Creator filter - filter recipes by specific user
-        if session_filters.get("creator_uid"):
-            sql_filters["creator_uid"] = session_filters["creator_uid"]
-            logger.info(f"[RETRIEVAL STRATEGY] Added creator_uid to sql_filters: {session_filters['creator_uid']}")
+        # Normalise to a plain string; the merge loop can occasionally produce a list.
+        raw_creator_uid = session_filters.get("creator_uid")
+        if raw_creator_uid:
+            if isinstance(raw_creator_uid, list):
+                raw_creator_uid = raw_creator_uid[0] if raw_creator_uid else None
+            if raw_creator_uid and isinstance(raw_creator_uid, str):
+                sql_filters["creator_uid"] = raw_creator_uid
+                logger.info(f"[RETRIEVAL STRATEGY] Added creator_uid to sql_filters: {raw_creator_uid}")
 
         logger.info(f"[RETRIEVAL STRATEGY] Final sql_filters: {sql_filters}")
         logger.info(f"[RETRIEVAL STRATEGY] session_filters: {session_filters}")

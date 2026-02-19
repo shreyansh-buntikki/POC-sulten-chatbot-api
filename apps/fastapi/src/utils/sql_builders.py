@@ -16,8 +16,13 @@ def build_recipe_cost_filter_sql(
     """
     Build SQL query for recipe cost filtering using recipe_metadata.
 
+    Sorting logic:
+    - Qualitative "low cost" / "cheap" → ASC (cheapest first)
+    - Qualitative "high cost" / "expensive" → DESC (most expensive first)
+    - Specific budget "under 500" → filter <= 500, sort DESC (nearest to budget first, not cheapest)
+
     Args:
-        cost_filter: Dict with operator, value, country
+        cost_filter: Dict with operator, value, country, sort_order, level
         user_uid: User identifier
         language: Language code
         additional_conditions: Additional WHERE conditions
@@ -38,18 +43,30 @@ def build_recipe_cost_filter_sql(
     }
     country_key = country_key_map.get(country, country.lower())
 
-    # Determine order direction based on operator and value
-    # For "low budget" queries (value is None), order by price ascending (cheapest first)
-    # For specific budget queries (value is set), order by price descending (closest to budget)
-    if value is None:
-        # No specific value - this is a "budget" or "cheap" request
-        # Order by price ascending to show cheapest recipes first
-        order_direction = "ASC"
-        price_condition = ""  # No filtering, just ordering
-    else:
-        # Specific budget provided
+    # Determine sort order:
+    # 1. If NLID explicitly set sort_order, use that
+    # 2. For specific budget (value set): DESC (nearest to budget, not cheapest)
+    # 3. For qualitative low cost / cheap: ASC (cheapest first)
+    # 4. For qualitative high cost / expensive: DESC (most expensive first)
+    explicit_sort = cost_filter.get("sort_order")
+    level = cost_filter.get("level")
+
+    if explicit_sort:
+        order_direction = explicit_sort.upper()
+    elif value is not None:
+        # Specific budget → DESC to show recipes nearest to budget
         order_direction = "DESC"
+    elif level == "high":
+        order_direction = "DESC"
+    else:
+        # Default for "low cost", "cheap", "affordable", "budget" → cheapest first
+        order_direction = "ASC"
+
+    # Build price condition only when a specific value is provided
+    if value is not None:
         price_condition = f"  AND CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}\n"
+    else:
+        price_condition = ""  # No filtering, just ordering
 
     # The actual structure is: recipe_metadata -> pricing -> country -> total
     base_query = f"""
@@ -133,6 +150,115 @@ WHERE r."deletedAt" IS NULL
 ORDER BY (r."prepTime" + r."cookTime") {sort_order}
 LIMIT {limit}
 """
+
+    return base_query
+
+
+def build_recipe_multi_filter_sql(
+    cost_filter: Optional[Dict[str, Any]] = None,
+    time_filter: Optional[Dict[str, Any]] = None,
+    nutrition_filter: Optional[Dict[str, Any]] = None,
+    user_uid: str = "",
+    language: str = "en",
+    additional_conditions: Optional[List[str]] = None,
+    limit: int = 20
+) -> str:
+    """
+    Build a single SQL query combining any combination of cost, time, and nutrition filters.
+    Used when multiple filters are active from multi-turn context management.
+
+    ORDER BY priority: cost > time > nutrition > default (name)
+    """
+    country_key_map = {"US": "usa", "India": "india", "Norway": "norway"}
+
+    base_query = f"""
+SELECT r."id", r."name", r."ingress", r."image",
+       (r."prepTime" + r."cookTime") as total_time,
+       r."difficulty", r."servings",
+       r."recipe_metadata"
+FROM recipe r
+LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
+LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+WHERE r."deletedAt" IS NULL
+  AND r."status" = 'published'
+  AND r."languageId" = '{language}'
+  AND (r."private" = false OR r."userUid" = '{user_uid}' OR br."bundleId" IS NOT NULL)
+"""
+
+    # Add cost filter WHERE conditions
+    cost_order = None
+    if cost_filter:
+        country = cost_filter.get("country", "Norway")
+        country_key = country_key_map.get(country, country.lower())
+        value = cost_filter.get("value")
+        operator = cost_filter.get("operator", "<=")
+
+        base_query += f"""  AND r."recipe_metadata" IS NOT NULL
+  AND r."recipe_metadata"->'pricing' IS NOT NULL
+  AND r."recipe_metadata"->'pricing'->'{country_key}' IS NOT NULL
+  AND r."recipe_metadata"->'pricing'->'{country_key}'->>'total' IS NOT NULL
+"""
+        if value is not None:
+            base_query += f"  AND CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}\n"
+
+        explicit_sort = cost_filter.get("sort_order")
+        level = cost_filter.get("level")
+        if explicit_sort:
+            cost_order = explicit_sort.upper()
+        elif value is not None:
+            cost_order = "DESC"
+        elif level == "high":
+            cost_order = "DESC"
+        else:
+            cost_order = "ASC"
+
+    # Add nutrition filter WHERE conditions
+    nutrient_key = None
+    nutrition_order = None
+    if nutrition_filter:
+        nutrient_key_mapping = {
+            "protein": "protein", "proteins": "protein",
+            "carb": "carbohydrates", "carbs": "carbohydrates", "carbohydrates": "carbohydrates",
+            "fat": "totalFat", "fats": "totalFat", "totalFat": "totalFat",
+            "calories": "energyKcal", "calorie": "energyKcal", "energyKcal": "energyKcal",
+            "fiber": "totalFiber", "fibre": "totalFiber", "totalFiber": "totalFiber",
+            "sugar": "totalSugars", "sugars": "totalSugars", "totalSugars": "totalSugars",
+        }
+        raw_key = nutrition_filter.get("nutrient_key") or nutrition_filter.get("sort_by", "protein")
+        nutrient_key = nutrient_key_mapping.get(raw_key, raw_key)
+        nutrition_order = nutrition_filter.get("order", "DESC")
+
+        base_query += f"""  AND r."recipe_metadata"->'totalNutrition' IS NOT NULL
+  AND r."recipe_metadata"->'totalNutrition'->'macros'->>'{nutrient_key}' IS NOT NULL
+"""
+
+    # Add additional conditions (allergens, tags, etc.)
+    if additional_conditions:
+        for condition in additional_conditions:
+            base_query += f"  AND {condition}\n"
+
+    # Add time filter to WHERE (only exclude zero-time recipes for time queries)
+    time_order = None
+    if time_filter:
+        time_order = time_filter.get("sort_order", "ASC").upper()
+
+    # Build ORDER BY - primary sort is the current intent's filter, secondary is from session
+    order_parts = []
+    if cost_filter and cost_order:
+        country = cost_filter.get("country", "Norway")
+        country_key = country_key_map.get(country, country.lower())
+        order_parts.append(f"CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {cost_order}")
+    if time_order:
+        order_parts.append(f"(r.\"prepTime\" + r.\"cookTime\") {time_order}")
+    if nutrient_key and nutrition_order:
+        order_parts.append(f"CAST(r.\"recipe_metadata\"->'totalNutrition'->'macros'->>'{nutrient_key}' AS FLOAT) {nutrition_order}")
+
+    if order_parts:
+        base_query += f"\nORDER BY {', '.join(order_parts)}"
+    else:
+        base_query += "\nORDER BY r.\"name\""
+
+    base_query += f"\nLIMIT {limit}\n"
 
     return base_query
 
@@ -367,7 +493,9 @@ WHERE r."deletedAt" IS NULL
     if not order_clause and cost_filter:
         country = cost_filter.get("country", "Norway")
         country_key = country_key_map.get(country, country.lower())
-        order_clause = f"ORDER BY CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) ASC"
+        # Use sort_order from cost_filter: DESC for specific budget (nearest to budget), ASC for cheap
+        cost_sort = cost_filter.get("sort_order", "DESC" if cost_filter.get("value") else "ASC")
+        order_clause = f"ORDER BY CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {cost_sort}"
 
     base_query += f"""
 {order_clause}

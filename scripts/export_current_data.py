@@ -15,8 +15,9 @@ sys.path.append(str(project_root))
 
 from database import SessionLocal
 from sqlalchemy import text
+from libs.utils.logger import setup_logger
 
-def decimal_to_float(obj):
+logger = setup_logger("export_current_data", True, False, False, False)(obj):
     """Convert Decimal to float for JSON serialization"""
     if isinstance(obj, Decimal):
         return float(obj)
@@ -31,9 +32,9 @@ def export_current_data():
 
     ingredient_ids = [ingredient['id'] for ingredient in data['ingredients']]
 
-    print(f"Found {len(ingredient_ids)} ingredients to export:")
+    logger.info(f"Found {len(ingredient_ids)} ingredients to export:")
     for ingredient in data['ingredients']:
-        print(f"  - {ingredient['name']} ({ingredient['id']})")
+        logger.info(f"  - {ingredient['name']} ({ingredient['id']})") 
 
     db = SessionLocal()
     try:
@@ -127,26 +128,26 @@ def export_current_data():
         with open(export_filename, 'w', encoding='utf-8') as f:
             json.dump(export_data, f, indent=2, ensure_ascii=False, default=decimal_to_float)
 
-        print(f"\n✅ Data exported to: {export_filename}")
+        logger.info(f"\n✅ Data exported to: {export_filename}")
 
         # Also display a summary
-        print("\n=== SUMMARY ===")
+        logger.info("\n=== SUMMARY ===")
         for ingredient in results:
-            print(f"\n{ingredient['name']} ({ingredient['id']}):")
+            logger.info(f"\n{ingredient['name']} ({ingredient['id']}):")
             if ingredient['macros']:
-                print(f"  Macros: {ingredient['macros']['energyKcal']} kcal, {ingredient['macros']['protein']}g protein")
+                logger.info(f"  Macros: {ingredient['macros']['energyKcal']} kcal, {ingredient['macros']['protein']}g protein")
             else:
-                print("  Macros: No data")
+                logger.info("  Macros: No data")
 
             if ingredient['pricing']:
-                print(f"  Pricing: {len(ingredient['pricing'])} countries")
+                logger.info(f"  Pricing: {len(ingredient['pricing'])} countries")
                 for country, pricing in ingredient['pricing'].items():
-                    print(f"    {country}: {pricing['pricePerUnit']} {pricing['currency']}")
+                    logger.info(f"    {country}: {pricing['pricePerUnit']} {pricing['currency']}")
             else:
-                print("  Pricing: No data")
+                logger.info("  Pricing: No data")
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         raise
 
     finally:

@@ -10,15 +10,21 @@ import csv
 import json
 import time
 import asyncio
+import sys
 from datetime import datetime
 from typing import Dict, List, Optional
 import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from libs.utils.logger import setup_logger
+
+logger = setup_logger("ingredient_enricher", True, False, False, False)
 
 try:
     from openai import OpenAI
     from agents import Agent, Runner
 except ImportError:
-    print("Installing required packages...")
+    logger.info("Installing required packages...")
     import subprocess
     subprocess.check_call(['pip', 'install', 'openai', 'agents'])
     from openai import OpenAI
@@ -61,7 +67,7 @@ class OpenAIIngredientEnricher:
                         'measuringUnitId': row['measuringUnitId']
                     }
         except Exception as e:
-            print(f"Warning: Could not load measuring units: {e}")
+            logger.warning(f"Warning: Could not load measuring units: {e}")
         return units
     
     def read_ingredients(self, start: int = 0, limit: int = 20) -> List[Dict]:
@@ -82,7 +88,7 @@ class OpenAIIngredientEnricher:
                         'index': i
                     })
         except Exception as e:
-            print(f"Error reading ingredients: {e}")
+            logger.error(f"Error reading ingredients: {e}")
         
         return ingredients
     
@@ -232,7 +238,7 @@ Important:
     
     async def fetch_data_from_openai(self, ingredient_name: str, language: str = "no") -> Optional[Dict]:
         """Fetch nutritional and pricing data using OpenAI Agents SDK"""
-        print(f"  Querying OpenAI for: {ingredient_name}")
+        logger.info(f"  Querying OpenAI for: {ingredient_name}")
 
         try:
             prompt = self.create_prompt(ingredient_name, language)
@@ -255,21 +261,21 @@ Important:
                 content = content.strip()
 
             data = json.loads(content)
-            print(f"    ✓ Data retrieved successfully")
+            logger.info(f"    ✓ Data retrieved successfully")
             return data
 
         except json.JSONDecodeError as e:
-            print(f"    ✗ JSON parsing error: {e}")
-            print(f"    Response: {content[:200]}...")
+            logger.error(f"    ✗ JSON parsing error: {e}")
+            logger.info(f"    Response: {content[:200]}...")
             return None
         except Exception as e:
-            print(f"    ✗ Error: {e}")
+            logger.error(f"    ✗ Error: {e}")
             return None
     
     async def enrich_ingredient(self, ingredient: Dict) -> Dict:
         """Enrich a single ingredient with all data using OpenAI"""
         name = ingredient['name']
-        print(f"\n[{ingredient['index'] + 1}] Processing: {name}")
+        logger.info(f"\n[{ingredient['index'] + 1}] Processing: {name}")
 
         # Fetch data from OpenAI
         ai_data = await self.fetch_data_from_openai(name, ingredient['languageId'])
@@ -288,7 +294,7 @@ Important:
             }
             ai_data['macros']['servingSize'] = '100g'
             ai_data['micros']['servingSize'] = '100g'
-            print(f"    Using empty data structure")
+            logger.info(f"    Using empty data structure")
         
         # Compile enriched data
         enriched = {
@@ -317,13 +323,13 @@ Important:
     
     async def process_batch(self, start: int = 0, limit: int = 20, batch_size: int = 10) -> List[Dict]:
         """Process a batch of ingredients"""
-        print(f"\n{'='*70}")
-        print(f"Reading ingredients {start+1} to {start+limit}...")
-        print(f"{'='*70}")
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Reading ingredients {start+1} to {start+limit}...")
+        logger.info(f"{'='*70}")
 
         ingredients = self.read_ingredients(start, limit)
 
-        print(f"\nProcessing {len(ingredients)} ingredients\n")
+        logger.info(f"\nProcessing {len(ingredients)} ingredients\n")
 
         enriched_ingredients = []
         success_nutrition = 0
@@ -342,18 +348,18 @@ Important:
                 # Save intermediate results every batch_size items
                 if (i + 1) % batch_size == 0:
                     self.save_to_json(enriched_ingredients, f'enriched_ingredients_partial_{start}_{i+1}.json')
-                    print(f"\n    💾 Saved intermediate results ({i+1} items)")
+                    logger.info(f"\n    💾 Saved intermediate results ({i+1} items)")
                 
             except Exception as e:
-                print(f"❌ Error processing {ingredient['name']}: {e}")
+                logger.error(f"❌ Error processing {ingredient['name']}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
         
-        print(f"\n{'='*70}")
-        print(f"✅ Nutrition data: {success_nutrition}/{len(enriched_ingredients)}")
-        print(f"✅ Pricing data: {success_pricing}/{len(enriched_ingredients)}")
-        print(f"{'='*70}")
+        logger.info(f"\n{'='*70}")
+        logger.info(f"✅ Nutrition data: {success_nutrition}/{len(enriched_ingredients)}")
+        logger.info(f"✅ Pricing data: {success_pricing}/{len(enriched_ingredients)}")
+        logger.info(f"{'='*70}")
         
         return enriched_ingredients
     
@@ -379,17 +385,17 @@ Important:
             json.dump(output, f, indent=2, ensure_ascii=False)
         
         file_size_kb = len(json.dumps(output)) / 1024
-        print(f"\n💾 Saved to: {filename}")
-        print(f"   Size: {file_size_kb:.2f} KB")
-        print(f"   Ingredients: {len(data)}")
+        logger.info(f"\n💾 Saved to: {filename}")
+        logger.info(f"   Size: {file_size_kb:.2f} KB")
+        logger.info(f"   Ingredients: {len(data)}")
 
 
 async def main():
-    print("\n" + "="*70)
-    print("🤖 OpenAI-Powered Ingredient Enricher v3.0")
-    print("   Fetches Nutrition Data + Pricing from OpenAI")
-    print("   Using OpenAI Agents SDK for consistent LLM calls")
-    print("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("🤖 OpenAI-Powered Ingredient Enricher v3.0")
+    logger.info("   Fetches Nutrition Data + Pricing from OpenAI")
+    logger.info("   Using OpenAI Agents SDK for consistent LLM calls")
+    logger.info("="*70)
 
     # Get OpenAI API key
     # Option 1: Hardcode your key here (NOT recommended for security)
@@ -412,8 +418,8 @@ async def main():
     start_index = 0
     num_ingredients = 2841  # Process all ingredients
 
-    print(f"\n📋 Processing {num_ingredients} ingredients starting from #{start_index}")
-    print(f"   (Edit lines 409-410 in script to change these values)")
+    logger.info(f"\n📋 Processing {num_ingredients} ingredients starting from #{start_index}")
+    logger.info(f"   (Edit lines 409-410 in script to change these values)")
 
     # Process ingredients
     enriched_data = await enricher.process_batch(start=start_index, limit=num_ingredients)
@@ -421,19 +427,19 @@ async def main():
     # Save to JSON
     enricher.save_to_json(enriched_data, 'enriched_ingredients_openai.json')
 
-    print("\n" + "="*70)
-    print("✅ Processing complete!")
-    print("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("✅ Processing complete!")
+    logger.info("="*70)
 
     # Show summary
     with_nutrition = sum(1 for ing in enriched_data if ing['metadata']['hasNutritionData'])
     with_pricing = sum(1 for ing in enriched_data if ing['metadata']['hasPricingData'])
 
-    print(f"\n📊 Summary:")
-    print(f"   Total processed: {len(enriched_data)}")
-    print(f"   With nutrition data: {with_nutrition} ({with_nutrition/len(enriched_data)*100:.1f}%)")
-    print(f"   With pricing data: {with_pricing} ({with_pricing/len(enriched_data)*100:.1f}%)")
-    print(f"\n   Output file: enriched_ingredients_openai.json")
+    logger.info(f"\n📊 Summary:")
+    logger.info(f"   Total processed: {len(enriched_data)}")
+    logger.info(f"   With nutrition data: {with_nutrition} ({with_nutrition/len(enriched_data)*100:.1f}%)")
+    logger.info(f"   With pricing data: {with_pricing} ({with_pricing/len(enriched_data)*100:.1f}%)")
+    logger.info(f"\n   Output file: enriched_ingredients_openai.json")
 
 
 if __name__ == "__main__":

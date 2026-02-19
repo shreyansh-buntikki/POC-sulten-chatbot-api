@@ -25,31 +25,31 @@ def drop_unused_embedding_columns():
     db = SessionLocal()
 
     try:
-        print("=" * 60)
-        print("Dropping Unused Embedding Columns")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("Dropping Unused Embedding Columns")
+        logger.info("=" * 60)
 
         # Drop tag embedding column
-        print("\nDropping embedding column from tag table...")
+        logger.info("\nDropping embedding column from tag table...")
         db.execute(text("ALTER TABLE tag DROP COLUMN IF EXISTS embedding"))
         db.commit()
-        print("  ✓ Tag embedding column dropped")
+        logger.info("  ✓ Tag embedding column dropped")
 
         # Drop seasonality embedding column
-        print("Dropping embedding column from seasonality table...")
+        logger.info("Dropping embedding column from seasonality table...")
         db.execute(text("ALTER TABLE seasonality DROP COLUMN IF EXISTS embedding"))
         db.commit()
-        print("  ✓ Seasonality embedding column dropped")
+        logger.info("  ✓ Seasonality embedding column dropped")
 
-        print("\n" + "=" * 60)
-        print("✓ Unused embedding columns dropped successfully!")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("✓ Unused embedding columns dropped successfully!")
+        logger.info("=" * 60)
 
         return True
 
     except Exception as e:
         db.rollback()
-        print(f"\n✗ Error: {e}")
+        logger.error(f"\n✗ Error: {e}")
         return False
 
     finally:

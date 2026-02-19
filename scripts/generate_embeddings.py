@@ -25,34 +25,35 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import SessionLocal
 from apps.fastapi.src.services.embedding_service import EmbeddingService
+from libs.utils.logger import setup_logger
 
-load_dotenv()
+logger = setup_logger("generate_embeddings", True, False, False, False)
 
 
 def generate_recipe_embeddings(limit: int = None):
     """Generate embeddings for recipes"""
-    print("=" * 60)
-    print("Generating Recipe Embeddings")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Generating Recipe Embeddings")
+    logger.info("=" * 60)
 
     db = SessionLocal()
     try:
         service = EmbeddingService(db)
 
         limit_msg = f" (limit: {limit})" if limit else " (all)"
-        print(f"Starting recipe embedding generation{limit_msg}...")
+        logger.info(f"Starting recipe embedding generation{limit_msg}...")
 
         stats = service.generate_recipe_embeddings(limit=limit)
 
-        print(f"\nResults:")
-        print(f"  ✓ Processed: {stats['processed']}")
-        print(f"  ✗ Failed: {stats['failed']}")
-        print(f"  ⊘ Skipped: {stats['skipped']}")
+        logger.info(f"\nResults:")
+        logger.info(f"  ✓ Processed: {stats['processed']}")
+        logger.error(f"  ✗ Failed: {stats['failed']}")
+        logger.info(f"  ⊘ Skipped: {stats['skipped']}")
 
         return stats['failed'] == 0
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         return False
     finally:
         db.close()
@@ -60,28 +61,28 @@ def generate_recipe_embeddings(limit: int = None):
 
 def generate_ingredient_embeddings(limit: int = None):
     """Generate embeddings for ingredients"""
-    print("\n" + "=" * 60)
-    print("Generating Ingredient Embeddings")
-    print("=" * 60)
+    logger.info("\n" + "=" * 60)
+    logger.info("Generating Ingredient Embeddings")
+    logger.info("=" * 60)
 
     db = SessionLocal()
     try:
         service = EmbeddingService(db)
 
         limit_msg = f" (limit: {limit})" if limit else " (all)"
-        print(f"Starting ingredient embedding generation{limit_msg}...")
+        logger.info(f"Starting ingredient embedding generation{limit_msg}...")
 
         stats = service.generate_ingredient_embeddings(limit=limit)
 
-        print(f"\nResults:")
-        print(f"  ✓ Processed: {stats['processed']}")
-        print(f"  ✗ Failed: {stats['failed']}")
-        print(f"  ⊘ Skipped: {stats['skipped']}")
+        logger.info(f"\nResults:")
+        logger.info(f"  ✓ Processed: {stats['processed']}")
+        logger.error(f"  ✗ Failed: {stats['failed']}")
+        logger.info(f"  ⊘ Skipped: {stats['skipped']}")
 
         return stats['failed'] == 0
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         return False
     finally:
         db.close()
@@ -117,8 +118,8 @@ def main():
 
     # Check for OpenAI API key
     if not os.getenv('OPENAI_API_KEY'):
-        print("Error: OPENAI_API_KEY not found in environment variables")
-        print("Please set OPENAI_API_KEY in your .env file")
+        logger.error("OPENAI_API_KEY not found in environment variables")
+        logger.error("Please set OPENAI_API_KEY in your .env file")
         sys.exit(1)
 
     success = True
@@ -131,12 +132,12 @@ def main():
         if not generate_ingredient_embeddings(args.limit):
             success = False
 
-    print("\n" + "=" * 60)
+    logger.info("=" * 60)
     if success:
-        print("✓ Embedding generation completed successfully!")
+        logger.info("Embedding generation completed successfully!")
     else:
-        print("✗ Embedding generation completed with some errors")
-    print("=" * 60)
+        logger.error("Embedding generation completed with some errors")
+    logger.info("=" * 60)
 
     sys.exit(0 if success else 1)
 
