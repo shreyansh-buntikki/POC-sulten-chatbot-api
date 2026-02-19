@@ -775,7 +775,11 @@ class RecipeSearchPipelineSDK:
                                 strategy=RetrievalStrategy.SQL_ONLY,
                                 reasoning="Exclusion-only refinement: original vector query IS the excluded ingredient",
                                 vector_query=None,
-                                sql_filters={"excluded_ingredients": merged_exclusions},
+                                sql_filters={
+                                    **{k: v for k, v in retrieval_plan.sql_filters.items()
+                                       if k != "excluded_ingredients"},
+                                    "excluded_ingredients": merged_exclusions,
+                                },
                                 top_k=20
                             )
                         else:
@@ -787,9 +791,11 @@ class RecipeSearchPipelineSDK:
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
                                 reasoning="Refinement search - preserving original search with allergy exclusion",
-                                vector_query=original_vector_query,  # Keep original search (e.g., "orange recipes")
+                                vector_query=original_vector_query,
                                 sql_filters={
-                                    "excluded_ingredients": merged_exclusions  # Full merged exclusion list
+                                    **{k: v for k, v in retrieval_plan.sql_filters.items()
+                                       if k != "excluded_ingredients"},
+                                    "excluded_ingredients": merged_exclusions,
                                 },
                                 top_k=top_k
                             )
@@ -998,12 +1004,21 @@ class RecipeSearchPipelineSDK:
 
                 # Step 1: Run embedding search
                 embedding_limit = max(retrieval_plan.top_k, 10)
+                # If the search is scoped to a specific creator, filter the embedding
+                # candidates to that creator's recipes only — avoids wasting candidate
+                # slots on other users' recipes and ensures the SQL creator filter
+                # always has enough candidates to work with.
+                embedding_creator_uid = (
+                    retrieval_plan.sql_filters.get("creator_uid")
+                    if retrieval_plan.sql_filters else None
+                )
                 embedding_results = search_recipes_by_embedding(
                     self.db,
                     query_text=retrieval_plan.vector_query or query,
                     limit=embedding_limit,
                     threshold=0.4,
-                    language_id=language
+                    language_id=language,
+                    creator_uid=embedding_creator_uid
                 )
                 candidate_ids = [str(r.id) for r, _ in embedding_results]
                 similarity_scores = {str(r.id): s for r, s in embedding_results}
@@ -1068,12 +1083,17 @@ class RecipeSearchPipelineSDK:
                         return None, {}
 
                     embedding_limit = max(retrieval_plan.top_k, 10)
+                    _emb_creator_uid = (
+                        retrieval_plan.sql_filters.get("creator_uid")
+                        if retrieval_plan.sql_filters else None
+                    )
                     embedding_results = search_recipes_by_embedding(
                         self.db,
                         query_text=retrieval_plan.vector_query or query,
                         limit=embedding_limit,
                         threshold=0.4,
-                        language_id=language
+                        language_id=language,
+                        creator_uid=_emb_creator_uid
                     )
                     cand_ids = [str(r.id) for r, _ in embedding_results]
                     sim_scores = {str(r.id): s for r, s in embedding_results}

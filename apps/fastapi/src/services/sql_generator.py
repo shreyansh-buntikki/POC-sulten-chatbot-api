@@ -947,6 +947,18 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
         sql_cleaned = sql
 
+        # Pattern F (ingredient-aware): Run FIRST while ingredient names are still
+        # present in the SQL. Removes any top-level AND (...) or AND NOT (...) block
+        # that references one of the excluded ingredient names via ILIKE.
+        # Uses a balanced-paren walker — safe for nested subqueries.
+        # Must run before C/D/E which strip the NOT ILIKE lines and would hide
+        # the ingredient name from this search.
+        for ing in excluded_ingredients:
+            ing_lower = ing.lower()
+            sql_cleaned = self._remove_ilike_blocks_for_ingredient(
+                sql_cleaned, ing_lower
+            )
+
         # Pattern A: AND NOT (...) blocks — the clean negation form
         # AND NOT ( r."name" ILIKE '%X%' OR r."ingress" ILIKE '%X%' OR EXISTS(...) )
         sql_cleaned = re.sub(
@@ -998,17 +1010,13 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             flags=re.IGNORECASE | re.DOTALL,
         )
 
-        # Pattern F (ingredient-aware): Remove ANY top-level AND (...) or AND NOT (...)
-        # block that references one of the excluded ingredient names via ILIKE.
-        # Uses a balanced-paren walker so nested subqueries don't confuse it.
-        # This catches the LLM's "positive inclusion" form:
-        #   AND ( (name ILIKE '%potato%') OR ... OR EXISTS(...) IS FALSE )
-        # as well as any other unusual exclusion form not covered above.
-        for ing in excluded_ingredients:
-            ing_lower = ing.lower()
-            sql_cleaned = self._remove_ilike_blocks_for_ingredient(
-                sql_cleaned, ing_lower
-            )
+        # Clean up orphaned empty AND () wrappers left by the removals above.
+        # Run in a loop to handle nested cases (inner removed first, then outer).
+        for _ in range(5):
+            cleaned = re.sub(r'\bAND\s*\(\s*\)', '', sql_cleaned, flags=re.IGNORECASE | re.DOTALL)
+            if cleaned == sql_cleaned:
+                break
+            sql_cleaned = cleaned
 
         # Clean up stray empty parens / extra blank lines
         sql_cleaned = re.sub(r'\bAND\s*\(\s*\)', '', sql_cleaned, flags=re.IGNORECASE)

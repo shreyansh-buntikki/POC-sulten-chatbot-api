@@ -822,9 +822,12 @@ class SessionMemoryManager:
         session.context_entities.last_user_query = user_query
         self.save_session(session)
 
+        recipe_names = [
+            r["name"] for r in session.context_entities.last_recipe_results
+        ]
         logger.info(
             f"[SESSION] Updated last_recipe_results: "
-            f"{len(session.context_entities.last_recipe_results)} recipes"
+            f"{len(session.context_entities.last_recipe_results)} recipes: {recipe_names}"
         )
 
         return session
