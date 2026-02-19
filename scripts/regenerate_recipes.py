@@ -16,8 +16,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import SessionLocal
 from apps.fastapi.src.services.embedding_service import EmbeddingService
 from models import Recipe
+from libs.utils.logger import setup_logger
 
-load_dotenv()
+logger = setup_logger("regenerate_recipes", True, False, False, False)
 
 
 def regenerate_all_recipe_embeddings():
@@ -25,18 +26,18 @@ def regenerate_all_recipe_embeddings():
     db = SessionLocal()
 
     try:
-        print("=" * 60)
-        print("Regenerating ALL Recipe Embeddings")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("Regenerating ALL Recipe Embeddings")
+        logger.info("=" * 60)
 
         # Get all recipes
         total_recipes = db.query(Recipe).count()
-        print(f"\nTotal recipes in database: {total_recipes}")
+        logger.info(f"\nTotal recipes in database: {total_recipes}")
 
         # Check for OpenAI API key
         if not os.getenv('OPENAI_API_KEY'):
-            print("\n✗ Error: OPENAI_API_KEY not found in environment variables")
-            print("Please set OPENAI_API_KEY in your .env file")
+            logger.error("\n✗ Error: OPENAI_API_KEY not found in environment variables")
+            logger.info("Please set OPENAI_API_KEY in your .env file")
             return False
 
         service = EmbeddingService(db)
@@ -48,8 +49,8 @@ def regenerate_all_recipe_embeddings():
         start_time = time.time()
         last_report_time = start_time
 
-        print(f"\nRegenerating embeddings for {len(recipes)} recipes...")
-        print("Progress shown every 10 recipes\n")
+        logger.info(f"\nRegenerating embeddings for {len(recipes)} recipes...")
+        logger.info("Progress shown every 10 recipes\n")
 
         for i, recipe in enumerate(recipes, 1):
             try:
@@ -71,7 +72,7 @@ def regenerate_all_recipe_embeddings():
                         rate = stats["regenerated"] / elapsed if elapsed > 0 else 0
                         eta = (len(recipes) - i) / rate if rate > 0 else 0
 
-                        print(f"  [{i:4d}/{len(recipes)}] ✓ {stats['regenerated']:4d} regenerated | {stats['failed']:3d} failed | {rate:.1f} recipes/sec | ETA: {eta/60:.1f} min")
+                        logger.info(f"  [{i:4d}/{len(recipes)}] ✓ {stats['regenerated']:4d} regenerated | {stats['failed']:3d} failed | {rate:.1f} recipes/sec | ETA: {eta/60:.1f} min")
                 else:
                     stats["failed"] += 1
 
@@ -79,23 +80,23 @@ def regenerate_all_recipe_embeddings():
                 db.rollback()
                 stats["failed"] += 1
                 if i % 10 == 0:
-                    print(f"  [{i:4d}/{len(recipes)}] ✗ Error for recipe {recipe.id}: {str(e)[:50]}")
+                    logger.error(f"  [{i:4d}/{len(recipes)}] ✗ Error for recipe {recipe.id}: {str(e)[:50]}")
 
         elapsed = time.time() - start_time
 
-        print("\n" + "=" * 60)
-        print("Regeneration Complete!")
-        print(f"  ✓ Regenerated: {stats['regenerated']}")
-        print(f"  ✗ Failed: {stats['failed']}")
-        print(f"  ⏱ Time elapsed: {elapsed/60:.1f} minutes")
-        print(f"  📊 Average rate: {stats['regenerated']/elapsed:.1f} recipes/sec")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("Regeneration Complete!")
+        logger.info(f"  ✓ Regenerated: {stats['regenerated']}")
+        logger.error(f"  ✗ Failed: {stats['failed']}")
+        logger.info(f"  ⏱ Time elapsed: {elapsed/60:.1f} minutes")
+        logger.info(f"  📊 Average rate: {stats['regenerated']/elapsed:.1f} recipes/sec")
+        logger.info("=" * 60)
 
         return stats['failed'] == 0
 
     except Exception as e:
         db.rollback()
-        print(f"\n✗ Error: {e}")
+        logger.error(f"\n✗ Error: {e}")
         return False
 
     finally:

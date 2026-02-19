@@ -16,7 +16,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Forbidden tables to exclude
+from libs.utils.logger import setup_logger
+
+logger = setup_logger("generate_schema_profiler", True, False, False, False)
 FORBIDDEN_TABLES = {
     'collection', 'collection_recipes_recipe',
     'comment',
@@ -223,7 +225,7 @@ def generate_json():
     with open('schema_profiler.json', 'w') as f:
         json.dump(output, f, indent=2)
 
-    print("✓ Generated schema_profiler.json")
+    logger.info("Generated schema_profiler.json")
     cursor.close()
 
 def generate_data_py():
@@ -275,14 +277,14 @@ SCHEMA_DATA = {json.dumps(tables_data, indent=4)}
     with open('schema_profiler_data.py', 'w') as f:
         f.write(output)
 
-    print("✓ Generated schema_profiler_data.py")
+    logger.info("✓ Generated schema_profiler_data.py")
     cursor.close()
 
 def main():
-    print("Generating schema profiler files...")
+    logger.info("Generating schema profiler files...")
     generate_json()
     generate_data_py()
-    print("Done!")
+    logger.info("Done!")
 
 if __name__ == "__main__":
     main()

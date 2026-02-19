@@ -24,8 +24,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from database import SessionLocal
 from apps.fastapi.src.services.embedding_service import EmbeddingService
 from models import Recipe
+from libs.utils.logger import setup_logger
 
-load_dotenv()
+logger = setup_logger("regenerate_recipe_embeddings", True, False, False, False)
 
 
 def regenerate_all_recipe_embeddings():
@@ -33,18 +34,18 @@ def regenerate_all_recipe_embeddings():
     db = SessionLocal()
 
     try:
-        print("=" * 60)
-        print("Regenerating ALL Recipe Embeddings")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("Regenerating ALL Recipe Embeddings")
+        logger.info("=" * 60)
 
         # Get all recipes
         total_recipes = db.query(Recipe).count()
-        print(f"\nTotal recipes in database: {total_recipes}")
+        logger.info(f"\nTotal recipes in database: {total_recipes}")
 
         # Check for OpenAI API key
         if not os.getenv('OPENAI_API_KEY'):
-            print("\n✗ Error: OPENAI_API_KEY not found in environment variables")
-            print("Please set OPENAI_API_KEY in your .env file")
+            logger.error("\n✗ Error: OPENAI_API_KEY not found in environment variables")
+            logger.info("Please set OPENAI_API_KEY in your .env file")
             return False
 
         service = EmbeddingService(db)
@@ -54,15 +55,15 @@ def regenerate_all_recipe_embeddings():
 
         stats = {"regenerated": 0, "failed": 0}
 
-        print(f"\nRegenerating embeddings for {len(recipes)} recipes...")
-        print("This will take approximately 5-10 minutes...\n")
+        logger.info(f"\nRegenerating embeddings for {len(recipes)} recipes...")
+        logger.info("This will take approximately 5-10 minutes...\n")
 
         for i, recipe in enumerate(recipes, 1):
             try:
                 # Generate new embedding
                 text = service._recipe_to_text(recipe)
                 if not text:
-                    print(f"  [{i}/{len(recipes)}] ⚠ Skipped recipe {recipe.id} (no text)")
+                    logger.warning(f"  [{i}/{len(recipes)}] ⚠ Skipped recipe {recipe.id} (no text)")
                     stats["failed"] += 1
                     continue
 
@@ -73,27 +74,27 @@ def regenerate_all_recipe_embeddings():
                     stats["regenerated"] += 1
 
                     if i % 100 == 0 or i == len(recipes):
-                        print(f"  [{i}/{len(recipes)}] ✓ Regenerated {stats['regenerated']} so far...")
+                        logger.info(f"  [{i}/{len(recipes)}] ✓ Regenerated {stats['regenerated']} so far...")
                 else:
                     stats["failed"] += 1
-                    print(f"  [{i}/{len(recipes)}] ✗ Failed to generate embedding for recipe {recipe.id}")
+                    logger.error(f"  [{i}/{len(recipes)}] ✗ Failed to generate embedding for recipe {recipe.id}")
 
             except Exception as e:
                 db.rollback()
                 stats["failed"] += 1
-                print(f"  [{i}/{len(recipes)}] ✗ Error for recipe {recipe.id}: {e}")
+                logger.error(f"  [{i}/{len(recipes)}] ✗ Error for recipe {recipe.id}: {e}")
 
-        print("\n" + "=" * 60)
-        print("Regeneration Complete!")
-        print(f"  ✓ Regenerated: {stats['regenerated']}")
-        print(f"  ✗ Failed: {stats['failed']}")
-        print("=" * 60)
+        logger.info("\n" + "=" * 60)
+        logger.info("Regeneration Complete!")
+        logger.info(f"  ✓ Regenerated: {stats['regenerated']}")
+        logger.error(f"  ✗ Failed: {stats['failed']}")
+        logger.info("=" * 60)
 
         return stats['failed'] == 0
 
     except Exception as e:
         db.rollback()
-        print(f"\n✗ Error: {e}")
+        logger.error(f"\n✗ Error: {e}")
         return False
 
     finally:
@@ -101,9 +102,9 @@ def regenerate_all_recipe_embeddings():
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 60)
-    print("⚠ WARNING: This will regenerate embeddings for ALL recipes")
-    print("=" * 60)
+    logger.warning("=" * 60)
+    logger.warning("WARNING: This will regenerate embeddings for ALL recipes")
+    logger.warning("=" * 60)
 
     response = input("\nDo you want to continue? (yes/no): ")
 
@@ -111,5 +112,5 @@ if __name__ == "__main__":
         success = regenerate_all_recipe_embeddings()
         sys.exit(0 if success else 1)
     else:
-        print("\n✗ Cancelled")
+        logger.info("Cancelled")
         sys.exit(1)

@@ -10,9 +10,12 @@ from typing import Dict, List, Any, Optional
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import reflection
 from dotenv import load_dotenv
+from libs.utils.logger import setup_logger
 
 # Load environment variables
 load_dotenv()
+
+logger = setup_logger("schema_profiler", True, False, False, False)
 
 # Database configuration
 DB_HOST = os.getenv('DB_HOST', 'localhost')
@@ -436,8 +439,8 @@ class SchemaProfiler:
 
     def profile_database(self, schema: str = 'public') -> Dict[str, Any]:
         """Profile the entire database schema"""
-        print(f"Connecting to database: {DB_NAME}")
-        print(f"Host: {DB_HOST}:{DB_PORT}")
+        logger.info(f"Connecting to database: {DB_NAME}")
+        logger.info(f"Host: {DB_HOST}:{DB_PORT}")
 
         # Get all custom enum types
         enum_types = {}
@@ -448,10 +451,10 @@ class SchemaProfiler:
         tables = {}
         table_names = self.get_all_tables()
 
-        print(f"Found {len(table_names)} tables")
+        logger.info(f"Found {len(table_names)} tables")
 
         for table_name in table_names:
-            print(f"Profiling table: {table_name}")
+            logger.info(f"Profiling table: {table_name}")
             tables[table_name] = self.profile_table(table_name)
 
         # Build relationships summary
@@ -546,25 +549,25 @@ def main():
         f.write("SCHEMA_DATA = ")
         f.write(json.dumps(schema, indent=2, default=str))
 
-    print("\n" + "="*60)
-    print("Schema profiler generated successfully!")
-    print("="*60)
-    print(f"Tables profiled: {len(schema['tables'])}")
-    print(f"Relationships found: {len(schema['relationships'])}")
-    print(f"Enum types: {len(schema['enum_types'])}")
-    print("\nOutput files:")
-    print("  - schema_profiler.json  (JSON format)")
-    print("  - schema_profiler.md    (Markdown for AI prompts)")
-    print("  - schema_profiler_data.py (Python module)")
+    logger.info("\n" + "="*60)
+    logger.info("Schema profiler generated successfully!")
+    logger.info("="*60)
+    logger.info(f"Tables profiled: {len(schema['tables'])}")
+    logger.info(f"Relationships found: {len(schema['relationships'])}")
+    logger.info(f"Enum types: {len(schema['enum_types'])}")
+    logger.info("\nOutput files:")
+    logger.info("  - schema_profiler.json  (JSON format)")
+    logger.info("  - schema_profiler.md    (Markdown for AI prompts)")
+    logger.info("  - schema_profiler_data.py (Python module)")
 
     # Print summary
-    print("\n" + "="*60)
-    print("TABLES SUMMARY")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("TABLES SUMMARY")
+    logger.info("="*60)
     for table_name, table_info in schema['tables'].items():
         col_count = len(table_info['columns'])
         fk_count = len(table_info['foreign_keys'])
-        print(f"{table_name}: {col_count} columns, {fk_count} foreign keys")
+        logger.info(f"{table_name}: {col_count} columns, {fk_count} foreign keys")
 
 
 if __name__ == "__main__":

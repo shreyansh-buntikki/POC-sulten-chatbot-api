@@ -60,7 +60,7 @@ app.add_middleware(
 
 @app.exception_handler(AppException)
 async def app_exception_handler(request: Request, exc: AppException):
-    print(
+    logger.warning(
         f"⚠️ AppException Caught: {exc.__class__.__name__}, Status: {exc.status_code}, Message: {exc.message}"
     )
     return JSONResponse(
@@ -71,7 +71,7 @@ async def app_exception_handler(request: Request, exc: AppException):
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print(
+    logger.error(
         f"🚨 Unhandled Exception: {exc.__class__.__name__}, Message: {str(exc)}"
     )
     return JSONResponse(
@@ -103,4 +103,4 @@ app.include_router(admin_route)
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=HOST, port=FASTAPI_PORT, reload=True)
+    uvicorn.run("app:app", host=HOST, port=FASTAPI_PORT, reload=False)

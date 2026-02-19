@@ -131,10 +131,14 @@ def get_schema_summary() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     # Test the module
-    print("Schema Profiler Data Module")
-    print("=" * 50)
-    print(f"Database: {_SCHEMA_PROFILER.get('database_name')}")
-    print(f"Schema: {_SCHEMA_PROFILER.get('schema')}")
-    print(f"Total Tables: {len(get_tables())}")
-    print(f"\nTables: {', '.join(get_tables()[:10])}...")
-    print(f"\nTotal Relationships: {len(get_all_relationships())}")
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_MODULE_DIR)))))
+    from libs.utils.logger import setup_logger as _setup_logger
+    _logger = _setup_logger("schema_profiler_data", True, False, False, False)
+    _logger.info("Schema Profiler Data Module")
+    _logger.info("=" * 50)
+    _logger.info(f"Database: {_SCHEMA_PROFILER.get('database_name')}")
+    _logger.info(f"Schema: {_SCHEMA_PROFILER.get('schema')}")
+    _logger.info(f"Total Tables: {len(get_tables())}")
+    _logger.info(f"Tables: {', '.join(get_tables()[:10])}...")
+    _logger.info(f"Total Relationships: {len(get_all_relationships())}")

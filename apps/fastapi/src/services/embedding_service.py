@@ -61,7 +61,7 @@ class EmbeddingService:
             )
             return response.data[0].embedding
         except Exception as e:
-            print(f"Error generating embedding: {e}")
+            logger.error(f"Error generating embedding: {e}")
             return None
 
     def generate_batch_embeddings(self, texts: List[str]) -> List[Optional[List[float]]]:
@@ -84,7 +84,7 @@ class EmbeddingService:
             )
             return [item.embedding for item in response.data]
         except Exception as e:
-            print(f"Error generating batch embeddings: {e}")
+            logger.error(f"Error generating batch embeddings: {e}")
             return [None] * len(texts)
 
     # =====================================================
@@ -364,7 +364,7 @@ class EmbeddingService:
                     stats["processed"] += 1
                 except Exception as e:
                     self.db.rollback()
-                    print(f"Error saving embedding for ingredient {ingredient.id}: {e}")
+                    logger.error(f"Error saving embedding for ingredient {ingredient.id}: {e}")
                     stats["failed"] += 1
             else:
                 stats["failed"] += 1
@@ -489,5 +489,5 @@ class EmbeddingService:
             return True
         except Exception as e:
             self.db.rollback()
-            print(f"Error updating embedding for recipe {recipe_id}: {e}")
+            logger.error(f"Error updating embedding for recipe {recipe_id}: {e}")
             return False

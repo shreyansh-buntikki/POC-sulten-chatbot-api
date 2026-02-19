@@ -30,7 +30,7 @@ SIMILARITY_THRESHOLD = 0.85
 CACHE_TTL = 3600  # 1 hour
 
 # LLM model for category expansion
-LLM_MODEL = os.getenv('INGREDIENT_MATCHER_MODEL', 'gpt-4o-mini')
+LLM_MODEL = os.getenv('INGREDIENT_MATCHER_MODEL')
 
 # ============================================================================
 # CATEGORY DEFINITIONS
@@ -296,7 +296,7 @@ PREDEFINED_ALLERGEN_EXPANSIONS: Dict[str, List[str]] = {
 
     # Poultry
     "poultry": ["poultry", "chicken", "turkey", "duck", "goose", "quail"],
-    "chicken": ["chicken", "poultry", "chicken breast", "chicken thigh", "drumstick"],
+    "chicken": ["chicken", "poultry", "chicken breast", "chicken thigh"],
 
     # Spices - top 15
     "spice": ["spice", "cinnamon", "cumin", "turmeric", "paprika", "ginger",

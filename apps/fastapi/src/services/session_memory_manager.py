@@ -39,6 +39,10 @@ class SessionFilters:
     season: Optional[str] = None  # summer, winter, etc.
     region: Optional[str] = None  # regional preference
     creator_uid: Optional[str] = None  # filter by recipe creator
+    # Persisted filter state for multi-turn context
+    cost_filter: Optional[Dict[str, Any]] = None  # e.g. {"operator": "<=", "value": 100, "country": "Norway", "sort_order": "DESC"}
+    time_filter: Optional[Dict[str, Any]] = None  # e.g. {"sort_order": "ASC"}
+    nutrition_filter: Optional[Dict[str, Any]] = None  # e.g. {"sort_by": "protein", "order": "DESC", "level": "high"}
 
 
 @dataclass
@@ -84,6 +88,11 @@ class ContextEntities:
 
     # NEW: Search cache for "show more" feature
     search_cache: Dict[str, Any] = field(default_factory=dict)
+
+    # NEW: Pricing context for multi-turn pricing queries
+    # e.g., Q1 "price of clove" → Q2 "and in India?" reuses last_pricing_item
+    last_pricing_item: Optional[str] = None       # ingredient/recipe name last priced
+    last_pricing_item_type: Optional[str] = None  # "ingredient" or "recipe"
 
 
 @dataclass
@@ -236,7 +245,7 @@ class SessionMemoryManager:
                 self.redis_client = redis.from_url(redis_url)
                 self.redis_client.ping()
             except Exception as e:
-                print(f"Redis connection failed: {e}. Falling back to in-memory.")
+                logger.warning(f"Redis connection failed: {e}. Falling back to in-memory.")
                 self.use_redis = False
                 self.redis_client = None
         else:
@@ -453,7 +462,20 @@ class SessionMemoryManager:
                 # Check if this is a recipe search query
                 is_recipe_search = any(keyword in content for keyword in recipe_keywords)
 
-                if is_recipe_search:
+                # Skip extraction if this is clearly an exclusion/dislike message.
+                # Phrases like "I dont like chicken recipes" contain "recipes" which
+                # would falsely trigger is_recipe_search and set last_vector_query
+                # to "chicken" — making the next stage think there was a prior
+                # positive chicken search and triggering an unnecessary embedding.
+                exclusion_indicators = [
+                    "dont like", "don't like", "do not like", "i hate",
+                    "allergic", "allergy", "can't have", "cannot have",
+                    "i'm not a fan", "im not a fan", "not a fan",
+                    "avoid", "without", "exclude",
+                ]
+                is_exclusion_query = any(indicator in content for indicator in exclusion_indicators)
+
+                if is_recipe_search and not is_exclusion_query:
                     # Try to extract main ingredient/dish from the query
                     # Simple approach: look for common ingredients/dishes
                     common_ingredients = [
@@ -506,7 +528,7 @@ class SessionMemoryManager:
                     logger.info(f"[SESSION LOAD] Loaded session {session_id} from Redis with context: {loaded_session.context_entities}")
                     return loaded_session
             except Exception as e:
-                print(f"Redis get failed: {e}")
+                logger.warning(f"Redis get failed: {e}")
 
         return cached_session
 
@@ -521,7 +543,6 @@ class SessionMemoryManager:
         session.update_timestamp()
 
         # Debug logging
-        logger.info(f"[SESSION SAVE] Saving session {session.session_id} with context_entities: {session.context_entities}")
         logger.info(f"[SESSION SAVE] last_vector_query: {session.context_entities.last_vector_query}")
 
         if self.use_redis and self.redis_client:
@@ -532,7 +553,7 @@ class SessionMemoryManager:
                     json.dumps(session.to_dict())
                 )
             except Exception as e:
-                print(f"Redis save failed: {e}")
+                logger.warning(f"Redis save failed: {e}")
 
         self._memory_cache[session.session_id] = session
 
@@ -551,7 +572,7 @@ class SessionMemoryManager:
             try:
                 self.redis_client.delete(f"session:{session_id}")
             except Exception as e:
-                print(f"Redis delete failed: {e}")
+                logger.warning(f"Redis delete failed: {e}")
 
         self._memory_cache.pop(session_id, None)
 
@@ -587,12 +608,21 @@ class SessionMemoryManager:
             if ingredient not in session.excluded_ingredients:
                 session.excluded_ingredients.append(ingredient)
 
-        # Update included ingredients ONLY if explicitly mentioned
+        # Update included ingredients ONLY if explicitly mentioned AND not excluded.
+        # NLID sometimes echoes the disliked ingredient in entities.ingredients
+        # (e.g. "I dont like chicken" → entities.ingredients=["chicken"]).
+        # Adding it to session.included_ingredients causes has_positive_context=True
+        # downstream, which then prevents the correct SQL_ONLY routing for pure
+        # exclusion queries.
         entities = nlid_result.get('entities', {})
         included_ingredients = entities.get('ingredients', [])
+        excluded_set_lower = {e.lower() for e in excluded_ingredients}
 
         for ingredient in included_ingredients:
-            if ingredient not in session.included_ingredients:
+            if (
+                ingredient not in session.included_ingredients
+                and ingredient.lower() not in excluded_set_lower
+            ):
                 session.included_ingredients.append(ingredient)
 
         # Update filters if provided
@@ -623,9 +653,30 @@ class SessionMemoryManager:
         if filters.get('regional'):
             session.filters.region = filters['regional'][0]  # Take first
 
-        # Handle creator_uid filter (resolved from creator_name in pipeline)
+        # Handle creator_uid filter (resolved from creator_name in pipeline).
+        # Normalise to a plain string; the NLID agent can occasionally return a list.
         if filters.get('creator_uid'):
-            session.filters.creator_uid = filters['creator_uid']
+            raw_uid = filters['creator_uid']
+            if isinstance(raw_uid, list):
+                raw_uid = raw_uid[0] if raw_uid else None
+            if raw_uid and isinstance(raw_uid, str):
+                session.filters.creator_uid = raw_uid
+
+        # Persist cost filter for multi-turn context
+        # e.g., Q1: "quick recipes" → Q2: "my budget is 100" → both filters apply
+        if filters.get('cost'):
+            session.filters.cost_filter = filters['cost']
+            logger.info(f"[SESSION UPDATE] Persisted cost_filter: {filters['cost']}")
+
+        # Persist time filter for multi-turn context
+        if filters.get('time'):
+            session.filters.time_filter = filters['time']
+            logger.info(f"[SESSION UPDATE] Persisted time_filter: {filters['time']}")
+
+        # Persist nutrition filter for multi-turn context
+        if filters.get('nutrition'):
+            session.filters.nutrition_filter = filters['nutrition']
+            logger.info(f"[SESSION UPDATE] Persisted nutrition_filter: {filters['nutrition']}")
 
         # Save and return
         session.increment_turn()
@@ -664,6 +715,9 @@ class SessionMemoryManager:
                 "season": session.filters.season,
                 "region": session.filters.region,
                 "creator_uid": session.filters.creator_uid,
+                "cost_filter": session.filters.cost_filter,
+                "time_filter": session.filters.time_filter,
+                "nutrition_filter": session.filters.nutrition_filter,
             },
             "context_entities": {
                 "last_referenced_recipe_id": session.context_entities.last_referenced_recipe_id,

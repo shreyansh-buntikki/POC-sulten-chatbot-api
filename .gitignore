@@ -25,3 +25,4 @@ database/migrations
 .agents
 .claude
 .venv
+mcp.config.json
