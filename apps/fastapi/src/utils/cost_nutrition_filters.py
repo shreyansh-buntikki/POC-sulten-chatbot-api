@@ -175,8 +175,8 @@ def extract_cost_filter(query: str) -> Optional[Dict[str, Any]]:
         # "$20 or less", "20$ max", "20 dollars maximum"
         r'[\$₹]?\s*(\d+(?:\.\d+)?)\s*(?:[$₹]|dollars?|rupees?|rs\.?|kr|nok)?\s*(?:or\s+less|max|maximum|budget)',
 
-        # "budget of $20", "budget 20$"
-        r'budget\s*(?:of)?\s*[\$₹]?\s*(\d+(?:\.\d+)?)\s*(?:[$₹]|dollars?|rupees?|rs\.?|kr|nok)?',
+        # "budget of $20", "budget 20$", "budget is 500", "my budget is $20"
+        r'budget\s*(?:of|is)?\s*[\$₹]?\s*(\d+(?:\.\d+)?)\s*(?:[$₹]|dollars?|rupees?|rs\.?|kr|nok)?',
 
         # "for under 20", "for less than 20"
         r'for\s+(?:under|less\s+than)\s*[\$₹]?\s*(\d+(?:\.\d+)?)',
@@ -186,6 +186,9 @@ def extract_cost_filter(query: str) -> Optional[Dict[str, Any]]:
 
         # "can I make under 20", "make for under 20"
         r'(?:can\s+i\s+)?make\s+(?:for\s+)?(?:under|less\s+than)\s*[\$₹]?\s*(\d+(?:\.\d+)?)',
+
+        # "cook under 500", "cook for 200"
+        r'cook\s+(?:under|for)\s*[\$₹]?\s*(\d+(?:\.\d+)?)',
     ]
 
     for pattern in patterns:
@@ -197,10 +200,33 @@ def extract_cost_filter(query: str) -> Optional[Dict[str, Any]]:
                     "operator": "<=",
                     "value": value,
                     "country": country,
-                    "currency_symbol": currency_symbol
+                    "currency_symbol": currency_symbol,
+                    "sort_order": "DESC"  # Sort DESC so recipes nearest to budget come first
                 }
             except (ValueError, IndexError):
                 continue
+
+    # Check for qualitative cost queries (no specific value)
+    qualitative_low = ["cheap", "budget", "affordable", "low cost", "low budget", "budget friendly", "inexpensive"]
+    qualitative_high = ["expensive", "premium", "high cost", "luxury", "pricey"]
+
+    for keyword in qualitative_low:
+        if keyword in query_lower:
+            return {
+                "country": country,
+                "currency_symbol": currency_symbol,
+                "sort_order": "ASC",  # Cheapest first
+                "level": "low"
+            }
+
+    for keyword in qualitative_high:
+        if keyword in query_lower:
+            return {
+                "country": country,
+                "currency_symbol": currency_symbol,
+                "sort_order": "DESC",  # Most expensive first
+                "level": "high"
+            }
 
     return None
 

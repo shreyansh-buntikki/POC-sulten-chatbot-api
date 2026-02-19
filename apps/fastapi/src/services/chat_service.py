@@ -100,11 +100,7 @@ class ChatService:
 
             for item in sessions_to_delete:
                 session_to_delete = item["session"]
-                logger.info(f"[CHAT SERVICE] Deleting old session {session_to_delete.id} for user {user_uid}")
                 self.conversation_store.delete_session(str(session_to_delete.id))
-
-            if sessions_to_delete:
-                logger.info(f"[CHAT SERVICE] Cleaned up {len(sessions_to_delete)} old sessions for user {user_uid}")
 
         except Exception as e:
             logger.error(f"[CHAT SERVICE] Error cleaning up old sessions for user {user_uid}: {e}")
@@ -441,7 +437,6 @@ class ChatService:
             # Create new session (either new_session=True or no existing session found)
             title = message[:50] + "..." if len(message) > 50 else message
             session = self.conversation_store.create_session(user_uid, title)
-            logger.info(f"[CHAT SERVICE] Created new session: {session.id}")
 
             # Cleanup old sessions - maintain max 5 sessions per user
             if user_uid:

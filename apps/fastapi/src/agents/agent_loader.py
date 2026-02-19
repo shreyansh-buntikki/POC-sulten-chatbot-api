@@ -35,7 +35,7 @@ def _get_all_agent_prompts() -> Dict[str, AgentPromptInfo]:
             agent_name="NLID Agent",
             description="Natural Language Intent Detection - Analyzes user queries to detect intent and extract entities for recipe and cooking platform",
             current_prompt=DEFAULT_NLID_PROMPT,
-            model_name=NLID_AGENT_MODEL or "gpt-4o-mini",
+            model_name=NLID_AGENT_MODEL,
             is_active=True
         )
     except ImportError as e:
@@ -49,7 +49,7 @@ def _get_all_agent_prompts() -> Dict[str, AgentPromptInfo]:
             agent_name="NLG Agent",
             description="Natural Language Generation - Generates warm, friendly responses for recipe recommendations and cooking assistance",
             current_prompt=DEFAULT_NLG_PROMPT,
-            model_name=NLG_AGENT_MODEL or "gpt-4o-mini",
+            model_name=NLG_AGENT_MODEL,
             is_active=True
         )
     except ImportError as e:
@@ -63,7 +63,7 @@ def _get_all_agent_prompts() -> Dict[str, AgentPromptInfo]:
             agent_name="Nutritional Agent",
             description="Nutrition Expert - Helps users understand nutritional content of recipes and ingredients",
             current_prompt=DEFAULT_NUTRITIONAL_PROMPT,
-            model_name=NUTRITIONAL_AGENT_MODEL or "gpt-4o-mini",
+            model_name=NUTRITIONAL_AGENT_MODEL,
             is_active=True
         )
     except ImportError as e:
@@ -77,7 +77,7 @@ def _get_all_agent_prompts() -> Dict[str, AgentPromptInfo]:
             agent_name="Recipe Agent",
             description="Recipe Search Specialist - Helps users discover recipes that match their needs",
             current_prompt=DEFAULT_RECIPE_PROMPT,
-            model_name=RECIPE_AGENT_MODEL or "gpt-4o-mini",
+            model_name=RECIPE_AGENT_MODEL,
             is_active=True
         )
     except ImportError as e:
@@ -95,7 +95,7 @@ def _get_all_agent_prompts() -> Dict[str, AgentPromptInfo]:
             agent_name="Orchestrator Agent",
             description="Main Cooking Assistant Coordinator - Routes user queries to appropriate agents and manages the conversation flow",
             current_prompt=DEFAULT_ORCHESTRATOR_PROMPT,
-            model_name=ORCHESTRATOR_AGENT_MODEL or "gpt-4o-mini",
+            model_name=ORCHESTRATOR_AGENT_MODEL,
             is_active=True
         )
         prompts["cooking_guardrail"] = AgentPromptInfo(
@@ -103,7 +103,7 @@ def _get_all_agent_prompts() -> Dict[str, AgentPromptInfo]:
             agent_name="Cooking Guardrail",
             description="Guardrail Agent - Checks if user queries are related to cooking, recipes, food, or kitchen activities",
             current_prompt=DEFAULT_COOKING_GUARDRAIL_PROMPT,
-            model_name=ORCHESTRATOR_AGENT_MODEL or "gpt-4o-mini",
+            model_name=ORCHESTRATOR_AGENT_MODEL,
             is_active=True
         )
     except ImportError as e:
