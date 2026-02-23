@@ -103,4 +103,4 @@ app.include_router(admin_route)
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=HOST, port=FASTAPI_PORT, reload=False)
+    uvicorn.run("app:app", host=HOST, port=FASTAPI_PORT, reload=True)

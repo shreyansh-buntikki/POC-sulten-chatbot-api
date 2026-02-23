@@ -602,6 +602,97 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         # Collapse extra blank lines left behind by comment removal
         sql = re.sub(r'\n{3,}', '\n\n', sql).strip()
 
+        # ------------------------------------------------------------------
+        # Fix unclosed EXISTS/NOT EXISTS clauses before r."name" references
+        # This happens when LLM generates allergen filters inside EXISTS
+        # Pattern: EXISTS (... WHERE ...) followed by AND (r."name" ...) at same level
+        # ------------------------------------------------------------------
+        def fix_unclosed_exists_before_rname(sql_str: str) -> str:
+            """
+            Find unclosed EXISTS clauses and close them before r."name" references.
+            The pattern we're fixing is:
+              AND EXISTS (SELECT ... WHERE ...condition...)
+              AND (r."name" ...)  <-- This AND should be OUTSIDE the EXISTS
+
+            We need to close the EXISTS before the AND that has r."name".
+            """
+            # Pattern: EXISTS ( followed by content, then AND (r."name" at depth 1
+            # We need to insert ) before the AND that has r."name"
+            result = []
+            i = 0
+            n = len(sql_str)
+
+            while i < n:
+                # Look for EXISTS ( or NOT EXISTS (
+                upper_from_i = sql_str[i:i+20].upper()
+                if 'EXISTS (' in upper_from_i or 'EXISTS(' in upper_from_i:
+                    # Find the opening paren of EXISTS
+                    exists_start = i
+                    paren_pos = sql_str.find('(', i)
+                    if paren_pos == -1:
+                        result.append(sql_str[i])
+                        i += 1
+                        continue
+
+                    # Track depth and look for r."name" at depth 1
+                    depth = 0
+                    in_str = False
+                    j = paren_pos
+                    rname_pos = -1
+
+                    while j < n:
+                        c = sql_str[j]
+                        if c == "'" and not in_str:
+                            in_str = True
+                        elif c == "'" and in_str:
+                            in_str = False
+                        elif not in_str:
+                            if c == '(':
+                                depth += 1
+                            elif c == ')':
+                                depth -= 1
+                                if depth == 0:
+                                    # EXISTS properly closed
+                                    break
+                            # Check for r."name" or r."ingress" at depth 1
+                            # This means we're still inside EXISTS but referencing outer table
+                            if depth == 1:
+                                remaining = sql_str[j:j+20]
+                                if remaining.startswith('r."name"') or remaining.startswith('r."ingress"'):
+                                    rname_pos = j
+                                    break
+                        j += 1
+
+                    if rname_pos != -1:
+                        # Found r."name" inside unclosed EXISTS
+                        # Look backwards for the AND that starts this block
+                        # Pattern: newline + whitespace + AND + whitespace + (
+                        and_pattern = re.compile(r'\n(\s*)AND\s*\(', re.IGNORECASE)
+                        # Search in the segment from paren_pos to rname_pos
+                        segment = sql_str[paren_pos:rname_pos]
+                        matches = list(and_pattern.finditer(segment))
+                        if matches:
+                            # Use the last match (the AND just before r."name")
+                            last_match = matches[-1]
+                            # Position in original string
+                            and_pos = paren_pos + last_match.start()
+                            indent = last_match.group(1)
+                            # Insert ) before the AND with proper indentation
+                            result.append(sql_str[i:and_pos])
+                            result.append(f'\n{indent})\n')
+                            result.append(sql_str[and_pos:])
+                            logger.info(
+                                f"[SQL FIXER] Closed unclosed EXISTS clause before r.\"name\" at position {and_pos}"
+                            )
+                            return ''.join(result)
+
+                result.append(sql_str[i])
+                i += 1
+
+            return sql_str
+
+        sql = fix_unclosed_exists_before_rname(sql)
+
         # Find LIMIT clause
         limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
         if not limit_match:
@@ -718,6 +809,117 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             i += 1
 
         return len(sql)
+
+    def _close_unclosed_exists(self, sql: str) -> str:
+        """
+        Find and close any unclosed EXISTS/NOT EXISTS clauses.
+        This is critical before injecting exclusion clauses.
+
+        The problem: LLM sometimes generates SQL like:
+            AND EXISTS (SELECT ... WHERE ...)
+            AND (r."name" NOT ILIKE '%chicken%' ...)
+
+        Where the EXISTS is not closed before the next AND clause.
+        This causes r."name" references to be inside the EXISTS subquery,
+        which is invalid (r is not in scope inside the subquery).
+
+        The fix: Detect unclosed EXISTS and insert closing ) before the
+        AND that starts with r."name" or r."ingress" references.
+        """
+        import re
+
+        # Find all EXISTS ( and NOT EXISTS ( positions
+        result = []
+        i = 0
+        n = len(sql)
+        modified = False
+
+        while i < n:
+            # Check for EXISTS ( pattern (case insensitive)
+            remaining = sql[i:]
+            exists_match = re.search(r'\bEXISTS\s*\(', remaining, re.IGNORECASE)
+            not_exists_match = re.search(r'\bNOT\s+EXISTS\s*\(', remaining, re.IGNORECASE)
+
+            # Use whichever comes first
+            if not_exists_match and (not exists_match or not_exists_match.start() < exists_match.start()):
+                match = not_exists_match
+                is_not = True
+            elif exists_match:
+                match = exists_match
+                is_not = False
+            else:
+                # No more EXISTS found, append rest and exit
+                result.append(sql[i:])
+                break
+
+            # Add content up to and including EXISTS (
+            match_start = i + match.start()
+            match_end = i + match.end()
+            result.append(sql[i:match_end])
+            i = match_end
+
+            # Track parentheses depth to find where EXISTS should close
+            # Also look for r."name" references which indicate we've exited the subquery scope
+            depth = 1  # Already inside the EXISTS (
+            in_str = False
+            j = i
+            found_rname = -1
+            proper_close = -1
+
+            while j < n:
+                c = sql[j]
+                if c == "'" and not in_str:
+                    in_str = True
+                elif c == "'" and in_str:
+                    in_str = False
+                elif not in_str:
+                    if c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            # EXISTS properly closed
+                            proper_close = j
+                            break
+                    # Check for r."name" or r."ingress" at depth 1
+                    # This indicates we're still inside EXISTS but referencing outer table
+                    if depth == 1:
+                        # Look for pattern: newline + whitespace + AND + whitespace + ( + r."
+                        lookahead = sql[j:j+50]
+                        rname_pattern = re.match(r'\s*AND\s*\(\s*r\."', lookahead, re.IGNORECASE)
+                        if rname_pattern:
+                            found_rname = j
+                            break
+                j += 1
+
+            if found_rname != -1 and proper_close == -1:
+                # EXISTS not properly closed, but found r."name" reference
+                # Insert closing ) before the AND that has r."name"
+                # Find the exact position of AND
+                and_match = re.search(r'\s*AND\s*\(', sql[found_rname:found_rname+50], re.IGNORECASE)
+                if and_match:
+                    insert_pos = found_rname + and_match.start()
+                    result.append(sql[i:insert_pos])
+                    result.append('\n)\n')
+                    result.append(sql[insert_pos:])
+                    logger.info(
+                        f"[SQL FIXER] Closed unclosed EXISTS clause before r.\"name\" reference"
+                    )
+                    modified = True
+                    break
+
+            if proper_close != -1:
+                # EXISTS properly closed, continue from there
+                result.append(sql[i:proper_close+1])
+                i = proper_close + 1
+            else:
+                # No proper close and no r."name" found - add rest and let _ensure_valid_sql handle it
+                result.append(sql[i:])
+                break
+
+        if modified:
+            return ''.join(result)
+        return sql
 
     def _build_allergen_exclusion_clause(
         self,
@@ -1011,6 +1213,56 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             flags=re.IGNORECASE | re.DOTALL,
         )
 
+        # Pattern F: MALFORMED NOT EXISTS with r."name"/r."ingress" nested inside
+        # This handles the case where LLM puts r."name" checks INSIDE a NOT EXISTS subquery:
+        # AND NOT EXISTS (SELECT ... WHERE ... AND (r."name" NOT ILIKE '%X%' ...))
+        # This is syntactically wrong - r."name" is from outer query, not the subquery
+        # We need to remove the entire NOT EXISTS block and the nested AND (...) blocks
+        for ing in excluded_ingredients:
+            ing_escaped = re.escape(ing.lower())
+            # Pattern for malformed NOT EXISTS containing r."name" checks
+            malformed_pattern = (
+                r"AND\s+NOT\s+EXISTS\s*\(\s*SELECT\s+[^)]+?"
+                r"WHERE\s+[^)]*?"
+                r"AND\s*\(\s*"
+                r"r\.\"name\"\s+NOT\s+ILIKE\s+'%" + ing_escaped + r"%'"
+                r"[^)]*\)"
+                r"[^)]*\)"
+            )
+            sql_cleaned = re.sub(
+                malformed_pattern,
+                "",
+                sql_cleaned,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
+        # Pattern G: Aggressive cleanup - remove ANY r."name" or r."ingress" NOT ILIKE
+        # that references an excluded ingredient, regardless of context
+        # This catches edge cases the above patterns miss
+        for ing in excluded_ingredients:
+            ing_escaped = re.escape(ing.lower())
+            # Remove r."name" NOT ILIKE '%ingredient%'
+            sql_cleaned = re.sub(
+                rf"AND\s+r\.\s*\"name\"\s+NOT\s+ILIKE\s+'%{ing_escaped}%'",
+                "",
+                sql_cleaned,
+                flags=re.IGNORECASE,
+            )
+            # Remove r."ingress" NOT ILIKE '%ingredient%'
+            sql_cleaned = re.sub(
+                rf"AND\s+r\.\s*\"ingress\"\s+NOT\s+ILIKE\s+'%{ing_escaped}%'",
+                "",
+                sql_cleaned,
+                flags=re.IGNORECASE,
+            )
+            # Remove nested AND (...) blocks containing r."name" NOT ILIKE
+            sql_cleaned = re.sub(
+                rf"AND\s*\(\s*r\.\s*\"name\"\s+NOT\s+ILIKE\s+'%{ing_escaped}%'[^)]*\)",
+                "",
+                sql_cleaned,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+
         # Clean up orphaned empty AND () wrappers left by the removals above.
         # Run in a loop to handle nested cases (inner removed first, then outer).
         for _ in range(5):
@@ -1028,9 +1280,13 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
                 "[ALLERGEN INJECTION] Removed existing LLM-generated "
                 "allergen filter blocks"
             )
-        # Re-balance after regex removals so the injected exclusion clause
-        # is appended at top-level WHERE scope.
-        sql = self._ensure_valid_sql(sql_cleaned)
+
+        # ------------------------------------------------------------------
+        # CRITICAL: Close any unclosed EXISTS/NOT EXISTS clauses BEFORE
+        # injecting the exclusion clause. Otherwise the exclusion will be
+        # injected inside the EXISTS where r."name" references are invalid.
+        # ------------------------------------------------------------------
+        sql_cleaned = self._close_unclosed_exists(sql_cleaned)
 
         # ------------------------------------------------------------------
         # Step 2: Build the programmatic exclusion clause
@@ -1048,7 +1304,7 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         #         append exclusion to WHERE body, re-attach trailing clauses.
         #         This is 100% reliable — no paren counting needed.
         # ------------------------------------------------------------------
-        body, trailing = self._strip_trailing_clauses(sql)
+        body, trailing = self._strip_trailing_clauses(sql_cleaned)
         if trailing.strip():
             sql = body + "\n" + exclusion_clause + trailing
             logger.info(

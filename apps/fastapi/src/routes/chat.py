@@ -146,6 +146,7 @@ class ChatRoutes:
         - Language header filters recipes by languageId
         - **Response caching**: Repeated queries return instantly from cache (5 min TTL)
         """
+        logger.info("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
         logger.info(f"Message received - session: {request.session_id}, user: {request.user_uid}, new_session: {request.new_session}, language: {language}")
 
         # Log custom prompts if provided

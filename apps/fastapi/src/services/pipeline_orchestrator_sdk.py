@@ -628,6 +628,19 @@ class RecipeSearchPipelineSDK:
                 "i am gluten-free": "gluten-free",
                 "i'm gluten-free": "gluten-free",
                 "gluten free": "gluten-free",
+                # Non-veg patterns (means vegetarian)
+                "don't eat non veg": "vegetarian",
+                "dont eat non veg": "vegetarian",
+                "don't eat non-veg": "vegetarian",
+                "dont eat non-veg": "vegetarian",
+                "no non veg": "vegetarian",
+                "no non-veg": "vegetarian",
+                "non veg free": "vegetarian",
+                "non-veg free": "vegetarian",
+                "vegetarian only": "vegetarian",
+                "veg only": "vegetarian",
+                "no meat": "vegetarian",
+                "meat free": "vegetarian",
             }
 
             for pattern, tag in dietary_patterns.items():
@@ -718,6 +731,36 @@ class RecipeSearchPipelineSDK:
                                 nlid_result_dict["filters"]["tags"] = []
                             nlid_result_dict["filters"]["tags"].extend(mentioned_tags)
 
+                        # ============ VEGETARIAN EXCLUSION ============
+                        # If user mentioned vegetarian, add non-veg ingredients to exclusions
+                        if "vegetarian" in mentioned_tags:
+                            NON_VEGETARIAN_INGREDIENTS = [
+                                # Eggs - ILIKE '%egg%' catches egg, eggs, egg white, egg yolk, etc.
+                                "egg", "eggs",
+                                # General meat - ILIKE '%meat%' catches meat, meats, minced meat, etc.
+                                "meat", "meats",
+                                # Poultry
+                                "chicken", "chickens", "turkey", "duck", "ducks", "goose", "geese", "quail",
+                                # Red meat
+                                "beef", "pork", "lamb", "mutton", "goat", "veal", "venison",
+                                # Processed meat
+                                "bacon", "ham", "sausage", "sausages", "salami", "pepperoni", "lard",
+                                "prosciutto", "chorizo", "hotdog", "hot dog", "hot dogs",
+                                # Fish & seafood
+                                "fish", "fishes", "seafood", "shellfish", "prawn", "prawns",
+                                "shrimp", "shrimps", "crab", "crabs", "lobster", "lobsters", "oyster", "oysters",
+                                "mussel", "mussels", "scallop", "scallops", "clam", "clams", "anchovy", "anchovies",
+                                "tuna", "salmon", "cod", "halibut", "tilapia", "trout", "trouts",
+                                "sardine", "sardines", "mackerel", "herring", "catfish",
+                                # Animal-derived fats/stock
+                                "gelatin", "bone broth", "chicken broth", "beef broth",
+                                "chicken stock", "beef stock", "fish sauce", "anchovy paste",
+                            ]
+                            for non_veg in NON_VEGETARIAN_INGREDIENTS:
+                                if non_veg not in excluded_ingredients:
+                                    excluded_ingredients.append(non_veg)
+                            logger.info(f"[VEGETARIAN REFINEMENT] Added {len(NON_VEGETARIAN_INGREDIENTS)} non-veg ingredients to exclusions")
+
                         # Add allergies to excluded_ingredients if any
                         # Use SMART ingredient expansion (no LLM calls for specific ingredients)
                         expanded_allergens = excluded_ingredients  # Default to original list
@@ -764,10 +807,25 @@ class RecipeSearchPipelineSDK:
                         # Merge current expanded allergens with ALL previously stored allergens
                         # (e.g., garlic was stored in session.excluded_ingredients from Q2,
                         # tomato is new for Q3 — we need both in the SQL filter)
+                        # Also include any exclusions already in retrieval_plan.sql_filters
+                        # (e.g., vegetarian exclusions added by retrieval_strategy.py)
                         existing_exclusions = session.excluded_ingredients or []
+                        retrieval_plan_exclusions = (
+                            retrieval_plan.sql_filters.get("excluded_ingredients", [])
+                            if retrieval_plan and retrieval_plan.sql_filters
+                            else []
+                        )
                         merged_exclusions = list(dict.fromkeys(
-                            existing_exclusions + [a for a in expanded_allergens if a not in existing_exclusions]
+                            existing_exclusions
+                            + retrieval_plan_exclusions
+                            + [a for a in expanded_allergens
+                               if a not in existing_exclusions and a not in retrieval_plan_exclusions]
                         ))
+                        logger.info(
+                            f"[REFINEMENT] Merged exclusions: session={len(existing_exclusions)}, "
+                            f"retrieval_plan={len(retrieval_plan_exclusions)}, "
+                            f"new={len(expanded_allergens)}, total={len(merged_exclusions)}"
+                        )
                         # Also update session so future turns carry everything forward
                         session.excluded_ingredients = merged_exclusions
 
@@ -813,15 +871,20 @@ class RecipeSearchPipelineSDK:
                                 f"[REFINEMENT] original_vector_query '{original_vector_query}' is the excluded "
                                 f"ingredient — routing to SQL_ONLY to avoid zero-result embedding bias"
                             )
+                            # Merge session filters (cuisines, tags, etc.) with retrieval_plan filters
+                            _merged_sql_filters = {
+                                **{k: v for k, v in retrieval_plan.sql_filters.items()
+                                   if k != "excluded_ingredients"},
+                                "excluded_ingredients": merged_exclusions,
+                            }
+                            # Also include session cuisines if not already present
+                            if session.filters.cuisines and "cuisines" not in _merged_sql_filters:
+                                _merged_sql_filters["cuisines"] = session.filters.cuisines
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.SQL_ONLY,
                                 reasoning="Exclusion-only refinement: original vector query IS the excluded ingredient",
                                 vector_query=None,
-                                sql_filters={
-                                    **{k: v for k, v in retrieval_plan.sql_filters.items()
-                                       if k != "excluded_ingredients"},
-                                    "excluded_ingredients": merged_exclusions,
-                                },
+                                sql_filters=_merged_sql_filters,
                                 top_k=20
                             )
                         else:
@@ -830,15 +893,20 @@ class RecipeSearchPipelineSDK:
                             top_k = 50 if merged_exclusions else 20
                             logger.info(f"[ALLERGY] Using top_k={top_k} for hybrid refinement with allergens")
 
+                            # Merge session filters (cuisines, tags, etc.) with retrieval_plan filters
+                            _merged_sql_filters = {
+                                **{k: v for k, v in retrieval_plan.sql_filters.items()
+                                   if k != "excluded_ingredients"},
+                                "excluded_ingredients": merged_exclusions,
+                            }
+                            # Also include session cuisines if not already present
+                            if session.filters.cuisines and "cuisines" not in _merged_sql_filters:
+                                _merged_sql_filters["cuisines"] = session.filters.cuisines
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
                                 reasoning="Refinement search - preserving original search with allergy exclusion",
                                 vector_query=original_vector_query,
-                                sql_filters={
-                                    **{k: v for k, v in retrieval_plan.sql_filters.items()
-                                       if k != "excluded_ingredients"},
-                                    "excluded_ingredients": merged_exclusions,
-                                },
+                                sql_filters=_merged_sql_filters,
                                 top_k=top_k
                             )
 
@@ -852,6 +920,36 @@ class RecipeSearchPipelineSDK:
                         for tag in mentioned_tags:
                             if tag not in session.filters.tags:
                                 session.filters.tags.append(tag)
+
+                        # ============ VEGETARIAN EXCLUSION ============
+                        # If user mentioned vegetarian, add non-veg ingredients to exclusions
+                        if "vegetarian" in mentioned_tags:
+                            NON_VEGETARIAN_INGREDIENTS = [
+                                # Eggs - ILIKE '%egg%' catches egg, eggs, egg white, egg yolk, etc.
+                                "egg", "eggs",
+                                # General meat - ILIKE '%meat%' catches meat, meats, minced meat, etc.
+                                "meat", "meats",
+                                # Poultry
+                                "chicken", "chickens", "turkey", "duck", "ducks", "goose", "geese", "quail",
+                                # Red meat
+                                "beef", "pork", "lamb", "mutton", "goat", "veal", "venison",
+                                # Processed meat
+                                "bacon", "ham", "sausage", "sausages", "salami", "pepperoni", "lard",
+                                "prosciutto", "chorizo", "hotdog", "hot dog", "hot dogs",
+                                # Fish & seafood
+                                "fish", "fishes", "seafood", "shellfish", "prawn", "prawns",
+                                "shrimp", "shrimps", "crab", "crabs", "lobster", "lobsters", "oyster", "oysters",
+                                "mussel", "mussels", "scallop", "scallops", "clam", "clams", "anchovy", "anchovies",
+                                "tuna", "salmon", "cod", "halibut", "tilapia", "trout", "trouts",
+                                "sardine", "sardines", "mackerel", "herring", "catfish",
+                                # Animal-derived fats/stock
+                                "gelatin", "bone broth", "chicken broth", "beef broth",
+                                "chicken stock", "beef stock", "fish sauce", "anchovy paste",
+                            ]
+                            for non_veg in NON_VEGETARIAN_INGREDIENTS:
+                                if non_veg not in excluded_ingredients:
+                                    excluded_ingredients.append(non_veg)
+                            logger.info(f"[VEGETARIAN] Added {len(NON_VEGETARIAN_INGREDIENTS)} non-veg ingredients to exclusions")
 
                         # Use SMART ingredient expansion (no LLM calls for specific ingredients)
                         expanded_allergens = excluded_ingredients  # Default to original list
@@ -933,14 +1031,38 @@ class RecipeSearchPipelineSDK:
                         # Merge new expanded allergens with ALL previously
                         # stored session exclusions so multi-turn exclusions
                         # accumulate correctly (e.g. Q2: "no egg" + Q3: "no potato").
+                        # Also include any exclusions already in retrieval_plan.sql_filters
+                        # (e.g., vegetarian exclusions added by retrieval_strategy.py)
                         existing_exclusions = session.excluded_ingredients or []
+                        retrieval_plan_exclusions = (
+                            retrieval_plan.sql_filters.get("excluded_ingredients", [])
+                            if retrieval_plan and retrieval_plan.sql_filters
+                            else []
+                        )
                         merged_exclusions = list(dict.fromkeys(
                             existing_exclusions
+                            + retrieval_plan_exclusions
                             + [a for a in expanded_allergens
-                               if a not in existing_exclusions]
+                               if a not in existing_exclusions and a not in retrieval_plan_exclusions]
                         ))
                         session.excluded_ingredients = merged_exclusions
                         self.session_manager.save_session(session)
+
+                        # Preserve other filters from the original retrieval_plan.sql_filters
+                        # (e.g., max_time, difficulty, cuisines, etc.)
+                        # Also include session filters that may have been set in previous turns
+                        preserved_filters = {
+                            k: v for k, v in (retrieval_plan.sql_filters or {}).items()
+                            if k not in ("excluded_ingredients", "exclude_ingredients", "tags")
+                        }
+                        # Include session cuisines if not already in preserved_filters
+                        if session.filters.cuisines and "cuisines" not in preserved_filters:
+                            preserved_filters["cuisines"] = session.filters.cuisines
+                        logger.info(
+                            f"[STANDALONE] Merged exclusions: session={len(existing_exclusions)}, "
+                            f"retrieval_plan={len(retrieval_plan_exclusions)}, "
+                            f"new={len(expanded_allergens)}, total={len(merged_exclusions)}"
+                        )
 
                         top_k = 50 if merged_exclusions else 20
                         if expanded_allergens and not has_positive_constraints:
@@ -949,7 +1071,10 @@ class RecipeSearchPipelineSDK:
                                 strategy=RetrievalStrategy.SQL_ONLY,
                                 reasoning="Standalone exclusion-only query – SQL filters full recipe table without embedding bias",
                                 vector_query=None,
-                                sql_filters={"excluded_ingredients": merged_exclusions},
+                                sql_filters={
+                                    **preserved_filters,
+                                    "excluded_ingredients": merged_exclusions,
+                                },
                                 top_k=top_k
                             )
                         else:
@@ -958,6 +1083,7 @@ class RecipeSearchPipelineSDK:
                                 reasoning="Standalone preference search with dietary constraints",
                                 vector_query=dietary_query,
                                 sql_filters={
+                                    **preserved_filters,
                                     "tags": mentioned_tags,
                                     "excluded_ingredients": merged_exclusions,
                                 },
@@ -984,10 +1110,25 @@ class RecipeSearchPipelineSDK:
                     for original_allergen in raw_allergens:
                         session = self.session_manager.add_allergy(session, original_allergen, new_expanded_allergens)
 
-                    # Merge with existing session exclusions
+                    # Merge with existing session exclusions AND any exclusions already in retrieval_plan
+                    # (e.g., vegetarian exclusions added by retrieval_strategy.py)
                     existing_exclusions = session.excluded_ingredients or []
-                    all_exclusions = list(set(existing_exclusions + new_expanded_allergens))
-                    logger.info(f"[ALLERGY] Merged exclusions: total={len(all_exclusions)}")
+                    retrieval_plan_exclusions = (
+                        retrieval_plan.sql_filters.get("excluded_ingredients", [])
+                        if retrieval_plan and retrieval_plan.sql_filters
+                        else []
+                    )
+                    all_exclusions = list(dict.fromkeys(
+                        existing_exclusions
+                        + retrieval_plan_exclusions
+                        + [a for a in new_expanded_allergens
+                           if a not in existing_exclusions and a not in retrieval_plan_exclusions]
+                    ))
+                    logger.info(
+                        f"[ALLERGY] Merged exclusions: session={len(existing_exclusions)}, "
+                        f"retrieval_plan={len(retrieval_plan_exclusions)}, "
+                        f"new={len(new_expanded_allergens)}, total={len(all_exclusions)}"
+                    )
 
                     # Update session's excluded_ingredients with merged list
                     session.excluded_ingredients = all_exclusions
@@ -2500,6 +2641,63 @@ class RecipeSearchPipelineSDK:
         for ing in filters.get("included_ingredients", []):
             if ing and ing not in filter_data["included_ingredients"]:
                 filter_data["included_ingredients"].append(ing)
+
+        # ============ VEGETARIAN EXCLUSION ============
+        # If user wants vegetarian, exclude all non-vegetarian ingredients
+        # This is more reliable than relying on the "vegetarian" tag alone
+        _tags = filter_data.get("tags", [])
+        if "vegetarian" in _tags:
+            NON_VEGETARIAN_INGREDIENTS = [
+                # Eggs - ILIKE '%egg%' catches egg, eggs, egg white, egg yolk, etc.
+                "egg", "eggs",
+                # General meat - ILIKE '%meat%' catches meat, meats, minced meat, etc.
+                "meat", "meats",
+                # Poultry
+                "chicken", "chickens", "turkey", "duck", "ducks", "goose", "geese", "quail",
+                # Red meat
+                "beef", "pork", "lamb", "mutton", "goat", "veal", "venison",
+                # Processed meat
+                "bacon", "ham", "sausage", "sausages", "salami", "pepperoni", "lard",
+                "prosciutto", "chorizo", "hotdog", "hot dog", "hot dogs",
+                # Fish & seafood
+                "fish", "fishes", "seafood", "shellfish", "prawn", "prawns",
+                "shrimp", "shrimps", "crab", "crabs", "lobster", "lobsters", "oyster", "oysters",
+                "mussel", "mussels", "scallop", "scallops", "clam", "clams", "anchovy", "anchovies",
+                "tuna", "salmon", "cod", "halibut", "tilapia", "trout", "trouts",
+                "sardine", "sardines", "mackerel", "herring", "catfish",
+                # Animal-derived fats/stock
+                "gelatin", "bone broth", "chicken broth", "beef broth",
+                "chicken stock", "beef stock", "fish sauce", "anchovy paste",
+            ]
+            existing_excluded = filter_data.get("excluded_ingredients", [])
+            existing_lower = {e.lower() for e in existing_excluded}
+            additional = [m for m in NON_VEGETARIAN_INGREDIENTS if m.lower() not in existing_lower]
+            filter_data["excluded_ingredients"] = existing_excluded + additional
+            logger.info(
+                f"[FILTER QUERY] Vegetarian: Added {len(additional)} non-veg ingredients to exclusions"
+            )
+
+        # ============ ALLERGEN EXPANSION ============
+        # Expand allergens to include all variants (e.g., "eggs" -> "egg", "egg white", "egg yolk", etc.)
+        # This ensures comprehensive exclusion in SQL
+        raw_exclusions = filter_data.get("excluded_ingredients", [])
+        if raw_exclusions:
+            try:
+                from apps.fastapi.src.services.ingredient_matcher import IntelligentIngredientMatcher
+                ingredient_matcher = IntelligentIngredientMatcher(self.db, self.client)
+                expanded_exclusions = ingredient_matcher.smart_expand_for_exclusions(raw_exclusions)
+                logger.info(f"[FILTER QUERY] Expanded exclusions: {raw_exclusions} -> {expanded_exclusions}")
+
+                # Update filter_data with expanded exclusions
+                filter_data["excluded_ingredients"] = expanded_exclusions
+
+                # Also update session to persist the expanded exclusions
+                for allergen in expanded_exclusions:
+                    if allergen not in session.excluded_ingredients:
+                        session.excluded_ingredients.append(allergen)
+                self.session_manager.save_session(session)
+            except Exception as e:
+                logger.warning(f"[FILTER QUERY] Failed to expand allergens: {e}, using original list")
 
         # Build additional SQL conditions from accumulated filter data
         additional_conditions = build_session_filter_conditions(filter_data)
