@@ -131,6 +131,10 @@ class RetrievalStrategyDecider:
         "don't have", "dont have", "i have no", "i don't have",
         "ran out of", "out of", "don't got", "dont got",
         "missing", "can't find", "cant find",
+        # Non-veg / vegetarian related patterns
+        "non veg", "non-veg", "don't eat non", "dont eat non",
+        "i don't eat", "i dont eat", "no non veg", "no non-veg",
+        "vegetarian only", "veg only", "no meat", "meat free",
     ]
 
     # Intents that typically indicate refinement vs new search
@@ -1014,34 +1018,37 @@ class RetrievalStrategyDecider:
 
         # Vegetarian ingredient-based expansion:
         # Replace (or supplement) the "vegetarian" tag filter with ingredient exclusion
-        # so that egg/dairy-containing recipes (which ARE vegetarian) are not missed
-        # when they happen to lack the "vegetarian" tag in the database.
+        # Uses ingredient exclusion instead of tag filter for more reliable filtering
         _tags = sql_filters.get("tags", [])
         if "vegetarian" in _tags:
             NON_VEGETARIAN = [
+                # Eggs - ILIKE '%egg%' catches egg, eggs, egg white, egg yolk, etc.
+                "egg", "eggs",
+                # General meat - ILIKE '%meat%' catches meat, meats, minced meat, etc.
+                "meat", "meats",
                 # Poultry
-                "chicken", "chickens", "turkey", "duck", "goose", "quail",
+                "chicken", "chickens", "turkey", "duck", "ducks", "goose", "geese", "quail",
                 # Red meat
                 "beef", "pork", "lamb", "mutton", "goat", "veal", "venison",
                 # Processed meat
-                "bacon", "ham", "sausage", "salami", "pepperoni", "lard",
-                "prosciutto", "chorizo", "hotdog", "hot dog",
+                "bacon", "ham", "sausage", "sausages", "salami", "pepperoni", "lard",
+                "prosciutto", "chorizo", "hotdog", "hot dog", "hot dogs",
                 # Fish & seafood
-                "fish", "seafood", "shellfish", "prawn", "prawns",
-                "shrimp", "shrimps", "crab", "lobster", "oyster",
-                "mussel", "scallop", "clam", "anchovy", "anchovies",
-                "tuna", "salmon", "cod", "halibut", "tilapia", "trout",
-                "sardine", "sardines", "mackerel", "herring",
+                "fish", "fishes", "seafood", "shellfish", "prawn", "prawns",
+                "shrimp", "shrimps", "crab", "crabs", "lobster", "lobsters", "oyster", "oysters",
+                "mussel", "mussels", "scallop", "scallops", "clam", "clams", "anchovy", "anchovies",
+                "tuna", "salmon", "cod", "halibut", "tilapia", "trout", "trouts",
+                "sardine", "sardines", "mackerel", "herring", "catfish",
                 # Animal-derived fats/stock used in cooking
-                "gelatin", "lard", "bone broth", "chicken broth", "beef broth",
-                "chicken stock", "beef stock", "fish sauce",
+                "gelatin", "bone broth", "chicken broth", "beef broth",
+                "chicken stock", "beef stock", "fish sauce", "anchovy paste",
             ]
             existing_excluded = sql_filters.get("excluded_ingredients", [])
             existing_lower = {e.lower() for e in existing_excluded}
             additional = [m for m in NON_VEGETARIAN if m not in existing_lower]
             sql_filters["excluded_ingredients"] = existing_excluded + additional
             # Remove the generic "vegetarian" tag so the LLM does not generate
-            # a tag-only SQL filter (which would miss egg/dairy-tagged recipes).
+            # a tag-only SQL filter (which would miss recipes without the tag).
             sql_filters["tags"] = [t for t in _tags if t != "vegetarian"]
             logger.info(
                 f"[VEGETARIAN] Replaced tag filter with ingredient exclusion "
