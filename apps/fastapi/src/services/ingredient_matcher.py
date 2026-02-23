@@ -91,9 +91,12 @@ INGREDIENT_SYNONYMS: Dict[str, List[str]] = {
     "bacon": ["bacon", "pancetta", "bacon fat"],
     "pancetta": ["pancetta", "bacon"],
 
-    # Dairy alternatives
-    "cream": ["cream", "heavy cream", "whipping cream", "double cream", "sour cream"],
-    "heavy cream": ["heavy cream", "cream", "whipping cream", "double cream"],
+    # Dairy alternatives - keep minimal, ILIKE '%cream%' catches all variants
+    "cream": ["cream"],
+    "heavy cream": ["cream"],
+    "whipping cream": ["cream"],
+    "double cream": ["cream"],
+    "sour cream": ["cream"],
 
     # Sweeteners
     "honey": ["honey", "raw honey"],
@@ -227,35 +230,31 @@ PREDEFINED_ALLERGEN_EXPANSIONS: Dict[str, List[str]] = {
     "nuts": ["nut", "nuts", "walnut", "almond", "cashew", "pecan", "hazelnut",
              "pistachio", "peanut", "pine nut", "macadamia", "chestnut", "brazil nut"],
 
-    # Dairy category - key items only (ILIKE handles multi-word matches)
-    # e.g., '%parmesan%' matches "parmesan cheese", '%mozzarella%' matches "mozzarella cheese"
+    # Dairy category - minimal list, ILIKE handles multi-word matches
+    # e.g., '%milk%' catches: milk, buttermilk, condensed milk, evaporated milk
+    # e.g., '%cream%' catches: cream, heavy cream, sour cream, whipping cream
+    # e.g., '%cheese%' catches: cheese, cream cheese, cottage cheese
+    # Only include items that DON'T contain the base word as substring
     "dairy": [
         "dairy", "milk", "cheese", "butter", "cream", "yogurt", "yoghurt",
         "ghee", "whey", "casein", "lactose",
-        # Key cheese types (single words only)
-        "parmesan", "pecorino", "romano", "asiago", "gruyere", "cheddar",
-        "gouda", "edam", "provolone", "mozzarella", "burrata", "ricotta",
-        "mascarpone", "feta", "brie", "camembert", "roquefort", "gorgonzola",
-        "stilton", "halloumi", "paneer", "ricotta",
-        # Key milk/cream types
-        "buttermilk", "condensed", "evaporated",
-        # Key cream types
-        "creme", "fraiche",
-        # Other dairy
-        "kefir", "custard", "whey"
+        # Cheese types that don't contain "cheese" in their name
+        "parmesan", "pecorino", "asiago", "gruyere", "cheddar", "gouda", "edam",
+        "provolone", "mozzarella", "burrata", "ricotta", "mascarpone", "feta",
+        "brie", "camembert", "roquefort", "gorgonzola", "stilton", "halloumi", "paneer",
+        # Other dairy items that need explicit inclusion
+        "buttermilk", "kefir", "custard"
     ],
     "milk": [
         "milk", "dairy", "lactose", "whey", "casein",
-        "buttermilk", "condensed", "evaporated",
-        "cream", "yogurt", "yoghurt", "kefir", "custard"
+        "butter", "cream", "yogurt", "yoghurt", "kefir", "custard", "ghee"
     ],
     "cheese": [
         "cheese", "dairy", "lactose", "whey", "casein",
-        # Key cheese types (single words)
-        "parmesan", "pecorino", "romano", "asiago", "gruyere", "cheddar",
-        "gouda", "edam", "provolone", "mozzarella", "burrata", "ricotta",
-        "mascarpone", "feta", "brie", "camembert", "roquefort", "gorgonzola",
-        "stilton", "halloumi", "paneer"
+        # Cheese types that don't contain "cheese" in their name
+        "parmesan", "pecorino", "asiago", "gruyere", "cheddar", "gouda", "edam",
+        "provolone", "mozzarella", "burrata", "ricotta", "mascarpone", "feta",
+        "brie", "camembert", "roquefort", "gorgonzola", "stilton", "halloumi", "paneer"
     ],
 
     # Seafood category - top 15
@@ -264,9 +263,10 @@ PREDEFINED_ALLERGEN_EXPANSIONS: Dict[str, List[str]] = {
     "shellfish": ["shellfish", "shrimp", "prawn", "crab", "lobster", "oyster",
                   "mussel", "clam", "scallop", "squid", "calamari", "octopus"],
 
-    # Eggs - all common forms
-    "egg": ["egg", "eggs", "egg white", "egg yolk", "albumin", "mayonnaise"],
-    "eggs": ["egg", "eggs", "egg white", "egg yolk", "albumin", "mayonnaise"],
+    # Eggs - rely on ILIKE '%egg%' for most variants (egg white, egg yolk, etc.)
+    # Only add items that DON'T contain "egg" as substring
+    "egg": ["egg", "eggs", "albumin", "albumen"],
+    "eggs": ["egg", "eggs", "albumin", "albumen"],
 
     # Gluten/Wheat - top 15
     "gluten": ["gluten", "wheat", "flour", "bread", "pasta", "noodle", "barley",

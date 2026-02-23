@@ -114,6 +114,33 @@ Refinement patterns:
 - "my budget is $200" / "under 500 rupees" → Add price filter
 - "I'm lactose intolerant" → excluded_ingredients: ["dairy", "milk", "cheese", "cream", "butter"]
 
+## RULE 4: Combined @username + Budget/Filter Queries (CRITICAL)
+
+When a SINGLE query contains BOTH @username AND a budget/price constraint ("under X", "budget X"):
+1. Keep intent = `recipe_search` (because @username is present)
+2. ALWAYS extract the cost filter into `filters.cost` with operator, value, country
+3. "under X" / "less than X" / "within X" with NO time unit (minutes, min, hours) = COST, NOT TIME
+4. Only treat "under X" as time when explicitly followed by time units: "under 30 minutes", "under 1 hour"
+5. Default country when no currency mentioned = "Norway"
+
+Examples:
+- "something under 200 by @user" → intent: recipe_search, filters.creator_username: "user", filters.cost: {operator: "<=", value: 200, country: "Norway", sort_order: "DESC"}
+- "recipes under 100 created by @mammapia" → intent: recipe_search, filters.creator_username: "mammapia", filters.cost: {operator: "<=", value: 100, country: "Norway", sort_order: "DESC"}
+- "@chef recipes under 30 minutes" → intent: recipe_search, filters.creator_username: "chef", parameters.time_constraints: ["under 30 min"] (has time unit = TIME)
+
+## RULE 5: Pronoun Resolution for Creators (CRITICAL)
+
+When the user says "her", "his", "him", "them", "their", "by her", "by him", "by them", "that user", "same user", "the same person":
+1. Look at `conversation_history` and `previous_search_context` for the most recent creator reference (creator_username or creator_name)
+2. Resolve the pronoun to that creator and populate `filters.creator_username` or `filters.creator_name`
+3. If no previous creator is found, ignore the pronoun
+
+Examples:
+- Q1: "recipes by @mammapia" → filters.creator_username: "mammapia"
+- Q2: "suggest me recipes under 100 by her" → filters.creator_username: "mammapia" (resolved from Q1)
+- Q2 alt: "show me more of his recipes" → filters.creator_username: "mammapia" (resolved from Q1)
+- Q2 alt: "what else do they have" → filters.creator_username: "mammapia" (resolved from Q1)
+
 When detecting refinement:
 1. Keep intent as `recipe_search`
 2. Preserve previous entities (ingredients, cuisines, etc.)
@@ -341,6 +368,14 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 - Q1: intent: recipe_search, filters.creator_username: "mammapia"
 - Q2: intent: price_filter, filters.cost: {operator: "<=", value: 200, country: "US", sort_order: "DESC"}
   (Pipeline carries forward creator filter from session)
+
+**"Can you tell me something under 200 created by @mammapia"** (single query with @username + budget)
+→ intent: recipe_search, filters.creator_username: "mammapia", filters.cost: {operator: "<=", value: 200, country: "Norway", sort_order: "DESC"}, requires_embedding: true
+  (Rule 4: "under 200" with no time unit = COST. Both @username and cost extracted together.)
+
+**"suggest me recipes under 100 by her"** (pronoun referencing previous creator)
+→ intent: recipe_search, filters.creator_username: resolve from conversation_history (e.g. "mammapia"), filters.cost: {operator: "<=", value: 100, country: "Norway", sort_order: "DESC"}
+  (Rule 5: "her" resolves to most recent creator. Rule 4: "under 100" = cost.)
 
 **"something sweet" followed by "I'm allergic to almonds"**
 - Q1: intent: recipe_search, filters.tags: ["dessert"], entities.meal_types: ["dessert"]

@@ -231,7 +231,8 @@ class EmbeddingService:
         limit: int = 10,
         threshold: float = 0.7,
         language_id: Optional[str] = None,
-        offset: int = 0
+        offset: int = 0,
+        creator_uid: Optional[str] = None
     ) -> List[Tuple[Recipe, float]]:
         """
         Search recipes by semantic similarity using cosine similarity
@@ -242,6 +243,7 @@ class EmbeddingService:
             threshold: Minimum similarity score (0-1)
             language_id: Optional language ID filter (e.g., 'en', 'no')
             offset: Number of results to skip (for pagination)
+            creator_uid: Optional user UID to restrict search to a specific creator
 
         Returns:
             List of (Recipe, similarity_score) tuples
@@ -277,6 +279,12 @@ class EmbeddingService:
             logger.warning(f"[EMBEDDING SEARCH] Language filter added: languageId={language_id}")
         else:
             logger.warning(f"[EMBEDDING SEARCH] NO language filter - language_id is None or empty!")
+
+        # Add creator filter if provided — restrict candidates to a single user's recipes
+        if creator_uid:
+            where_conditions.append('"userUid" = :creator_uid')
+            params["creator_uid"] = creator_uid
+            logger.warning(f"[EMBEDDING SEARCH] Creator filter added: userUid={creator_uid}")
 
 
         # Use cosine similarity search (1 - cosine_distance)

@@ -28,7 +28,8 @@ def search_recipes_by_embedding(
     limit: int = 10,
     threshold: float = 0.65,
     language_id: Optional[str] = None,
-    offset: int = 0
+    offset: int = 0,
+    creator_uid: Optional[str] = None
 ) -> List[Tuple[Recipe, float]]:
     """
     Search recipes using semantic embeddings.
@@ -40,6 +41,7 @@ def search_recipes_by_embedding(
         threshold: Minimum similarity score (0-1)
         language_id: Optional language ID filter (e.g., 'en', 'no')
         offset: Number of results to skip (for pagination)
+        creator_uid: Optional user UID to restrict search to a specific creator
 
     Returns:
         List of (Recipe, similarity_score) tuples
@@ -53,7 +55,8 @@ def search_recipes_by_embedding(
         limit=limit,
         threshold=threshold,
         language_id=language_id,
-        offset=offset
+        offset=offset,
+        creator_uid=creator_uid
     )
 
     logger.warning(f"[AGENT_TOOLS] search_recipes_by_embedding returned {len(results)} results")

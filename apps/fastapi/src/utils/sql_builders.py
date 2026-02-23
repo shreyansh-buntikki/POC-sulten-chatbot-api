@@ -3,7 +3,7 @@ SQL Query Builders for Cost and Nutrition Filters
 Builds SQL queries that filter recipes by recipe_metadata (pricing/nutrition)
 and query ingredient tables directly.
 """
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 
 def build_recipe_cost_filter_sql(
@@ -161,11 +161,22 @@ def build_recipe_multi_filter_sql(
     user_uid: str = "",
     language: str = "en",
     additional_conditions: Optional[List[str]] = None,
+    candidate_ids: Optional[List[str]] = None,
     limit: int = 20
 ) -> str:
     """
     Build a single SQL query combining any combination of cost, time, and nutrition filters.
     Used when multiple filters are active from multi-turn context management.
+
+    Args:
+        cost_filter: Cost filter dict with operator, value, country
+        time_filter: Time filter dict with sort_order
+        nutrition_filter: Nutrition filter dict with sort_by, order
+        user_uid: User identifier
+        language: Language code
+        additional_conditions: Additional WHERE conditions
+        candidate_ids: Optional list of recipe IDs to restrict search to (from embedding)
+        limit: Max results
 
     ORDER BY priority: cost > time > nutrition > default (name)
     """
@@ -184,6 +195,11 @@ WHERE r."deletedAt" IS NULL
   AND r."languageId" = '{language}'
   AND (r."private" = false OR r."userUid" = '{user_uid}' OR br."bundleId" IS NOT NULL)
 """
+
+    # Add candidate_ids restriction if provided (from embedding search)
+    if candidate_ids:
+        ids_list = ", ".join([f"'{cid}'" for cid in candidate_ids])
+        base_query += f"  AND r.\"id\" IN ({ids_list})\n"
 
     # Add cost filter WHERE conditions
     cost_order = None
@@ -264,7 +280,7 @@ WHERE r."deletedAt" IS NULL
 
 
 def build_recipe_nutrition_filter_sql(
-    nutrition_filter: Dict[str, Any],
+    nutrition_filter: Union[Dict[str, Any], List[Dict[str, Any]]],
     user_uid: str,
     language: str,
     additional_conditions: Optional[List[str]] = None,
@@ -274,7 +290,8 @@ def build_recipe_nutrition_filter_sql(
     Build SQL query for recipe nutrition filtering/sorting using recipe_metadata.
 
     Args:
-        nutrition_filter: Dict with sort_by, order, nutrient_key
+        nutrition_filter: Dict with sort_by, order, nutrient_key, OR a list of such dicts
+                          When a list is provided, uses the first for primary sorting
         user_uid: User identifier
         language: Language code
         additional_conditions: Additional WHERE conditions
@@ -283,6 +300,15 @@ def build_recipe_nutrition_filter_sql(
     Returns:
         SQL query string
     """
+    # Handle list of nutrition filters - use the first one for primary sorting
+    if isinstance(nutrition_filter, list):
+        if not nutrition_filter:
+            raise ValueError("nutrition_filter list is empty")
+        # Use the first filter for primary sorting (usually the most important one)
+        primary_filter = nutrition_filter[0]
+    else:
+        primary_filter = nutrition_filter
+
     # Map common nutrient names to actual DB keys
     # If a nutrient is not in this mapping, it will be used as-is (pass-through)
     nutrient_key_mapping = {
@@ -331,10 +357,10 @@ def build_recipe_nutrition_filter_sql(
     }
 
     # Get nutrient key - prefer nutrient_key, fallback to sort_by
-    raw_key = nutrition_filter.get("nutrient_key") or nutrition_filter.get("sort_by", "protein")
+    raw_key = primary_filter.get("nutrient_key") or primary_filter.get("sort_by", "protein")
     nutrient_key = nutrient_key_mapping.get(raw_key, raw_key)
 
-    order = nutrition_filter.get("order", "DESC")
+    order = primary_filter.get("order", "DESC")
 
     # The actual structure is: recipe_metadata -> totalNutrition -> macros -> nutrient
     base_query = f"""

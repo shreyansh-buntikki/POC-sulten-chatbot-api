@@ -163,7 +163,8 @@ async def generate_recipe_response(
     query: str,
     recipes: List[Dict[str, Any]],
     user_context: Optional[Dict[str, Any]] = None,
-    agent: Optional[Agent] = None
+    agent: Optional[Agent] = None,
+    filter_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Generate an engaging 2-3 line response that adds value to recipe search results.
@@ -177,6 +178,8 @@ async def generate_recipe_response(
         recipes: List of recipe dictionaries with details
         user_context: Optional user context (liked recipes, preferences)
         agent: Optional custom agent to use (if None, uses default nlg_agent)
+        filter_context: Optional dict of all active session filters
+            (excluded_ingredients, creator_username, cost_filter, etc.)
 
     Returns:
         Engaging 2-3 line natural language response (40-50 words)
@@ -186,9 +189,68 @@ async def generate_recipe_response(
     recipe_count = len(recipes)
     use_agent = agent if agent else nlg_agent
 
+    # Build active-filters section for the prompt
+    filter_lines: list[str] = []
+    if filter_context:
+        if filter_context.get("creator_username"):
+            filter_lines.append(
+                f"- Recipes by @{filter_context['creator_username']}"
+            )
+        if filter_context.get("excluded_ingredients"):
+            items = ", ".join(filter_context["excluded_ingredients"])
+            filter_lines.append(f"- Excluding ingredients: {items}")
+        if filter_context.get("included_ingredients"):
+            items = ", ".join(filter_context["included_ingredients"])
+            filter_lines.append(f"- Including ingredients: {items}")
+        if filter_context.get("cost_filter"):
+            cf = filter_context["cost_filter"]
+            op = cf.get("operator", "<=")
+            val = cf.get("value", "")
+            country = cf.get("country", "")
+            filter_lines.append(
+                f"- Budget: {op} {val} ({country})" if country
+                else f"- Budget: {op} {val}"
+            )
+        if filter_context.get("time_filter"):
+            tf = filter_context["time_filter"]
+            sort = tf.get("sort_order", "ASC")
+            label = "quickest first" if sort == "ASC" else "longest first"
+            filter_lines.append(f"- Time preference: {label}")
+        if filter_context.get("max_time_minutes"):
+            filter_lines.append(
+                f"- Max cooking time: {filter_context['max_time_minutes']} minutes"
+            )
+        if filter_context.get("nutrition_filter"):
+            nf = filter_context["nutrition_filter"]
+            sort_by = nf.get("sort_by", "")
+            level = nf.get("level", "")
+            if level:
+                filter_lines.append(f"- Nutrition: {level} {sort_by}")
+            elif sort_by:
+                filter_lines.append(f"- Sorted by: {sort_by}")
+        if filter_context.get("dietary_tags"):
+            tags = ", ".join(filter_context["dietary_tags"])
+            filter_lines.append(f"- Dietary tags: {tags}")
+        if filter_context.get("cuisines"):
+            cuisines = ", ".join(filter_context["cuisines"])
+            filter_lines.append(f"- Cuisines: {cuisines}")
+        if filter_context.get("difficulty"):
+            filter_lines.append(
+                f"- Difficulty: {filter_context['difficulty']}"
+            )
+
+    filters_section = ""
+    if filter_lines:
+        joined = "\n".join(filter_lines)
+        filters_section = (
+            f"\n\nActive filters applied to results:\n{joined}\n"
+            "Mention the active filters naturally in your response "
+            "(e.g. 'Here are 5 recipes by @user without garlic under 200 kr')."
+        )
+
     prompt = f"""User query: "{query}"
 
-Found {recipe_count} recipe(s) matching their search.
+Found {recipe_count} recipe(s) matching their search.{filters_section}
 
 Generate a value-adding response (2-3 lines, 40-50 words) that:
 1. Describes what makes these recipes special or worth trying
@@ -216,7 +278,8 @@ async def generate_no_results_response(
     intent: str,
     entities: Dict[str, Any],
     filters: Dict[str, Any],
-    agent: Optional[Agent] = None
+    agent: Optional[Agent] = None,
+    filter_context: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Generate an informative response when no recipes match.
@@ -227,6 +290,7 @@ async def generate_no_results_response(
         entities: Extracted entities
         filters: Applied filters
         agent: Optional custom agent to use (if None, uses default nlg_agent)
+        filter_context: Optional dict of all active session filters
 
     Returns:
         Informative natural language response with alternatives
@@ -235,9 +299,57 @@ async def generate_no_results_response(
 
     use_agent = agent if agent else nlg_agent
 
+    # Build accumulated filter context section
+    context_lines: list[str] = []
+    if filter_context:
+        if filter_context.get("creator_username"):
+            context_lines.append(
+                f"- Recipes by @{filter_context['creator_username']}"
+            )
+        if filter_context.get("excluded_ingredients"):
+            items = ", ".join(filter_context["excluded_ingredients"])
+            context_lines.append(f"- Excluding ingredients: {items}")
+        if filter_context.get("included_ingredients"):
+            items = ", ".join(filter_context["included_ingredients"])
+            context_lines.append(f"- Must include ingredients: {items}")
+        if filter_context.get("cost_filter"):
+            cf = filter_context["cost_filter"]
+            op = cf.get("operator", "<=")
+            val = cf.get("value", "")
+            country = cf.get("country", "")
+            context_lines.append(
+                f"- Budget: {op} {val} ({country})" if country
+                else f"- Budget: {op} {val}"
+            )
+        if filter_context.get("time_filter"):
+            tf = filter_context["time_filter"]
+            sort = tf.get("sort_order", "ASC")
+            label = "quickest first" if sort == "ASC" else "longest first"
+            context_lines.append(f"- Time preference: {label}")
+        if filter_context.get("max_time_minutes"):
+            context_lines.append(
+                f"- Max cooking time: {filter_context['max_time_minutes']} min"
+            )
+        if filter_context.get("dietary_tags"):
+            tags = ", ".join(filter_context["dietary_tags"])
+            context_lines.append(f"- Dietary tags: {tags}")
+        if filter_context.get("cuisines"):
+            cuisines = ", ".join(filter_context["cuisines"])
+            context_lines.append(f"- Cuisines: {cuisines}")
+
+    accumulated_section = ""
+    if context_lines:
+        joined = "\n".join(context_lines)
+        accumulated_section = (
+            f"\n\nAll active session filters (accumulated across the conversation):\n"
+            f"{joined}\n"
+            "Mention ALL of these filters in your response so the user knows "
+            "exactly which combination produced zero results."
+        )
+
     prompt = f"""User query: "{query}"
 
-No recipes matched their search.
+No recipes matched their search.{accumulated_section}
 
 Analysis:
 - Intent: {intent}
@@ -245,13 +357,13 @@ Analysis:
 - Filters applied: {filters}
 
 Generate an informative response (2-3 sentences) that:
-1. Acknowledges what they were looking for
-2. Explains why results might be limited
+1. Acknowledges what they were looking for, mentioning ALL active filters
+2. Explains why results might be limited given the combination of filters
 3. Suggests related alternatives they might enjoy
 
 DO NOT ask questions. Just provide helpful information.
 
-Example: "I couldn't find an exact match for that combination, but similar ingredients like mushrooms or cashews can create equally delicious creamy textures in vegan dishes."
+Example: "I couldn't find any banana recipes without dairy under 200 kr. The dairy-free restriction combined with the budget narrows things down quite a bit. Try relaxing the budget or exploring coconut- or oat-based alternatives."
 
 Be helpful and informative!"""
 
