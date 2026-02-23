@@ -39,6 +39,7 @@ class SessionFilters:
     season: Optional[str] = None  # summer, winter, etc.
     region: Optional[str] = None  # regional preference
     creator_uid: Optional[str] = None  # filter by recipe creator
+    creator_username: Optional[str] = None  # resolved username for NLG context
     # Persisted filter state for multi-turn context
     cost_filter: Optional[Dict[str, Any]] = None  # e.g. {"operator": "<=", "value": 100, "country": "Norway", "sort_order": "DESC"}
     time_filter: Optional[Dict[str, Any]] = None  # e.g. {"sort_order": "ASC"}
@@ -661,6 +662,10 @@ class SessionMemoryManager:
                 raw_uid = raw_uid[0] if raw_uid else None
             if raw_uid and isinstance(raw_uid, str):
                 session.filters.creator_uid = raw_uid
+
+        # Persist resolved creator username for NLG context
+        if filters.get('creator_username'):
+            session.filters.creator_username = filters['creator_username']
 
         # Persist cost filter for multi-turn context
         # e.g., Q1: "quick recipes" → Q2: "my budget is 100" → both filters apply

@@ -464,6 +464,7 @@ class RecipeSearchPipelineSDK:
                     # Found the user - add creator_uid to filters
                     logger.info(f"[CREATOR] Found user by @username: {user.username} (uid: {user.uid})")
                     nlid_result_dict["filters"]["creator_uid"] = user.uid
+                    nlid_result_dict["filters"]["creator_username"] = user.username
                     # Also add to session context for display (use username for @username)
                     nlid_result_dict["creator_resolved"] = {
                         "name": user.name or user.username,
@@ -493,6 +494,7 @@ class RecipeSearchPipelineSDK:
                     # Found the user - add creator_uid to filters
                     logger.info(f"[CREATOR] Found user: {user.name} (uid: {user.uid})")
                     nlid_result_dict["filters"]["creator_uid"] = user.uid
+                    nlid_result_dict["filters"]["creator_username"] = user.username
                     # Also add to session context for display
                     nlid_result_dict["creator_resolved"] = {
                         "name": user.name,
@@ -515,6 +517,46 @@ class RecipeSearchPipelineSDK:
 
             # Update session state from NLID results
             session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
+
+            # ============ RE-ROUTE: recipe_search with cost/time/nutrition filter ============
+            # When NLID detects both @username (→ recipe_search) and a budget/time
+            # constraint ("under 200"), the cost/time filter lives in filters.cost or
+            # filters.time.  Route to the deterministic filter handler instead of
+            # the LLM SQL generator which often misinterprets "under 200" as time.
+            # Also re-route when the SESSION has persisted cost/time/nutrition from
+            # a previous turn (e.g. Q1 "budget 400" → Q2 "dessert recipes" should
+            # keep the 400 kr constraint).
+            _filters_for_reroute = nlid_result_dict.get("filters", {})
+            _has_cost_reroute = bool(_filters_for_reroute.get("cost"))
+            _has_time_reroute = bool(_filters_for_reroute.get("time"))
+            _has_nutrition_reroute = bool(_filters_for_reroute.get("nutrition"))
+
+            # Check session-persisted filters too
+            _has_session_cost = bool(session.filters.cost_filter)
+            _has_session_time = bool(session.filters.time_filter)
+            _has_session_nutrition = bool(session.filters.nutrition_filter)
+
+            _any_filter = (
+                _has_cost_reroute or _has_time_reroute or _has_nutrition_reroute
+                or _has_session_cost or _has_session_time or _has_session_nutrition
+            )
+
+            if (
+                nlid_result_dict["intent"] == "recipe_search"
+                and _any_filter
+            ):
+                logger.info(
+                    f"[REROUTE] recipe_search has filter(s): "
+                    f"cost={_has_cost_reroute or _has_session_cost}, "
+                    f"time={_has_time_reroute or _has_session_time}, "
+                    f"nutrition={_has_nutrition_reroute or _has_session_nutrition}. "
+                    f"(from_nlid={_has_cost_reroute or _has_time_reroute or _has_nutrition_reroute}, "
+                    f"from_session={_has_session_cost or _has_session_time or _has_session_nutrition}) "
+                    f"Re-routing to _handle_filter_query for deterministic SQL."
+                )
+                return await self._handle_filter_query(
+                    query, nlid_result_dict, session, user_uid, language
+                )
 
             # Get user context
             session_context = self.session_manager.get_user_context(session, {})
@@ -888,14 +930,26 @@ class RecipeSearchPipelineSDK:
                             or filters.get("difficulty")
                             or filters.get("included_ingredients")
                         )
-                        top_k = 50 if expanded_allergens else 20
+                        # Merge new expanded allergens with ALL previously
+                        # stored session exclusions so multi-turn exclusions
+                        # accumulate correctly (e.g. Q2: "no egg" + Q3: "no potato").
+                        existing_exclusions = session.excluded_ingredients or []
+                        merged_exclusions = list(dict.fromkeys(
+                            existing_exclusions
+                            + [a for a in expanded_allergens
+                               if a not in existing_exclusions]
+                        ))
+                        session.excluded_ingredients = merged_exclusions
+                        self.session_manager.save_session(session)
+
+                        top_k = 50 if merged_exclusions else 20
                         if expanded_allergens and not has_positive_constraints:
                             logger.info(f"[EXCLUSION-ONLY] SQL_ONLY routing for standalone exclusion query")
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.SQL_ONLY,
                                 reasoning="Standalone exclusion-only query – SQL filters full recipe table without embedding bias",
                                 vector_query=None,
-                                sql_filters={"excluded_ingredients": expanded_allergens},
+                                sql_filters={"excluded_ingredients": merged_exclusions},
                                 top_k=top_k
                             )
                         else:
@@ -905,7 +959,7 @@ class RecipeSearchPipelineSDK:
                                 vector_query=dietary_query,
                                 sql_filters={
                                     "tags": mentioned_tags,
-                                    "excluded_ingredients": expanded_allergens  # Use expanded allergens
+                                    "excluded_ingredients": merged_exclusions,
                                 },
                                 top_k=top_k
                             )
@@ -975,39 +1029,6 @@ class RecipeSearchPipelineSDK:
             # For other strategies: Can run in parallel
             parallel2_start = time.time()
 
-            # ============ MULTI-TURN CONTEXT: Merge session-persisted filters ============
-            # Carry forward persisted filters (cost, time, nutrition) from previous turns
-            # so that follow-up queries maintain ALL accumulated constraints.
-            # This ensures "I don't like garlic" (Q5) still respects "budget is 50$" from (Q4).
-            session_cost = session.filters.cost_filter
-            session_time = session.filters.time_filter
-            session_nutrition = session.filters.nutrition_filter
-
-            if session_cost or session_time or session_nutrition:
-                merged_sql_filters = dict(retrieval_plan.sql_filters) if retrieval_plan.sql_filters else {}
-
-                # Only add session filters if not already present in current query
-                if session_cost and "cost" not in merged_sql_filters:
-                    merged_sql_filters["cost"] = session_cost
-                    logger.info(f"[MULTI-TURN] Carrying forward cost_filter: {session_cost}")
-
-                if session_time and "time" not in merged_sql_filters:
-                    merged_sql_filters["time"] = session_time
-                    logger.info(f"[MULTI-TURN] Carrying forward time_filter: {session_time}")
-
-                if session_nutrition and "nutrition" not in merged_sql_filters:
-                    merged_sql_filters["nutrition"] = session_nutrition
-                    logger.info(f"[MULTI-TURN] Carrying forward nutrition_filter: {session_nutrition}")
-
-                # Update retrieval plan with merged filters
-                retrieval_plan = RetrievalPlan(
-                    strategy=retrieval_plan.strategy,
-                    reasoning=retrieval_plan.reasoning,
-                    vector_query=retrieval_plan.vector_query,
-                    sql_filters=merged_sql_filters,
-                    top_k=retrieval_plan.top_k
-                )
-
             # Initialize variables for all paths
             candidate_ids = None
             similarity_scores = {}
@@ -1015,89 +1036,92 @@ class RecipeSearchPipelineSDK:
             sql_result = None
 
             if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
-                # FILTER-ONLY queries: Skip embedding search, run schema + SQL directly
+                # FILTER-ONLY queries: Skip embedding search, use deterministic
+                # SQL builder instead of the LLM to avoid broken SQL.
+                relevant_schema = self.schema_understanding.get_relevant_schema(
+                    nlid_result_dict["intent"],
+                    retrieval_plan.sql_filters,
+                    session_context
+                )
 
-                # Check if we have session-persisted cost/time/nutrition filters
-                # If so, use direct SQL builders instead of LLM for proper handling
-                sql_filters = retrieval_plan.sql_filters or {}
-                has_cost = sql_filters.get("cost")
-                has_time = sql_filters.get("time")
-                has_nutrition = sql_filters.get("nutrition")
+                # Build SQL deterministically using session filters
+                _sf = retrieval_plan.sql_filters or {}
+                _session_filters_dict: Dict[str, Any] = {
+                    "excluded_ingredients": _sf.get(
+                        "excluded_ingredients", []
+                    ),
+                    "included_ingredients": _sf.get(
+                        "included_ingredients", []
+                    ),
+                    "tags": _sf.get("tags", []),
+                    "cuisines": _sf.get("cuisines", []),
+                    "difficulty": _sf.get("difficulty"),
+                    "max_time": _sf.get("max_time"),
+                    "excluded_recipe_ids": (
+                        session.excluded_recipe_ids or []
+                    ),
+                }
+                _additional = build_session_filter_conditions(
+                    _session_filters_dict
+                )
 
-                if has_cost or has_time or has_nutrition:
-                    # Build SQL directly using sql_builders for cost/time/nutrition filters
-                    # This ensures proper handling of session-persisted filters
-                    logger.info(f"[SQL_ONLY] Using direct SQL builder with persisted filters")
+                # Pick the right builder based on persisted session
+                # filters (time / cost / nutrition) so multi-turn
+                # context is preserved (e.g. Q1: "quick" → time ASC
+                # carried into Q2: "no eggs").
+                _time_f = session.filters.time_filter
+                _cost_f = session.filters.cost_filter
+                _nutr_f = session.filters.nutrition_filter
 
-                    # Build additional conditions from session context (exclusions, tags, etc.)
-                    session_filter_conditions = build_session_filter_conditions(sql_filters)
-
-                    # Count active filters
-                    active_filter_count = sum(1 for f in [has_cost, has_time, has_nutrition] if f)
-
-                    if active_filter_count >= 2:
-                        # Use combined builder for multiple filters
-                        from apps.fastapi.src.utils.sql_builders import build_recipe_multi_filter_sql
-                        direct_sql = build_recipe_multi_filter_sql(
-                            cost_filter=has_cost,
-                            time_filter=has_time,
-                            nutrition_filter=has_nutrition,
-                            user_uid=user_uid or "",
-                            language=language or "en",
-                            additional_conditions=session_filter_conditions,
-                            limit=20
-                        )
-                    elif has_cost:
-                        direct_sql = build_recipe_cost_filter_sql(
-                            cost_filter=has_cost,
-                            user_uid=user_uid or "",
-                            language=language or "en",
-                            additional_conditions=session_filter_conditions,
-                            limit=20
-                        )
-                    elif has_time:
-                        direct_sql = build_recipe_time_filter_sql(
-                            time_filter=has_time,
-                            user_uid=user_uid or "",
-                            language=language or "en",
-                            additional_conditions=session_filter_conditions,
-                            limit=20
-                        )
-                    elif has_nutrition:
-                        direct_sql = build_recipe_nutrition_filter_sql(
-                            nutrition_filter=has_nutrition,
-                            user_uid=user_uid or "",
-                            language=language or "en",
-                            additional_conditions=session_filter_conditions,
-                            limit=20
-                        )
-
-                    # Create SQLGenerationResult from direct SQL
-                    sql_result = SQLGenerationResult(
-                        sql=direct_sql,
-                        explanation="Direct SQL with session-persisted filters",
-                        params={},
-                        estimated_rows=20,
-                        is_safe=True
+                if _time_f:
+                    _direct_sql = build_recipe_time_filter_sql(
+                        time_filter=_time_f,
+                        user_uid=user_uid or "",
+                        language=language or "en",
+                        additional_conditions=_additional,
+                        limit=20,
                     )
-                    logger.info(f"[SQL_ONLY] ✓ Direct SQL built with persisted filters in {time.time() - parallel2_start:.3f}s")
+                elif _cost_f:
+                    _direct_sql = build_recipe_cost_filter_sql(
+                        cost_filter=_cost_f,
+                        user_uid=user_uid or "",
+                        language=language or "en",
+                        additional_conditions=_additional,
+                        limit=20,
+                    )
+                elif _nutr_f:
+                    _direct_sql = build_recipe_nutrition_filter_sql(
+                        nutrition_filter=_nutr_f,
+                        user_uid=user_uid or "",
+                        language=language or "en",
+                        additional_conditions=_additional,
+                        limit=20,
+                    )
                 else:
-                    # No session-persisted filters, use LLM-based SQL generation
-                    relevant_schema = self.schema_understanding.get_relevant_schema(
-                        nlid_result_dict["intent"],
-                        retrieval_plan.sql_filters,
-                        session_context
+                    # No session filter — plain base query with
+                    # exclusion conditions only.
+                    _direct_sql = build_recipe_time_filter_sql(
+                        time_filter={"sort_order": "ASC"},
+                        user_uid=user_uid or "",
+                        language=language or "en",
+                        additional_conditions=_additional,
+                        limit=20,
                     )
 
-                    # SQL generation for filter-only queries
-                    sql_result = await self.sql_generator.generate_sql(
-                        query,
-                        nlid_result_dict,
-                        retrieval_plan.sql_filters,
-                        session_context,
-                        None  # No candidate_ids for filter-only queries
-                    )
-                    logger.info(f"[FILTER-ONLY] ✓ SQL generated in {time.time() - parallel2_start:.3f}s")
+                from apps.fastapi.src.services.sql_generator import (
+                    SQLGenerationResult,
+                )
+                sql_result = SQLGenerationResult(
+                    sql=_direct_sql,
+                    explanation="Direct SQL builder (no LLM)",
+                    params={},
+                    estimated_rows=20,
+                    is_safe=True,
+                )
+                logger.info(
+                    f"[SQL_ONLY] ✓ Direct SQL built with persisted "
+                    f"filters in {time.time() - parallel2_start:.3f}s"
+                )
 
             elif retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
                 # SEQUENTIAL for hybrid: Embedding first, then SQL with candidate_ids
@@ -1165,47 +1189,13 @@ class RecipeSearchPipelineSDK:
                 )
 
                 # Step 3: SQL generation WITH candidate_ids (filters the embedding candidates)
-                # Check if we have session-persisted cost/time/nutrition filters - if so,
-                # use direct SQL builder with candidate_ids constraint instead of LLM
-                sql_filters = retrieval_plan.sql_filters or {}
-                has_cost = sql_filters.get("cost")
-                has_time = sql_filters.get("time")
-                has_nutrition = sql_filters.get("nutrition")
-
-                if has_cost or has_time or has_nutrition:
-                    # Build SQL directly with combined filters + candidate_ids
-                    logger.info(f"[HYBRID] Using direct SQL builder with persisted filters + candidates")
-                    session_filter_conditions = build_session_filter_conditions(sql_filters)
-
-                    # Build combined SQL with candidate_ids restriction
-                    from apps.fastapi.src.utils.sql_builders import build_recipe_multi_filter_sql
-                    direct_sql = build_recipe_multi_filter_sql(
-                        cost_filter=has_cost,
-                        time_filter=has_time,
-                        nutrition_filter=has_nutrition,
-                        user_uid=user_uid or "",
-                        language=language or "en",
-                        additional_conditions=session_filter_conditions,
-                        candidate_ids=candidate_ids,
-                        limit=20
-                    )
-
-                    sql_result = SQLGenerationResult(
-                        sql=direct_sql,
-                        explanation="Direct SQL with session-persisted filters + candidate restriction",
-                        params={},
-                        estimated_rows=20,
-                        is_safe=True
-                    )
-                else:
-                    # No session-persisted cost/time/nutrition filters - use LLM-based SQL generation
-                    sql_result = await self.sql_generator.generate_sql(
-                        query,
-                        nlid_result_dict,
-                        retrieval_plan.sql_filters,
-                        session_context,
-                        candidate_ids  # Pass candidate_ids so SQL only searches within them
-                    )
+                sql_result = await self.sql_generator.generate_sql(
+                    query,
+                    nlid_result_dict,
+                    retrieval_plan.sql_filters,
+                    session_context,
+                    candidate_ids  # Pass candidate_ids so SQL only searches within them
+                )
                 logger.info(f"[HYBRID] ✓ Embedding + SQL completed in {time.time() - parallel2_start:.3f}s")
 
             else:
@@ -1314,6 +1304,18 @@ class RecipeSearchPipelineSDK:
 
             logger.info(f"[STAGE 8] ✓ Execution: success={execution_result['success']} | rows={execution_result.get('row_count', 0)} | time={time.time() - stage_start:.3f}s")
 
+            # CRITICAL: Always save search context for multi-turn refinement, even on SQL failure
+            # This allows users to refine queries like "I am allergic to tomato" after a failed search
+            if retrieval_plan.vector_query and nlid_result_dict["intent"] == "recipe_search":
+                self.session_manager.update_search_context(
+                    session,
+                    query,
+                    retrieval_plan.vector_query,
+                    retrieval_plan.sql_filters,
+                    nlid_result_dict["intent"]
+                )
+                logger.info(f"[STAGE 8] Saved search context: vector_query='{retrieval_plan.vector_query}'")
+
             if not execution_result["success"]:
                 # Error response - no fallback
                 logger.error(f"[STAGE 8] SQL execution failed, generating error response")
@@ -1330,17 +1332,6 @@ class RecipeSearchPipelineSDK:
                         "num_results": 0,
                     }
                 }
-
-            # Update session context with successful search for future refinements
-            # This enables follow-up queries like "I am allergic to tomato" to maintain context
-            if execution_result.get("row_count", 0) > 0:
-                self.session_manager.update_search_context(
-                    session,
-                    query,
-                    retrieval_plan.vector_query,
-                    retrieval_plan.sql_filters,
-                    nlid_result_dict["intent"]
-                )
 
             # ============ STAGE 9+10: PARALLEL PHASE 3 - Post-Processing + NLG ============
             # Run post-processing and NLG in parallel
@@ -1363,11 +1354,13 @@ class RecipeSearchPipelineSDK:
                 """Run NLG with the SQL results directly"""
                 # Use SDK NLG agent for natural language responses
                 # We pass the SQL results directly; NLG will format them
+                nlg_filter_ctx = self._build_nlg_filter_context(session)
                 response = await self._generate_natural_language_response(
                     query,
                     execution_result["rows"][:self.MAX_RECIPES],  # Use SQL results directly
                     nlid_result_dict,
-                    current_nlg_agent  # Pass the custom agent
+                    current_nlg_agent,  # Pass the custom agent
+                    filter_context=nlg_filter_ctx
                 )
 
                 return response
@@ -2019,27 +2012,70 @@ class RecipeSearchPipelineSDK:
 
         return processed
 
+    def _build_nlg_filter_context(
+        self,
+        session: SessionState,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build a context dict describing all active session filters
+        for the NLG agent so it can mention them in the intro text.
+
+        Returns None when no meaningful filters are active.
+        """
+        context: Dict[str, Any] = {}
+
+        if session.excluded_ingredients:
+            context["excluded_ingredients"] = session.excluded_ingredients
+        if session.included_ingredients:
+            context["included_ingredients"] = session.included_ingredients
+        if session.filters.creator_username:
+            context["creator_username"] = session.filters.creator_username
+        if session.filters.cost_filter:
+            context["cost_filter"] = session.filters.cost_filter
+        if session.filters.time_filter:
+            context["time_filter"] = session.filters.time_filter
+        if session.filters.nutrition_filter:
+            context["nutrition_filter"] = session.filters.nutrition_filter
+        if session.filters.tags:
+            context["dietary_tags"] = session.filters.tags
+        if session.filters.cuisines:
+            context["cuisines"] = session.filters.cuisines
+        if session.filters.max_time:
+            context["max_time_minutes"] = session.filters.max_time
+        if session.filters.difficulty:
+            context["difficulty"] = session.filters.difficulty
+
+        return context if context else None
+
     async def _generate_natural_language_response(
         self,
         query: str,
         recipes: List[Dict[str, Any]],
         nlid_result: Dict[str, Any],
-        nlg_agent_instance = None
+        nlg_agent_instance = None,
+        filter_context: Optional[Dict[str, Any]] = None
     ) -> str:
         """Generate natural language response from recipe results using SDK"""
         if not recipes:
             logger.warning(f"[NLG] No recipes found, generating no-results response")
-            return await self._generate_no_results_response(query, nlid_result, nlg_agent_instance)
+            return await self._generate_no_results_response(
+                query, nlid_result, nlg_agent_instance,
+                filter_context=filter_context
+            )
 
         # Use SDK NLG agent to generate response
-        response = await generate_recipe_response(query, recipes, None, nlg_agent_instance)
+        response = await generate_recipe_response(
+            query, recipes, None, nlg_agent_instance,
+            filter_context=filter_context
+        )
         return response
 
     async def _generate_no_results_response(
         self,
         query: str,
         nlid_result: Dict[str, Any],
-        nlg_agent = None
+        nlg_agent = None,
+        filter_context: Optional[Dict[str, Any]] = None
     ) -> str:
         """Generate response when no recipes are found using SDK"""
         response = await generate_no_results_response(
@@ -2047,7 +2083,8 @@ class RecipeSearchPipelineSDK:
             nlid_result.get("intent", "unknown"),
             nlid_result.get("entities", {}),
             nlid_result.get("filters", {}),
-            nlg_agent
+            nlg_agent,
+            filter_context=filter_context
         )
         return response
 
@@ -2443,27 +2480,29 @@ class RecipeSearchPipelineSDK:
         # ============ STANDALONE MODE: No previous context, use direct SQL ============
         logger.info(f"[FILTER QUERY] No previous search context, using direct SQL")
 
-        # Get session context for additional filters (dietary restrictions, allergies, etc.)
-        session_context = self.session_manager.get_user_context(session, {})
-        session_filters = session_context.get("filters", {})
+        # Build filter data directly from session state so that NLID empty
+        # lists cannot overwrite accumulated session exclusions.
+        filter_data: Dict[str, Any] = {
+            "excluded_ingredients": list(session.excluded_ingredients),
+            "included_ingredients": list(session.included_ingredients),
+            "excluded_recipe_ids": list(session.excluded_recipe_ids),
+            "tags": list(session.filters.tags),
+            "cuisines": list(session.filters.cuisines),
+            "difficulty": session.filters.difficulty,
+            "max_time": session.filters.max_time,
+            "creator_uid": session.filters.creator_uid,
+        }
 
-        # Add excluded_ingredients from session (allergies, expanded allergens)
-        if session_context.get("excluded_ingredients"):
-            session_filters["excluded_ingredients"] = session_context.get("excluded_ingredients")
+        # Merge any NEW exclusions/inclusions from the current NLID result
+        for ing in filters.get("excluded_ingredients", []):
+            if ing and ing not in filter_data["excluded_ingredients"]:
+                filter_data["excluded_ingredients"].append(ing)
+        for ing in filters.get("included_ingredients", []):
+            if ing and ing not in filter_data["included_ingredients"]:
+                filter_data["included_ingredients"].append(ing)
 
-        # Add included_ingredients from session
-        if session_context.get("included_ingredients"):
-            session_filters["included_ingredients"] = session_context.get("included_ingredients")
-
-        # Add excluded_recipe_ids from session (for negative feedback)
-        if session.excluded_recipe_ids:
-            session_filters["excluded_recipe_ids"] = session.excluded_recipe_ids
-
-        # Merge with NLID filters
-        merged_filters = {**session_filters, **filters}
-
-        # Build additional SQL conditions from session context
-        additional_conditions = build_session_filter_conditions(merged_filters)
+        # Build additional SQL conditions from accumulated filter data
+        additional_conditions = build_session_filter_conditions(filter_data)
 
         # Build the SQL query
         sql_query = None
@@ -2529,6 +2568,7 @@ class RecipeSearchPipelineSDK:
 
         try:
             result = self.db.execute(text(sql_query))
+            logger.info(f"SQL QUERY: {str(sql_query)}")
             rows = [dict(row._mapping) for row in result.fetchall()]
             logger.info(f"[FILTER QUERY] ✓ SQL executed: {len(rows)} results")
         except Exception as e:
@@ -2563,13 +2603,34 @@ class RecipeSearchPipelineSDK:
         # Limit to MAX_RECIPES
         final_recipes = processed_recipes[:self.MAX_RECIPES]
 
+        # Save search filters to session so follow-ups carry forward
+        # creator, cost, etc.
+        # Do NOT save vector_query here. Standalone mode uses direct SQL
+        # (no embedding), so saving the raw query as vector_query would
+        # cause the next turn to route to _handle_filter_refinement which
+        # does embedding search on a small candidate pool.  Follow-up
+        # queries should also use standalone SQL (full database) with all
+        # accumulated session filters (tags, exclusions, cost, etc.).
+        if final_recipes:
+            sql_filters_snapshot = dict(filters)
+            if session.filters.creator_uid:
+                sql_filters_snapshot["creator_uid"] = session.filters.creator_uid
+            session.context_entities.last_search_filters = sql_filters_snapshot
+            session.last_intent = intent
+            self.session_manager.save_session(session)
+
         # Generate natural language response
         if final_recipes:
             response = await self._generate_cost_nutrition_response(
-                query, final_recipes, intent, cost_filter, nutrition_filter
+                query, final_recipes, intent, cost_filter, nutrition_filter,
+                session=session
             )
         else:
-            response = await self._generate_no_results_response(query, nlid_result, current_nlg_agent)
+            nlg_filter_ctx = self._build_nlg_filter_context(session)
+            response = await self._generate_no_results_response(
+                query, nlid_result, None,
+                filter_context=nlg_filter_ctx
+            )
 
         # Save to session
         session.add_to_history("assistant", response)
@@ -2664,6 +2725,17 @@ class RecipeSearchPipelineSDK:
         session_context = self.session_manager.get_user_context(session, {})
         excluded_ingredients = session_context.get("excluded_ingredients", [])
 
+        # Resolve creator_uid from session context so the embedding
+        # search is scoped to that creator's recipes (avoids wasting
+        # candidate slots on other users' recipes).
+        last_search_filters = (
+            session.context_entities.last_search_filters or {}
+        )
+        embedding_creator_uid = (
+            last_search_filters.get("creator_uid")
+            or session.filters.creator_uid
+        )
+
         # Step 1: Run embedding search with previous query
         embedding_results = search_recipes_by_embedding(
             self.db,
@@ -2671,20 +2743,27 @@ class RecipeSearchPipelineSDK:
             limit=EMBEDDING_BATCH_SIZE,
             threshold=0.35,
             language_id=language or "en",
-            offset=0
+            offset=0,
+            creator_uid=embedding_creator_uid,
         )
 
         if not embedding_results:
-            logger.info("[FILTER REFINEMENT] No embedding results found")
-            return {
-                "response": f"I couldn't find any {previous_vector_query} matching your criteria. Would you like to try a different search?",
-                "metadata": {
-                    "intent": nlid_result.get("intent", "filter"),
-                    "is_cooking_related": True,
-                    "num_results": 0,
-                    "recipes": []
-                }
-            }
+            logger.info(
+                "[FILTER REFINEMENT] No embedding results found, "
+                "falling back to standalone SQL mode"
+            )
+            # Clear the previous_vector_query so _handle_filter_query
+            # uses standalone mode instead of looping back here.
+            session.context_entities.last_vector_query = None
+            if session.context_entities.search_cache:
+                session.context_entities.search_cache.pop(
+                    "vector_query", None
+                )
+            self.session_manager.save_session(session)
+
+            return await self._handle_filter_query(
+                query, nlid_result, session, user_uid, language
+            )
 
         candidate_ids = [str(r.id) for r, _ in embedding_results]
         logger.info(f"[FILTER REFINEMENT] ✓ {len(candidate_ids)} candidates")
@@ -2732,6 +2811,23 @@ class RecipeSearchPipelineSDK:
             )
                 """
 
+        # Build ingredient inclusion conditions from session
+        # e.g. Q1 "I only have banana" → Q2 "My budget is 200" should
+        # still require banana in every result.
+        included_ingredients = session_context.get("included_ingredients", [])
+        inclusion_conditions = ""
+        if included_ingredients:
+            for ingredient in included_ingredients[:10]:
+                escaped = ingredient.replace("'", "''").replace("%", "\\%")
+                inclusion_conditions += f"""
+            AND EXISTS (
+                SELECT 1 FROM recipe_ingredient ri
+                JOIN ingredient i ON ri."ingredientId" = i."id"
+                WHERE ri."recipeId" = r."id"
+                AND LOWER(i."name") LIKE '%{escaped.lower()}%'
+            )
+                """
+
         # Build time-based ORDER BY clause
         # Priority: cost sort > time sort > default
         time_order_clause = "ORDER BY r.name"  # Default
@@ -2753,16 +2849,15 @@ class RecipeSearchPipelineSDK:
             session_filter_conditions += f"""
           AND r."userUid" = '{session.filters.creator_uid}'"""
 
-        # 3. Cuisine filter from session
+        # 3. Cuisine filter from session (via tags table)
         if session.filters.cuisines:
-            cuisine_list = ", ".join([f"'{c}'" for c in session.filters.cuisines])
+            cuisine_list = ", ".join([f"'{c.lower()}'" for c in session.filters.cuisines])
             session_filter_conditions += f"""
           AND EXISTS (
-              SELECT 1 FROM recipe_recipe_types_recipe_type rrt
-              JOIN recipe_type rt ON rrt."recipeTypeId" = rt."id"
-              JOIN recipe_type_translation rtt ON rt."id" = rtt."recipeTypeId"
-              WHERE rrt."recipeId" = r."id"
-              AND LOWER(rtt."name") IN ({cuisine_list.lower()})
+              SELECT 1 FROM recipe_tags_tag rtt
+              JOIN tag t ON rtt."tagId" = t."id"
+              WHERE rtt."recipeId" = r."id"
+              AND LOWER(t."name") IN ({cuisine_list})
           )"""
 
         # 4. Tags filter from session
@@ -2803,11 +2898,16 @@ class RecipeSearchPipelineSDK:
                r.image, r.servings, r."userUid" as creator_uid,
                r."private", r."deletedAt", r.recipe_metadata{extra_select_cols}
         FROM recipe r
+        LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
+        LEFT JOIN "bundle" b ON br."bundleId" = b."id"
         WHERE r.id IN ({candidate_list})
           AND r."deletedAt" IS NULL
           AND r."status" = 'published'
+          AND r."languageId" = '{language or "en"}'
+          AND (r."private" = false OR r."userUid" = '{user_uid or ""}' OR br."bundleId" IS NOT NULL)
           {cost_condition}
           {allergen_conditions}
+          {inclusion_conditions}
           {session_filter_conditions}
         {time_order_clause}
         LIMIT 20
@@ -2945,9 +3045,10 @@ class RecipeSearchPipelineSDK:
             # Step 4: Generate response
             response = await generate_recipe_response(
                 query,
-                {"intent": "price_filter"},
                 recipes,
-                {}
+                None,
+                None,
+                filter_context=self._build_nlg_filter_context(session)
             )
 
             # Update session with shown recipes
@@ -3212,14 +3313,19 @@ class RecipeSearchPipelineSDK:
         recipes: List[Dict[str, Any]],
         intent: str,
         cost_filter: Optional[Dict[str, Any]],
-        nutrition_filter: Optional[Dict[str, Any]]
+        nutrition_filter: Optional[Dict[str, Any]],
+        session: Optional[SessionState] = None
     ) -> str:
         """
         Generate natural language response for cost/nutrition filter queries.
         Uses the standard NLG agent for consistent, natural responses.
         """
         if not recipes:
-            return await self._generate_no_results_response(query, {"intent": intent}, None)
+            ctx = self._build_nlg_filter_context(session) if session else None
+            return await self._generate_no_results_response(
+                query, {"intent": intent}, None,
+                filter_context=ctx
+            )
 
         # Use the standard NLG agent for generating response
         # This provides consistent, natural language responses
@@ -3232,7 +3338,11 @@ class RecipeSearchPipelineSDK:
         if nutrition_filter:
             nlid_result["filters"]["nutrition"] = nutrition_filter
 
-        return await self._generate_natural_language_response(query, recipes, nlid_result)
+        filter_ctx = self._build_nlg_filter_context(session) if session else None
+        return await self._generate_natural_language_response(
+            query, recipes, nlid_result,
+            filter_context=filter_ctx
+        )
 
     # ------------------------------------------------------------------ #
     # Helper: extract a country name from a short follow-up query          #
@@ -4869,9 +4979,10 @@ class RecipeSearchPipelineSDK:
             # Generate response
             response = await generate_recipe_response(
                 "Show me more recipes",
-                {"intent": "show_more"},
                 recipes,
-                {}
+                None,
+                None,
+                filter_context=self._build_nlg_filter_context(session)
             )
 
             return {

@@ -306,6 +306,7 @@ CRITICAL RULES:
    - DO NOT add excluded_ingredients (allergies) - these are handled programmatically
 10. For tags (vegetarian, vegan, dessert, etc.): AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%tag_name%')
 11. When filtering by multiple tags, use OR: AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name ILIKE '%vegetarian%' OR t.name ILIKE '%vegan%'))
+12. BUNDLE TABLE: When joining bundle table, ALWAYS add: AND b."deletedAt" IS NULL. The column is mixed-case so MUST be quoted.
 
 SUPER IMPORTANT - PARENTHESES BALANCE:
 - EVERY opening parenthesis ( MUST have a matching closing parenthesis )
@@ -325,7 +326,7 @@ STANDARD QUERY TEMPLATE:
 SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
 FROM recipe r
 LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
-LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+LEFT JOIN "bundle" b ON br."bundleId" = b."id" AND b."deletedAt" IS NULL
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
@@ -338,7 +339,7 @@ TAG FILTERING TEMPLATE (for dessert, vegetarian, etc.):
 SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
 FROM recipe r
 LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
-LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+LEFT JOIN "bundle" b ON br."bundleId" = b."id" AND b."deletedAt" IS NULL
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
@@ -355,7 +356,7 @@ NEVER use a username or display name in the userUid filter.
 SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
 FROM recipe r
 LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
-LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+LEFT JOIN "bundle" b ON br."bundleId" = b."id" AND b."deletedAt" IS NULL
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
@@ -1027,7 +1028,9 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
                 "[ALLERGEN INJECTION] Removed existing LLM-generated "
                 "allergen filter blocks"
             )
-        sql = sql_cleaned
+        # Re-balance after regex removals so the injected exclusion clause
+        # is appended at top-level WHERE scope.
+        sql = self._ensure_valid_sql(sql_cleaned)
 
         # ------------------------------------------------------------------
         # Step 2: Build the programmatic exclusion clause
@@ -1363,6 +1366,11 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             flags=re.IGNORECASE
         )
 
+        # Normalize / balance SQL before programmatic injections.
+        # If LLM output contains unclosed parentheses, later injections can
+        # land inside nested OR/EXISTS blocks and become ineffective.
+        sql = self._ensure_valid_sql(sql)
+
         # Inject programmatically-built allergen exclusion clause
         # This ensures ALL expanded allergen variants are included
         excluded_ingredients = sql_filters.get("excluded_ingredients") or sql_filters.get("exclude_ingredients")
@@ -1474,7 +1482,6 @@ class SQLExecutionService:
                 formatted_sql = sql
                 for key, value in params.items():
                     formatted_sql = formatted_sql.replace(f":{key}", f"'{value}'")
-                logger.info(f"[SQL EXECUTOR] Final SQL (after param substitution):\n{formatted_sql}")
                 result = self.db.execute(text(formatted_sql))
             else:
                 logger.info(f"[SQL EXECUTOR] Final SQL (no params):\n{sql}")
