@@ -44,7 +44,7 @@ class RetrievalPlan:
     reasoning: str
     vector_query: Optional[str] = None  # Query for embedding search
     sql_filters: Dict[str, Any] = None  # Filters for SQL
-    top_k: int = 20  # Number of candidates to retrieve
+    top_k: int = 100  # Number of candidates to retrieve (large pool for multi-turn filter narrowing)
     use_reranking: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
@@ -154,36 +154,63 @@ class RetrievalStrategyDecider:
           "vegetarian recipes without dairy"           → "vegetarian recipes"
           "something sweet but no nuts"                → "something sweet"
           "easy quick, vegetarian, allergic to dairy"  → "easy quick vegetarian"
+          "I dont have eggs, cook something for christmas" → "cook something christmas"
         """
         import re
 
         q = query.lower()
 
+        # First, explicitly remove excluded ingredient names from the query
+        # This handles cases where regex patterns might miss them
+        excluded_ingredients = filters.get("excluded_ingredients", [])
+        if excluded_ingredients:
+            for ingredient in excluded_ingredients:
+                # Remove the ingredient word(s) from query
+                # Use word boundaries to avoid partial matches
+                ing_lower = ingredient.lower().strip()
+                if ing_lower and len(ing_lower) > 2:  # Skip very short words
+                    # Remove ingredient with optional surrounding context
+                    q = re.sub(rf'\b{re.escape(ing_lower)}s?\b', '', q, flags=re.IGNORECASE)
+
         # Ordered from most-specific to least-specific so broad patterns
         # don't swallow more specific ones.
+        # FIXED: Removed the typo `[,.]!\s*` and improved patterns
         STRIP_PATTERNS = [
+            # Structural filter phrases - these don't add semantic meaning for embeddings
+            # "that serves 4 guests" → remove entirely
+            r"\bthat\s+serv(?:es?|ing)\s+\d+\s*(?:guests?|people|portions?|servings?)?\b",
+            # "serves 4 guests" / "serves 4 people" → remove entirely
+            r"\bserv(?:es?|ing)\s+\d+\s*(?:guests?|people|portions?|servings?)?\b",
+            # "for 4 guests" / "for 4 people" when used as serving specification
+            r"\bfor\s+\d+\s+(?:guests?|people|portions?|servings?)\b",
             # "remember I am a vegetarian" → keep "vegetarian" but strip the frame
             r"remember\s+i\s+(?:'?m|am)\s+",
             # "I am / I'm allergic to X", "I am intolerant to X"
-            r"(?:i\s+)?(?:i'?m|i\s+am)\s+(?:allergic|intolerant)\s+to\s+[\w\s]{1,30}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r"(?:i\s+)?(?:i'?m|i\s+am)\s+(?:allergic|intolerant)\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "allergic to X"
-            r"\ballergic\s+to\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
-            # "I don't like/want/eat/have/use X"
-            r"(?:i\s+)?(?:don'?t|do\s+not)\s+(?:like|want|eat|have|use)\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r"\ballergic\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "I don't like/want/eat/have/use/need X" - matches "dont" and "don't"
+            # FIXED: Greedily match up to 3 words after the verb to capture ingredient names
+            r"(?:i\s+)?(?:don'?t|do\s+not)\s+(?:like|want|eat|have|use|need)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "I ran out of X", "I'm missing X"
+            r"(?:i\s+)?(?:ran\s+out\s+of|missing|out\s+of)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "without X"
-            r"\bwithout\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r"\bwithout\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "but no X / except X / avoid X"
-            r"\b(?:but\s+no|except|avoid(?:ing)?)\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r"\b(?:but\s+no|except|avoid(?:ing)?)\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "I hate X"
-            r"(?:i\s+)?hate\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r"(?:i\s+)?hate\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "can't eat X"
-            r"can'?t\s+eat\s+[\w\s]{1,20}?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
-            # Standalone "no X"
-            r"\bno\s+[\w]+(?:\s+[\w]+)?(?=\s+|,|\.|$)",
+            r"can'?t\s+eat\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            # "no X" followed by comma or end of clause
+            r",?\s*no\s+\w+(?:\s+\w+)?(?=\s*,|\s*\.|\s+and\b|\s+but\b|$)",
         ]
 
         for pat in STRIP_PATTERNS:
+            old_q = q
             q = re.sub(pat, " ", q, flags=re.IGNORECASE)
+            if old_q != q:
+                logger.info(f"[RETRIEVAL STRATEGY] Pattern '{pat[:50]}...' matched and removed text")
 
         # Clean up punctuation and whitespace
         q = re.sub(r'[,;]+', ' ', q)
@@ -197,6 +224,7 @@ class RetrievalStrategyDecider:
             'tell', 'give', 'show', 'get', 'make', 'want', 'need',
             'something', 'anything', 'everything', 'it', 'its',
             'with', 'for', 'from', 'to', 'at', 'by', 'on', 'in',
+            'dont', "don't", 'not', 'no', 'im', "i'm", 'am',
         }
         tokens = [w for w in q.split() if w not in STOP_WORDS and len(w) > 1]
 
@@ -296,6 +324,7 @@ class RetrievalStrategyDecider:
             "cost_filter", "time_filter", "nutrition_filter",
             "cost", "time", "nutrition",
             "difficulty", "max_time", "season", "region",
+            "servings", "ingredient_count",
         }
 
         # Merge fresh filters with existing filters
@@ -642,6 +671,21 @@ class RetrievalStrategyDecider:
                 )
                 vector_query = clean_query
 
+        # CRITICAL: Check if query has ONLY structural filters (no semantic content)
+        # Examples: "recipes for 3 people", "something under 30 minutes", "quick recipes"
+        # These should use SQL_ONLY to avoid useless embeddings returning random results
+        if self._has_structural_filters_only(query, filters, entities, parameters):
+            logger.info(
+                f"[RETRIEVAL STRATEGY] Query has only structural filters, "
+                f"no semantic content. Using SQL_ONLY to avoid useless embedding."
+            )
+            return RetrievalPlan(
+                strategy=RetrievalStrategy.SQL_ONLY,
+                reasoning="Query has only structural filters (servings/time/cost) with no ingredients/cuisines. SQL-only to avoid meaningless embedding.",
+                sql_filters=self._build_sql_filters(parameters, filters, session_context, RetrievalStrategy.SQL_ONLY),
+                top_k=100
+            )
+
         # Check for direct recipe search
         if self._is_direct_recipe_search(query):
             strategy = RetrievalStrategy.HYBRID_VECTOR_TO_SQL
@@ -650,7 +694,7 @@ class RetrievalStrategyDecider:
                 reasoning="Direct recipe request - using semantic search with SQL filters",
                 vector_query=vector_query,
                 sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
-                top_k=20
+                top_k=100
             )
 
         # Check for structured query with multiple constraints
@@ -667,7 +711,7 @@ class RetrievalStrategyDecider:
                 reasoning=f"Query has both structured (score:{structured_score}) and fuzzy (score:{fuzzy_score}) elements. Using vector search for relevance, SQL for constraints.",
                 vector_query=vector_query,
                 sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
-                top_k=20
+                top_k=100
             )
 
         elif structured_score >= 3:
@@ -679,7 +723,7 @@ class RetrievalStrategyDecider:
                     strategy=strategy,
                     reasoning=f"Query has tight structured filters (score:{structured_score}). SQL-only is sufficient.",
                     sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
-                    top_k=20
+                    top_k=100
                 )
             else:
                 # Has structure but filters are loose → Hybrid (SQL → Vector)
@@ -689,7 +733,7 @@ class RetrievalStrategyDecider:
                     reasoning=f"Query has structured elements (score:{structured_score}) but filters are loose. Using SQL to narrow, vector to re-rank.",
                     vector_query=vector_query,
                     sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
-                    top_k=30,  # Get more candidates for re-ranking
+                    top_k=100,  # Get more candidates for re-ranking
                     use_reranking=True
                 )
 
@@ -700,7 +744,7 @@ class RetrievalStrategyDecider:
                 reasoning=f"Query is primarily fuzzy/semantic (score:{fuzzy_score}). Using embedding search for relevance.",
                 vector_query=vector_query,
                 sql_filters={},  # Minimal filtering
-                top_k=20
+                top_k=100
             )
 
         else:
@@ -711,7 +755,7 @@ class RetrievalStrategyDecider:
                 reasoning="Query intent is unclear. Using hybrid approach for best results.",
                 vector_query=vector_query,
                 sql_filters=self._build_sql_filters(parameters, filters, session_context, strategy),
-                top_k=20
+                top_k=100
             )
 
     def _is_direct_recipe_search(self, query: str) -> bool:
@@ -806,7 +850,7 @@ class RetrievalStrategyDecider:
         if parameters.get("difficulty"):
             tight_filter_count += 1
 
-        if parameters.get("servings"):
+        if parameters.get("servings") or filters.get("servings"):
             tight_filter_count += 1
 
         if filters.get("tags"):
@@ -824,6 +868,120 @@ class RetrievalStrategyDecider:
         else:
             # Need at least 2 tight filters for SQL-only
             return tight_filter_count >= 2
+
+    def _has_semantic_content(
+        self,
+        query: str,
+        filters: Dict[str, Any],
+        entities: Dict[str, Any]
+    ) -> bool:
+        """
+        Check if the query has meaningful semantic content for embedding.
+
+        Returns True if there's positive content to embed (ingredients, cuisines, dish types).
+        Returns False if the query only has structural filters (servings, time, cost, etc.).
+
+        This prevents useless embeddings like "I have guests" returning random recipes.
+        """
+        query_lower = query.lower()
+
+        # Check for positive ingredients (included, not excluded)
+        included_ingredients = filters.get("included_ingredients", [])
+        if included_ingredients:
+            return True
+
+        # Check entities for ingredients or recipes
+        if entities:
+            ingredients = entities.get("ingredients", [])
+            recipes = entities.get("recipes", [])
+            cuisines = entities.get("cuisines", [])
+            meal_types = entities.get("meal_types", [])  # dinner, lunch, breakfast, etc.
+
+            if ingredients or recipes or cuisines or meal_types:
+                return True
+
+        # Check for cuisine keywords in query
+        cuisine_keywords = [
+            "italian", "mexican", "indian", "chinese", "thai", "japanese",
+            "french", "greek", "spanish", "korean", "vietnamese", "american"
+        ]
+        for cuisine in cuisine_keywords:
+            if cuisine in query_lower:
+                return True
+
+        # Check for dish type keywords
+        dish_keywords = [
+            "pasta", "pizza", "burger", "salad", "soup", "curry", "rice",
+            "chicken", "beef", "fish", "pork", "lamb", "seafood",
+            "dessert", "cake", "cookie", "bread", "sandwich", "tacos",
+            "noodles", "stew", "roast", "steak", "omelet", "pancakes"
+        ]
+        for dish in dish_keywords:
+            if dish in query_lower:
+                return True
+
+        # Check for positive dietary/meal type tags
+        positive_tags = filters.get("tags", [])
+        # These are semantic (dessert, breakfast, christmas) not just structural
+        semantic_tags = [
+            "dessert", "breakfast", "lunch", "dinner", "snack",
+            "christmas", "thanksgiving", "easter", "holiday",
+            "healthy", "comfort food", "party", "bbq"
+        ]
+        for tag in positive_tags:
+            if tag.lower() in semantic_tags:
+                return True
+
+        # Check for meaningful descriptive words that indicate what user wants
+        # (not just structural filters)
+        descriptive_patterns = [
+            r'\b(sweet|savory|spicy|creamy|crispy|chewy|soft|hard)\b',
+            r'\b(chocolate|vanilla|strawberry|lemon|garlic|onion|tomato)\b',
+            r'\b(simple|easy|quick|fast|elaborate|fancy)\b',
+        ]
+        import re
+        for pattern in descriptive_patterns:
+            if re.search(pattern, query_lower):
+                return True
+
+        # No semantic content found - only structural filters
+        return False
+
+    def _has_structural_filters_only(
+        self,
+        query: str,
+        filters: Dict[str, Any],
+        entities: Dict[str, Any],
+        parameters: Dict[str, Any]
+    ) -> bool:
+        """
+        Check if the query has ONLY structural filters with no semantic content.
+
+        Examples of structural-only queries:
+        - "recipes for 3 people" (only servings)
+        - "something under 30 minutes" (only time)
+        - "recipes under $20" (only cost)
+        - "quick recipes for 4 people" (time + servings, no ingredients)
+
+        These should use SQL_ONLY to avoid useless embeddings.
+        """
+        # If there's semantic content, it's not structural-only
+        if self._has_semantic_content(query, filters, entities):
+            return False
+
+        # Check if there are any structural filters present
+        has_structural = (
+            parameters.get("servings") or
+            filters.get("servings") or
+            parameters.get("max_time") or
+            filters.get("time") or
+            filters.get("cost") or
+            filters.get("nutrition") or
+            filters.get("ingredient_count") or
+            filters.get("excluded_ingredients")  # Exclusions are structural
+        )
+
+        return has_structural
 
     def _build_sql_filters(
         self,
@@ -924,6 +1082,14 @@ class RetrievalStrategyDecider:
         if parameters.get("servings"):
             sql_filters["servings"] = parameters["servings"]
 
+        # Handle servings from filters (NLID may put it there)
+        if filters.get("servings"):
+            sql_filters["servings"] = filters["servings"]
+
+        # Handle ingredient_count filter
+        if filters.get("ingredient_count"):
+            sql_filters["ingredient_count"] = filters["ingredient_count"]
+
         # From NLID filters
         if filters.get("tags"):
             sql_filters["tags"] = filters["tags"]
@@ -1009,6 +1175,45 @@ class RetrievalStrategyDecider:
                 sql_filters["difficulty"] = existing
             else:
                 sql_filters["difficulty"] = session_filters["difficulty"]
+
+        # Session servings - carry forward from previous turns
+        # Only use session servings if current query doesn't specify servings
+        if session_filters.get("servings") and not sql_filters.get("servings"):
+            sql_filters["servings"] = session_filters["servings"]
+            logger.info(f"[RETRIEVAL STRATEGY] Carried forward servings from session: {session_filters['servings']}")
+
+        # Session ingredient count - carry forward from previous turns
+        if session_filters.get("ingredient_count") and not sql_filters.get("ingredient_count"):
+            sql_filters["ingredient_count"] = session_filters["ingredient_count"]
+
+        # Session cost_filter - carry forward for multi-turn budget context
+        # e.g., Q1: "my budget is 100" → Q2: "something vegetarian" → both filters apply
+        if session_filters.get("cost_filter") and not sql_filters.get("cost_filter"):
+            sql_filters["cost_filter"] = session_filters["cost_filter"]
+            # Also set the pricing_filters key expected by SQL generator
+            if not sql_filters.get("pricing_filters"):
+                sql_filters["pricing_filters"] = session_filters["cost_filter"]
+            logger.info(f"[RETRIEVAL STRATEGY] Carried forward cost_filter from session")
+
+        # Session time_filter - carry forward for multi-turn time context
+        # e.g., Q1: "quick recipes" → Q2: "vegetarian" → both filters apply
+        if session_filters.get("time_filter") and not sql_filters.get("time_filter"):
+            sql_filters["time_filter"] = session_filters["time_filter"]
+            # Convert time_filter to time_sort_order if it has sort_order
+            time_f = session_filters["time_filter"]
+            if isinstance(time_f, dict) and time_f.get("sort_order"):
+                if not sql_filters.get("time_sort_order"):
+                    sql_filters["time_sort_order"] = time_f["sort_order"]
+            logger.info(f"[RETRIEVAL STRATEGY] Carried forward time_filter from session")
+
+        # Session nutrition_filter - carry forward for multi-turn nutrition context
+        # e.g., Q1: "high protein" → Q2: "without eggs" → both filters apply
+        if session_filters.get("nutrition_filter") and not sql_filters.get("nutrition_filter"):
+            sql_filters["nutrition_filter"] = session_filters["nutrition_filter"]
+            # Also set the nutrition_filters key expected by SQL generator
+            if not sql_filters.get("nutrition_filters"):
+                sql_filters["nutrition_filters"] = session_filters["nutrition_filter"]
+            logger.info(f"[RETRIEVAL STRATEGY] Carried forward nutrition_filter from session")
 
         # Session excluded ingredients (allergies) - always apply
         session_excluded = session_context.get("excluded_ingredients", [])

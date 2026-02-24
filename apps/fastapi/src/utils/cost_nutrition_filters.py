@@ -8,6 +8,115 @@ from typing import Dict, Any, Optional, List, Tuple
 from enum import Enum
 
 
+# =====================================================
+# SPELLING TOLERANCE - Common misspellings
+# =====================================================
+
+SPELLING_CORRECTIONS = {
+    # Price/budget related
+    "budjet": "budget",
+    "bujet": "budget",
+    "bidget": "budget",
+    "expencive": "expensive",
+    "expenive": "expensive",
+    "expensiv": "expensive",
+    "cheep": "cheap",
+    "chep": "cheap",
+    "afforadable": "affordable",
+    "affrdable": "affordable",
+    "afordable": "affordable",
+    "prce": "price",
+    "prize": "price",
+    "prise": "price",
+    "priec": "price",
+    "costy": "costly",
+    "cast": "cost",  # only in context
+
+    # Currency related
+    "doller": "dollar",
+    "dollers": "dollars",
+    "dolar": "dollar",
+    "rupe": "rupee",
+    "rupess": "rupees",
+    "rupies": "rupees",
+    "rupeese": "rupees",
+    "kroner": "krone",
+    "krone": "kr",
+
+    # Direction words
+    "underneeth": "under",
+    "underneth": "under",
+    "bellow": "below",
+    "belw": "below",
+    "less then": "less than",
+    "lessthan": "less than",
+    "les than": "less than",
+
+    # Recipe/food related
+    "recpie": "recipe",
+    "recpies": "recipes",
+    "receipe": "recipe",
+    "receipes": "recipes",
+    "resipe": "recipe",
+    "ingrediant": "ingredient",
+    "ingrediants": "ingredients",
+    "ingridient": "ingredient",
+    "chiken": "chicken",
+    "chickn": "chicken",
+    "potatoe": "potato",
+    "tomatoe": "tomato",
+    "brocoli": "broccoli",
+    "califlower": "cauliflower",
+    "onoin": "onion",
+    "oignon": "onion",
+
+    # Nutrition related
+    "protien": "protein",
+    "protine": "protein",
+    "proteen": "protein",
+    "carboydrate": "carbohydrate",
+    "carbohidrate": "carbohydrate",
+    "carb": "carbs",
+    "callorie": "calorie",
+    "calory": "calorie",
+    "calorys": "calories",
+    "fibre": "fiber",
+    "suger": "sugar",
+    "suggar": "sugar",
+    "vitimin": "vitamin",
+    "vitamine": "vitamin",
+    "calcum": "calcium",
+    "calcuim": "calcium",
+    "magnessium": "magnesium",
+    "magnesum": "magnesium",
+    "potasium": "potassium",
+    "potassum": "potassium",
+    "selinium": "selenium",
+    "selenum": "selenium",
+}
+
+
+def normalize_spelling(query: str) -> str:
+    """
+    Normalize common misspellings in the query.
+
+    Args:
+        query: User's query text
+
+    Returns:
+        Query with corrected spellings
+    """
+    query_lower = query.lower()
+    corrected = query_lower
+
+    for misspelling, correct in SPELLING_CORRECTIONS.items():
+        # Use word boundaries to avoid partial replacements
+        pattern = r'\b' + re.escape(misspelling) + r'\b'
+        corrected = re.sub(pattern, correct, corrected, flags=re.IGNORECASE)
+
+    return corrected
+
+
 class CountryCode(str, Enum):
     US = "US"
     INDIA = "India"
@@ -55,6 +164,8 @@ CURRENCY_SYMBOLS = {
 
 
 # Nutrition keyword normalization
+# For micros (minerals/vitamins), we store the path as "micros:key" to indicate
+# they should be looked up in the micros section of recipe_metadata
 NUTRITION_KEYWORDS = {
     # Protein
     "protein": "protein",
@@ -86,13 +197,168 @@ NUTRITION_KEYWORDS = {
     "sugar": "totalSugars",
     "sugars": "totalSugars",
 
-    # Sodium
+    # Sodium (in macros)
     "sodium": "sodium",
     "salt": "sodium",
 
-    # Cholesterol
+    # Cholesterol (in macros)
     "cholesterol": "cholesterol",
+
+    # Saturated Fat (in macros)
+    "saturated": "saturatedFat",
+    "saturated fat": "saturatedFat",
+    "saturatedfat": "saturatedFat",
+
+    # Trans Fat (in macros)
+    "trans fat": "transFat",
+    "transfat": "transFat",
+
+    # Starch (in macros)
+    "starch": "starch",
+
+    # === MICRONUTRIENTS (Minerals) - stored in micros section ===
+    # Calcium
+    "calcium": "micros:calcium",
+    "ca": "micros:calcium",
+
+    # Iron
+    "iron": "micros:iron",
+    "fe": "micros:iron",
+
+    # Magnesium
+    "magnesium": "micros:magnesium",
+    "mg": "micros:magnesium",
+
+    # Zinc
+    "zinc": "micros:zinc",
+    "zn": "micros:zinc",
+
+    # Potassium
+    "potassium": "micros:potassium",
+    "k": "micros:potassium",
+
+    # Copper
+    "copper": "micros:copper",
+    "cu": "micros:copper",
+
+    # Phosphorus
+    "phosphorus": "micros:phosphorus",
+    "phosphate": "micros:phosphorus",
+    "p": "micros:phosphorus",
+
+    # Manganese
+    "manganese": "micros:manganese",
+    "mn": "micros:manganese",
+
+    # Selenium
+    "selenium": "micros:selenium",
+    "se": "micros:selenium",
+
+    # Fluoride
+    "fluoride": "micros:fluoride",
+    "fluorine": "micros:fluoride",
+    "f": "micros:fluoride",
+
+    # === MICRONUTRIENTS (Vitamins) - stored in micros section ===
+    # Vitamin A
+    "vitamin a": "micros:vitaminA",
+    "vitamina": "micros:vitaminA",
+    "retinol": "micros:vitaminA",
+    "vit a": "micros:vitaminA",
+
+    # Vitamin C
+    "vitamin c": "micros:vitaminC",
+    "vitaminc": "micros:vitaminC",
+    "ascorbic": "micros:vitaminC",
+    "ascorbic acid": "micros:vitaminC",
+    "vit c": "micros:vitaminC",
+
+    # Vitamin D
+    "vitamin d": "micros:vitaminD",
+    "vitamind": "micros:vitaminD",
+    "calciferol": "micros:vitaminD",
+    "vit d": "micros:vitaminD",
+
+    # Vitamin E
+    "vitamin e": "micros:vitaminE",
+    "vitamine": "micros:vitaminE",
+    "tocopherol": "micros:vitaminE",
+    "vit e": "micros:vitaminE",
+
+    # Vitamin K
+    "vitamin k": "micros:vitaminK",
+    "vitamink": "micros:vitaminK",
+    "phylloquinone": "micros:vitaminK",
+    "vit k": "micros:vitaminK",
+
+    # B Vitamins
+    "vitamin b1": "micros:thiamineB1",
+    "thiamine": "micros:thiamineB1",
+    "thiamin": "micros:thiamineB1",
+    "b1": "micros:thiamineB1",
+
+    "vitamin b2": "micros:riboflavinB2",
+    "riboflavin": "micros:riboflavinB2",
+    "b2": "micros:riboflavinB2",
+
+    "vitamin b3": "micros:niacinB3",
+    "niacin": "micros:niacinB3",
+    "b3": "micros:niacinB3",
+
+    "vitamin b5": "micros:pantothenicAcidB5",
+    "pantothenic": "micros:pantothenicAcidB5",
+    "pantothenic acid": "micros:pantothenicAcidB5",
+    "b5": "micros:pantothenicAcidB5",
+
+    "vitamin b6": "micros:vitaminB6",
+    "pyridoxine": "micros:vitaminB6",
+    "b6": "micros:vitaminB6",
+
+    "vitamin b7": "micros:biotinB7",
+    "biotin": "micros:biotinB7",
+    "b7": "micros:biotinB7",
+
+    "vitamin b9": "micros:folateB9",
+    "folate": "micros:folateB9",
+    "folic acid": "micros:folateB9",
+    "b9": "micros:folateB9",
+
+    "vitamin b12": "micros:vitaminB12",
+    "cobalamin": "micros:vitaminB12",
+    "b12": "micros:vitaminB12",
+
+    "choline": "micros:choline",
 }
+
+
+def get_nutrition_type(nutrient_key: str) -> str:
+    """
+    Determine if a nutrient is a macro or micro.
+
+    Args:
+        nutrient_key: The nutrient key from NUTRITION_KEYWORDS
+
+    Returns:
+        "micros" if the nutrient is a micronutrient, "macros" otherwise
+    """
+    if nutrient_key.startswith("micros:"):
+        return "micros"
+    return "macros"
+
+
+def get_nutrient_column(nutrient_key: str) -> str:
+    """
+    Get the actual column name for a nutrient.
+
+    Args:
+        nutrient_key: The nutrient key from NUTRITION_KEYWORDS
+
+    Returns:
+        The column name without the "micros:" prefix if present
+    """
+    if nutrient_key.startswith("micros:"):
+        return nutrient_key[6:]  # Remove "micros:" prefix
+    return nutrient_key
 
 
 # Level keywords mapping to sort order
@@ -162,7 +428,8 @@ def extract_cost_filter(query: str) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with cost filter details or None
     """
-    query_lower = query.lower()
+    # Normalize spelling first
+    query_lower = normalize_spelling(query)
 
     # Detect country and currency
     country, currency_symbol = detect_country_from_currency(query)
@@ -246,7 +513,8 @@ def extract_nutrition_filter(query: str) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with nutrition filter details or None
     """
-    query_lower = query.lower()
+    # Normalize spelling first
+    query_lower = normalize_spelling(query)
 
     result = {
         "nutrients": [],

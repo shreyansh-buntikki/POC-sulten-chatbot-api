@@ -87,6 +87,115 @@ class ConversationStore:
 
         return query.order_by(desc(ChatSession.updated_at)).limit(limit).all()
 
+    def get_most_recent_active_session(
+        self,
+        user_uid: str
+    ) -> Optional[ChatSession]:
+        """
+        Get the most recently active session for a user based on last user message.
+
+        Uses a single optimized query with JOIN instead of N+1 queries.
+        This is more efficient than get_user_sessions + looping through messages.
+
+        Args:
+            user_uid: User identifier
+
+        Returns:
+            Most recently active ChatSession or None if no sessions exist
+        """
+        from sqlalchemy import func
+
+        # Single query: JOIN sessions with messages, filter by user messages,
+        # group by session, order by max message created_at
+        subquery = self.db.query(
+            ChatMessage.session_id,
+            func.max(ChatMessage.created_at).label('last_user_msg_time')
+        ).filter(
+            ChatMessage.role == 'user'
+        ).group_by(
+            ChatMessage.session_id
+        ).subquery()
+
+        # Join with sessions, filter by user and active status
+        result = self.db.query(ChatSession).join(
+            subquery,
+            ChatSession.id == subquery.c.session_id
+        ).filter(
+            ChatSession.user_uid == user_uid,
+            ChatSession.is_active == True
+        ).order_by(
+            desc(subquery.c.last_user_msg_time)
+        ).first()
+
+        # If no session with user messages, fall back to most recent session by updated_at
+        if not result:
+            result = self.db.query(ChatSession).filter(
+                ChatSession.user_uid == user_uid,
+                ChatSession.is_active == True
+            ).order_by(
+                desc(ChatSession.updated_at)
+            ).first()
+
+        return result
+
+    def get_sessions_with_last_message_time(
+        self,
+        user_uid: str,
+        include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """
+        Get sessions with their last user message timestamp in a single query.
+        Optimized to avoid N+1 queries when sorting sessions by activity.
+
+        Args:
+            user_uid: User identifier
+            include_inactive: Whether to include inactive sessions
+
+        Returns:
+            List of dicts with 'session' and 'last_user_msg_time' keys,
+            sorted by last_user_msg_time descending (most recent first)
+        """
+        from sqlalchemy import func
+
+        # Subquery to get last user message time per session
+        subquery = self.db.query(
+            ChatMessage.session_id,
+            func.max(ChatMessage.created_at).label('last_user_msg_time')
+        ).filter(
+            ChatMessage.role == 'user'
+        ).group_by(
+            ChatMessage.session_id
+        ).subquery()
+
+        # Base query for sessions
+        query = self.db.query(
+            ChatSession,
+            subquery.c.last_user_msg_time
+        ).outerjoin(
+            subquery,
+            ChatSession.id == subquery.c.session_id
+        ).filter(
+            ChatSession.user_uid == user_uid
+        )
+
+        if not include_inactive:
+            query = query.filter(ChatSession.is_active == True)
+
+        # Order by last message time (nulls last), then by session updated_at
+        results = query.order_by(
+            desc(subquery.c.last_user_msg_time),
+            desc(ChatSession.updated_at)
+        ).all()
+
+        # Format results
+        return [
+            {
+                "session": row[0],
+                "last_user_msg_time": row[1] or row[0].created_at  # Fallback to session creation
+            }
+            for row in results
+        ]
+
     def update_session_title(self, session_id: str, title: str) -> bool:
         """
         Update session title
@@ -239,10 +348,22 @@ class ConversationStore:
         if role:
             query = query.filter(ChatMessage.role == role)
 
-        query = query.order_by(ChatMessage.created_at)
-
+        # When limit is specified, we want the MOST RECENT N messages,
+        # not the oldest N. Use a subquery to get the last N by created_at,
+        # then order the result chronologically for AI context.
         if limit:
-            query = query.limit(limit)
+            # Subquery: get the IDs of the most recent N messages
+            subquery = self.db.query(ChatMessage.id).filter(
+                ChatMessage.session_id == session_id
+            )
+            if role:
+                subquery = subquery.filter(ChatMessage.role == role)
+            subquery = subquery.order_by(ChatMessage.created_at.desc()).limit(limit)
+
+            # Main query: get those messages ordered chronologically
+            query = query.filter(ChatMessage.id.in_(subquery))
+
+        query = query.order_by(ChatMessage.created_at)
 
         return query.all()
 

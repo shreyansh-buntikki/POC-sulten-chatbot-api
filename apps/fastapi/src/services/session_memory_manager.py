@@ -2,7 +2,7 @@
 Session Memory Manager
 Maintains conversational context and state across turns
 """
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Union
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -40,6 +40,13 @@ class SessionFilters:
     region: Optional[str] = None  # regional preference
     creator_uid: Optional[str] = None  # filter by recipe creator
     creator_username: Optional[str] = None  # resolved username for NLG context
+    servings: Optional[Union[int, Dict[str, Any]]] = None  # int for exact, dict for range/comparison/sort
+    # Examples:
+    #   - 4 → exactly 4 servings
+    #   - {"min": 2, "max": 4} → between 2 and 4 servings
+    #   - {"operator": ">=", "value": 4} → at least 4 servings
+    #   - {"sort": "DESC"} → just sort by servings DESC (no filter)
+    ingredient_count: Optional[Dict[str, Any]] = None  # e.g. {"operator": "<=", "value": 5}
     # Persisted filter state for multi-turn context
     cost_filter: Optional[Dict[str, Any]] = None  # e.g. {"operator": "<=", "value": 100, "country": "Norway", "sort_order": "DESC"}
     time_filter: Optional[Dict[str, Any]] = None  # e.g. {"sort_order": "ASC"}
@@ -473,6 +480,10 @@ class SessionMemoryManager:
                     "allergic", "allergy", "can't have", "cannot have",
                     "i'm not a fan", "im not a fan", "not a fan",
                     "avoid", "without", "exclude",
+                    # NEW: Handle "don't have" patterns
+                    "dont have", "don't have", "do not have",
+                    "ran out", "ran out of", "missing", "i'm missing",
+                    "no more", "out of",
                 ]
                 is_exclusion_query = any(indicator in content for indicator in exclusion_indicators)
 
@@ -502,6 +513,36 @@ class SessionMemoryManager:
                     r"no (\w+(?:\s+\w+)*)(?:\s+please)?",
                 ]
 
+                # Additional exclusion patterns for "ran out of", "don't have", etc.
+                # These catch cases where the NLID agent might miss the extraction
+                exclusion_patterns = [
+                    # "ran out of X", "ran out of eggs"
+                    r"ran out of (\w+(?:\s+\w+)*)",
+                    # "don't have X", "dont have eggs"
+                    r"don'?t have (\w+(?:\s+\w+)*)",
+                    # "don't like X", "dont like chicken"
+                    r"don'?t like (\w+(?:\s+\w+)*)",
+                    # "do not have X"
+                    r"do not have (\w+(?:\s+\w+)*)",
+                    # "do not like X"
+                    r"do not like (\w+(?:\s+\w+)*)",
+                    # "missing X", "i'm missing X"
+                    r"(?:i'?m\s+)?missing (\w+(?:\s+\w+)*)",
+                    # "out of X" (when referring to ingredients)
+                    r"out of (\w+(?:\s+\w+)*)",
+                    # "no more X"
+                    r"no more (\w+(?:\s+\w+)*)",
+                    # "avoid X"
+                    r"avoid (\w+(?:\s+\w+)*)",
+                    # "without X"
+                    r"without (\w+(?:\s+\w+)*)",
+                    # "hate X"
+                    r"hate (\w+(?:\s+\w+)*)",
+                    # "can't eat X"
+                    r"can'?t eat (\w+(?:\s+\w+)*)",
+                ]
+
+                # Process allergy patterns
                 for pattern in allergy_patterns:
                     matches = re.finditer(pattern, content)
                     for match in matches:
@@ -509,6 +550,24 @@ class SessionMemoryManager:
                         if ingredient and ingredient not in ["no", "not", "dont", "don't"]:
                             if ingredient not in session.excluded_ingredients:
                                 session.excluded_ingredients.append(ingredient)
+                                logger.info(f"[SESSION FALLBACK] Extracted excluded ingredient via allergy pattern: {ingredient}")
+
+                # Process exclusion patterns
+                for pattern in exclusion_patterns:
+                    matches = re.finditer(pattern, content)
+                    for match in matches:
+                        ingredient = match.group(1).strip().lower()
+                        # Filter out false positives (common words that aren't ingredients)
+                        false_positives = [
+                            "a", "an", "the", "it", "that", "this", "my", "your", "his", "her",
+                            "any", "some", "much", "many", "more", "most", "other", "another",
+                            "time", "money", "idea", "clue", "problem", "issue", "luck",
+                            "recipes", "recipe", "food", "meal", "dinner", "lunch", "breakfast",
+                        ]
+                        if ingredient and ingredient not in false_positives:
+                            if ingredient not in session.excluded_ingredients:
+                                session.excluded_ingredients.append(ingredient)
+                                logger.info(f"[SESSION FALLBACK] Extracted excluded ingredient via exclusion pattern: {ingredient}")
 
         return session
 
@@ -683,6 +742,20 @@ class SessionMemoryManager:
             session.filters.nutrition_filter = filters['nutrition']
             logger.info(f"[SESSION UPDATE] Persisted nutrition_filter: {filters['nutrition']}")
 
+        # Persist servings for multi-turn context
+        # e.g., Q1: "Italian for 2 people" → Q2: "allergic to chicken" → servings=2 preserved
+        if filters.get('servings'):
+            session.filters.servings = filters['servings']
+            logger.info(f"[SESSION UPDATE] Persisted servings: {filters['servings']}")
+        elif parameters.get('servings'):
+            session.filters.servings = parameters['servings']
+            logger.info(f"[SESSION UPDATE] Persisted servings from parameters: {parameters['servings']}")
+
+        # Persist ingredient_count for multi-turn context
+        if filters.get('ingredient_count'):
+            session.filters.ingredient_count = filters['ingredient_count']
+            logger.info(f"[SESSION UPDATE] Persisted ingredient_count: {filters['ingredient_count']}")
+
         # Save and return
         session.increment_turn()
         self.save_session(session)
@@ -723,6 +796,8 @@ class SessionMemoryManager:
                 "cost_filter": session.filters.cost_filter,
                 "time_filter": session.filters.time_filter,
                 "nutrition_filter": session.filters.nutrition_filter,
+                "servings": session.filters.servings,
+                "ingredient_count": session.filters.ingredient_count,
             },
             "context_entities": {
                 "last_referenced_recipe_id": session.context_entities.last_referenced_recipe_id,

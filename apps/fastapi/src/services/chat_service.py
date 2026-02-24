@@ -67,40 +67,23 @@ class ChatService:
             max_sessions: Maximum number of sessions to keep (default 5)
         """
         try:
-            # Get all active sessions for user
-            sessions = self.conversation_store.get_user_sessions(user_uid, limit=100)
-
-            if len(sessions) <= max_sessions:
-                return  # Nothing to cleanup
-
-            # Get last user message timestamp for each session
-            sessions_with_timestamps = []
-            for s in sessions:
-                messages = self.conversation_store.get_messages(str(s.id))
-                user_msgs = [m for m in messages if m.role == "user"]
-
-                if user_msgs:
-                    last_user_msg_time = user_msgs[-1].created_at
-                else:
-                    last_user_msg_time = s.created_at  # Fallback to session creation time
-
-                sessions_with_timestamps.append({
-                    "session": s,
-                    "last_user_msg_time": last_user_msg_time
-                })
-
-            # Sort by last user message timestamp (most recent first)
-            sessions_with_timestamps.sort(
-                key=lambda x: x["last_user_msg_time"] or datetime.min,
-                reverse=True
+            # Use optimized single-query method instead of N+1 queries
+            sessions_with_timestamps = self.conversation_store.get_sessions_with_last_message_time(
+                user_uid,
+                include_inactive=False
             )
 
+            if len(sessions_with_timestamps) <= max_sessions:
+                return  # Nothing to cleanup
+
+            # Sessions are already sorted by last message time (most recent first)
             # Delete sessions beyond the limit
             sessions_to_delete = sessions_with_timestamps[max_sessions:]
 
             for item in sessions_to_delete:
                 session_to_delete = item["session"]
                 self.conversation_store.delete_session(str(session_to_delete.id))
+                logger.info(f"[CHAT SERVICE] Deleted old session {session_to_delete.id} for user {user_uid}")
 
         except Exception as e:
             logger.error(f"[CHAT SERVICE] Error cleaning up old sessions for user {user_uid}: {e}")
@@ -169,48 +152,11 @@ class ChatService:
         # Validate user exists before loading conversation history
         self._validate_user_exists(user_uid)
 
-        # Get all active sessions for user
-        sessions = self.conversation_store.get_user_sessions(user_uid, limit=100)
-        logger.info(f"[CHAT SERVICE] Found {len(sessions)} active sessions for user {user_uid}")
-
-        if not sessions:
-            logger.warning(f"[CHAT SERVICE] No sessions found for user {user_uid}")
-            return []
-
-        # Find the session with the most recent user message
-        most_recent_session = None
-        most_recent_time = None
-
-        for s in sessions:
-            logger.info(f"[CHAT SERVICE] Checking session {s.id}: is_active={s.is_active}")
-
-            # Verify session still exists and is active (defensive check)
-            if not s.is_active:
-                logger.info(f"[CHAT SERVICE] Session {s.id} is inactive, skipping")
-                continue
-
-            messages = self.conversation_store.get_messages(str(s.id))
-            logger.info(f"[CHAT SERVICE] Session {s.id} has {len(messages)} total messages")
-            user_msgs = [m for m in messages if m.role == "user"]
-
-            if user_msgs:
-                last_user_msg_time = user_msgs[-1].created_at
-                logger.info(f"[CHAT SERVICE] Session {s.id} has {len(user_msgs)} user messages, last at {last_user_msg_time}")
-                if most_recent_time is None or (last_user_msg_time and last_user_msg_time > most_recent_time):
-                    most_recent_time = last_user_msg_time
-                    most_recent_session = s
-
-        # If no session with user messages, try to find any active session
-        if not most_recent_session and sessions:
-            logger.info(f"[CHAT SERVICE] No session with user messages found, looking for any active session")
-            for s in sessions:
-                if s.is_active:
-                    most_recent_session = s
-                    logger.info(f"[CHAT SERVICE] Found active session without user messages: {s.id}")
-                    break
+        # Use optimized single-query method to find most recent active session
+        most_recent_session = self.conversation_store.get_most_recent_active_session(user_uid)
 
         if not most_recent_session:
-            logger.warning(f"[CHAT SERVICE] No most_recent_session found for user {user_uid}")
+            logger.warning(f"[CHAT SERVICE] No sessions found for user {user_uid}")
             return []
 
         logger.info(f"[CHAT SERVICE] Most recent session: {most_recent_session.id}")
