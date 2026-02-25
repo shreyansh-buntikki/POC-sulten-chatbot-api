@@ -250,24 +250,47 @@ class RecipeSearchPipelineSDK:
                 "session_id": session_id,
                 "user_uid": user_uid,
                 "conversation_history": conversation_history,
-                "previous_search_context": None
+                "previous_search_context": {}
             }
 
             # Add previous search context if available
             if session.context_entities.last_vector_query:
-                enhanced_context["previous_search_context"] = {
-                    "last_query": session.context_entities.last_vector_query,
-                    "last_filters": session.context_entities.last_search_filters,
-                    "last_intent": session.last_intent,
-                    "excluded_ingredients": session.excluded_ingredients,
-                    "included_ingredients": session.included_ingredients
-                }
+                enhanced_context["previous_search_context"]["last_query"] = session.context_entities.last_vector_query
+                enhanced_context["previous_search_context"]["last_filters"] = session.context_entities.last_search_filters
+                enhanced_context["previous_search_context"]["last_intent"] = session.last_intent
+                enhanced_context["previous_search_context"]["excluded_ingredients"] = session.excluded_ingredients
+                enhanced_context["previous_search_context"]["included_ingredients"] = session.included_ingredients
+
+            # Add pricing context for multi-turn pricing follow-ups (e.g., "And in India?")
+            if session.context_entities.last_pricing_item:
+                enhanced_context["previous_search_context"]["last_pricing_item"] = session.context_entities.last_pricing_item
+                enhanced_context["previous_search_context"]["last_pricing_item_type"] = session.context_entities.last_pricing_item_type
 
             async def run_nlid():
                 """Run NLID agent with conversation history and previous search context"""
+                # Build an enriched input that includes conversation history
+                # and previous search context so the LLM can see them
+                # (the SDK context param is NOT injected into the prompt).
+                nlid_input_parts = []
+
+                if conversation_history:
+                    nlid_input_parts.append(
+                        f"conversation_history:\n{conversation_history}"
+                    )
+
+                prev_ctx = enhanced_context.get("previous_search_context", {})
+                if prev_ctx:
+                    nlid_input_parts.append(
+                        f"previous_search_context: {prev_ctx}"
+                    )
+
+                nlid_input_parts.append(f"User query: {query}")
+
+                nlid_input = "\n\n".join(nlid_input_parts)
+
                 return await Runner.run(
                     current_nlid_agent,
-                    query,
+                    nlid_input,
                     context=enhanced_context
                 )
 
@@ -314,40 +337,12 @@ class RecipeSearchPipelineSDK:
                 "confidence": nlid_data.confidence,
             }
 
-            # Check if query is cooking-related
-            if not nlid_data.is_cooking_related:
-                logger.warning(f"[STAGE 2] Query NOT cooking-related, returning scope message")
-                # Return a direct rejection message without running orchestrator
-                # (orchestrator has its own guardrail that would raise an exception)
-                rejection_message = (
-                    "I'm Sulten Chatbot, your cooking and recipe assistant! "
-                    "I can help you with:\n"
-                    "- Finding recipes and meal ideas\n"
-                    "- Nutritional information about foods\n"
-                    "- Cooking tips and techniques\n"
-                    "- Ingredient substitutions\n\n"
-                    "I'm not able to help with non-cooking topics, but I'd be happy to assist with any food-related questions!"
-                )
-
-
-                session.add_to_history("assistant", rejection_message)
-                self.session_manager.save_session(session)
-
-                return {
-                    "response": rejection_message,
-                    "metadata": {
-                        "is_cooking_related": False,
-                        "intent": "not_supported",
-                        "retrieval_strategy": "none",
-                        "num_results": 0,
-                    }
-                }
-
             # ============ PRICING FOLLOW-UP DETECTION ============
-            # If the last intent was `pricing_info` and the current query looks like
-            # a country/currency refinement (e.g., "And in India?", "in Norway"),
-            # reuse the previously priced item with the new country instead of
-            # misrouting to recipe_search.
+            # MUST run BEFORE the is_cooking_related check because the NLID
+            # may classify a short country follow-up (e.g., "In India?") as
+            # general_chat / not-cooking-related.  If the session's previous
+            # intent was pricing_info and the query mentions a country, we
+            # override NLID's output to keep it as a valid pricing follow-up.
             if (
                 session.last_intent == "pricing_info"
                 and session.context_entities.last_pricing_item
@@ -375,9 +370,39 @@ class RecipeSearchPipelineSDK:
                             "recipes": [],
                         }
                     nlid_result_dict["intent"] = "pricing_info"
+                    nlid_result_dict["is_cooking_related"] = True
                     nlid_result_dict["entities"] = override_entities
                     nlid_result_dict["parameters"] = {"country": detected_country}
                     nlid_result_dict["filters"] = nlid_result_dict.get("filters", {})
+
+            # Check if query is cooking-related
+            if not nlid_result_dict["is_cooking_related"]:
+                logger.warning(f"[STAGE 2] Query NOT cooking-related, returning scope message")
+                # Return a direct rejection message without running orchestrator
+                # (orchestrator has its own guardrail that would raise an exception)
+                rejection_message = (
+                    "I'm Sulten Chatbot, your cooking and recipe assistant! "
+                    "I can help you with:\n"
+                    "- Finding recipes and meal ideas\n"
+                    "- Nutritional information about foods\n"
+                    "- Cooking tips and techniques\n"
+                    "- Ingredient substitutions\n\n"
+                    "I'm not able to help with non-cooking topics, but I'd be happy to assist with any food-related questions!"
+                )
+
+
+                session.add_to_history("assistant", rejection_message)
+                self.session_manager.save_session(session)
+
+                return {
+                    "response": rejection_message,
+                    "metadata": {
+                        "is_cooking_related": False,
+                        "intent": "not_supported",
+                        "retrieval_strategy": "none",
+                        "num_results": 0,
+                    }
+                }
 
             # ============ SPECIAL HANDLING: Pricing and Nutrition Queries ============
             # Handle pricing_info and nutritional_info intents directly
@@ -391,6 +416,13 @@ class RecipeSearchPipelineSDK:
             # CRITICAL: If the query ALSO contains semantic content (cuisines, tags like "dessert",
             # ingredients, meal types, etc.), we must do embedding search first, then apply filters.
             # Only use direct SQL (no embedding) if there's NO semantic content.
+            # Track whether the intent was converted from a pure filter
+            # (price_filter / nutrition_filter / time_filter) to recipe_search.
+            # Used later to decide whether cached embedding candidates can be
+            # reused instead of running a pointless new embedding search with
+            # a non-semantic query like "my budget is 800 kr".
+            _converted_from_filter_intent = False
+
             if nlid_result_dict["intent"] in ["price_filter", "nutrition_filter", "time_filter"]:
                 _filter_intent = nlid_result_dict["intent"]
                 _filters_for_filter_intent = nlid_result_dict.get("filters", {})
@@ -421,6 +453,7 @@ class RecipeSearchPipelineSDK:
                     )
                     # Change intent to recipe_search and let it flow through the normal pipeline
                     nlid_result_dict["intent"] = "recipe_search"
+                    _converted_from_filter_intent = True
                     # Continue to the recipe_search flow below (don't return here)
                 else:
                     # No semantic content - use direct SQL (no embedding)
@@ -573,7 +606,7 @@ class RecipeSearchPipelineSDK:
                     }
 
             # Update session state from NLID results
-            session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
+            session = self.session_manager.update_session_from_nlid(session, nlid_result_dict, original_query=query)
 
             # ============ RE-ROUTE: recipe_search with cost/time/nutrition filter ============
             # When NLID detects both @username (→ recipe_search) and a budget/time
@@ -1014,9 +1047,17 @@ class RecipeSearchPipelineSDK:
                                    if k != "excluded_ingredients"},
                                 "excluded_ingredients": merged_exclusions,
                             }
-                            # Also include session cuisines if not already present
+                            # Carry forward session filters not already in retrieval_plan
                             if session.filters.cuisines and "cuisines" not in _merged_sql_filters:
                                 _merged_sql_filters["cuisines"] = session.filters.cuisines
+                            if session.filters.servings and "servings" not in _merged_sql_filters:
+                                _merged_sql_filters["servings"] = session.filters.servings
+                            if session.filters.cost_filter and "cost_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["cost_filter"] = session.filters.cost_filter
+                            if session.filters.time_filter and "time_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["time_filter"] = session.filters.time_filter
+                            if session.filters.nutrition_filter and "nutrition_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["nutrition_filter"] = session.filters.nutrition_filter
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.SQL_ONLY,
                                 reasoning="Exclusion-only refinement: original vector query IS the excluded ingredient",
@@ -1036,9 +1077,17 @@ class RecipeSearchPipelineSDK:
                                    if k != "excluded_ingredients"},
                                 "excluded_ingredients": merged_exclusions,
                             }
-                            # Also include session cuisines if not already present
+                            # Carry forward session filters not already in retrieval_plan
                             if session.filters.cuisines and "cuisines" not in _merged_sql_filters:
                                 _merged_sql_filters["cuisines"] = session.filters.cuisines
+                            if session.filters.servings and "servings" not in _merged_sql_filters:
+                                _merged_sql_filters["servings"] = session.filters.servings
+                            if session.filters.cost_filter and "cost_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["cost_filter"] = session.filters.cost_filter
+                            if session.filters.time_filter and "time_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["time_filter"] = session.filters.time_filter
+                            if session.filters.nutrition_filter and "nutrition_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["nutrition_filter"] = session.filters.nutrition_filter
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
                                 reasoning="Refinement search - preserving original search with allergy exclusion",
@@ -1192,9 +1241,17 @@ class RecipeSearchPipelineSDK:
                             k: v for k, v in (retrieval_plan.sql_filters or {}).items()
                             if k not in ("excluded_ingredients", "exclude_ingredients", "tags")
                         }
-                        # Include session cuisines if not already in preserved_filters
+                        # Carry forward session filters not already in preserved_filters
                         if session.filters.cuisines and "cuisines" not in preserved_filters:
                             preserved_filters["cuisines"] = session.filters.cuisines
+                        if session.filters.servings and "servings" not in preserved_filters:
+                            preserved_filters["servings"] = session.filters.servings
+                        if session.filters.cost_filter and "cost_filter" not in preserved_filters:
+                            preserved_filters["cost_filter"] = session.filters.cost_filter
+                        if session.filters.time_filter and "time_filter" not in preserved_filters:
+                            preserved_filters["time_filter"] = session.filters.time_filter
+                        if session.filters.nutrition_filter and "nutrition_filter" not in preserved_filters:
+                            preserved_filters["nutrition_filter"] = session.filters.nutrition_filter
                         logger.info(
                             f"[STANDALONE] Merged exclusions: session={len(existing_exclusions)}, "
                             f"retrieval_plan={len(retrieval_plan_exclusions)}, "
@@ -1363,6 +1420,87 @@ class RecipeSearchPipelineSDK:
                 )
                 candidate_ids = _cached_candidates
                 similarity_scores = {}
+            elif (
+                retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL
+                and _cache_is_valid
+                and _converted_from_filter_intent
+            ):
+                # Filter intent (price/time/nutrition) converted to recipe_search
+                # because of session-carried semantic content (e.g. cuisines).
+                # The current query ("my budget is 800 kr") has no semantic
+                # value for embedding — reuse existing candidates and just
+                # apply the new filter via SQL.
+                logger.info(
+                    f"[CACHE REUSE] Converted filter intent: "
+                    f"reusing {len(_cached_candidates)} cached candidates "
+                    f"from '{_cached_vector_query}' (filter refinement, "
+                    f"no re-embedding needed)"
+                )
+                candidate_ids = _cached_candidates
+                similarity_scores = {}
+                # Override the vector_query on the plan so downstream
+                # logging and cache storage remain consistent.
+                retrieval_plan = RetrievalPlan(
+                    strategy=retrieval_plan.strategy,
+                    reasoning=(
+                        retrieval_plan.reasoning
+                        + " (reused cached candidates for filter refinement)"
+                    ),
+                    vector_query=_cached_vector_query,
+                    sql_filters=retrieval_plan.sql_filters,
+                    top_k=retrieval_plan.top_k,
+                )
+            elif (
+                retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL
+                and _cache_is_valid
+            ):
+                # ── Filter-only refinement detection ──
+                # Compare semantic content between cached and current
+                # sql_filters.  If tags / cuisines / included ingredients
+                # are unchanged, the embedding candidates are still valid
+                # and only structural filters (servings, cost, time, …)
+                # were added or modified → skip re-embedding.
+                _cached_sf = _search_cache.get("sql_filters", {})
+                _current_sf = retrieval_plan.sql_filters or {}
+
+                _SEMANTIC_KEYS = (
+                    "tags", "cuisines", "included_ingredients",
+                    "include_ingredients", "categories",
+                )
+
+                _semantic_same = True
+                for _sk in _SEMANTIC_KEYS:
+                    _cv = _cached_sf.get(_sk, [])
+                    _nv = _current_sf.get(_sk, [])
+                    if isinstance(_cv, list) and isinstance(_nv, list):
+                        if set(_cv) != set(_nv):
+                            _semantic_same = False
+                            break
+                    elif _cv != _nv:
+                        _semantic_same = False
+                        break
+
+                if _semantic_same:
+                    logger.info(
+                        f"[CACHE REUSE] Filter-only refinement: "
+                        f"reusing {len(_cached_candidates)} cached "
+                        f"candidates from '{_cached_vector_query}' "
+                        f"(semantic content unchanged, only structural "
+                        f"filters changed, no re-embedding needed)"
+                    )
+                    candidate_ids = _cached_candidates
+                    similarity_scores = {}
+                    retrieval_plan = RetrievalPlan(
+                        strategy=retrieval_plan.strategy,
+                        reasoning=(
+                            retrieval_plan.reasoning
+                            + " (reused cached candidates – "
+                            "filter-only refinement)"
+                        ),
+                        vector_query=_cached_vector_query,
+                        sql_filters=retrieval_plan.sql_filters,
+                        top_k=retrieval_plan.top_k,
+                    )
 
             if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
                 # FILTER-ONLY queries: Skip embedding search, use deterministic

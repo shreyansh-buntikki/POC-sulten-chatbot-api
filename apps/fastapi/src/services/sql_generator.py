@@ -370,6 +370,23 @@ WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :l
 LIMIT 20
 ```
 
+CUISINE FILTERING TEMPLATE (for italian, asian, mexican, etc.):
+IMPORTANT: Cuisines are NOT strict filters. Use LEFT JOIN LATERAL to BOOST/RANK cuisine-matching recipes higher, but still include non-matching recipes.
+Cuisines are stored as tags in the database.
+```sql
+SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
+FROM recipe r
+LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
+LEFT JOIN "bundle" b ON br."bundleId" = b."id" AND b."deletedAt" IS NULL
+LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
+LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%italian%' LIMIT 1) cuisine_match ON true
+WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
+  AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
+  AND r."id" IN (:recipe_ids)
+ORDER BY (CASE WHEN cuisine_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC
+LIMIT 20
+```
+
 Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
     def _build_generation_prompt(
@@ -420,7 +437,13 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
                 )
 
         if sql_filters.get("cuisines"):
-            parts.append(f"- Cuisines: {', '.join(sql_filters['cuisines'])}")
+            parts.append(f"- Cuisines (SOFT RANKING, NOT strict filter): {', '.join(sql_filters['cuisines'])}")
+            parts.append("  CRITICAL: Do NOT use AND EXISTS for cuisines. Cuisine data may be incomplete.")
+            parts.append("  Instead, use LEFT JOIN LATERAL to compute a cuisine_match score and ORDER BY it DESC.")
+            parts.append("  Recipes WITH matching cuisine rank higher, but recipes WITHOUT the cuisine are STILL included.")
+            cuisine_conditions = " OR ".join([f"t.name ILIKE '%{c}%'" for c in sql_filters['cuisines']])
+            parts.append(f"  Use: LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt.\"tagId\" = t.id WHERE rtt.\"recipeId\" = r.\"id\" AND ({cuisine_conditions}) LIMIT 1) cuisine_match ON true")
+            parts.append("  Then: ORDER BY (CASE WHEN cuisine_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC")
 
         # Servings filter
         if sql_filters.get("servings"):

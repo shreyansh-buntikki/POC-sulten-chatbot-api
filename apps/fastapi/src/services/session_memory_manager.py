@@ -639,7 +639,8 @@ class SessionMemoryManager:
     def update_session_from_nlid(
         self,
         session: SessionState,
-        nlid_result: Dict[str, Any]
+        nlid_result: Dict[str, Any],
+        original_query: Optional[str] = None
     ) -> SessionState:
         """
         Update session state based on NLID results
@@ -650,6 +651,7 @@ class SessionMemoryManager:
         Args:
             session: Current session state
             nlid_result: Result from NLID agent
+            original_query: Optional original user query for detecting recipe types
 
         Returns:
             Updated session state
@@ -674,16 +676,52 @@ class SessionMemoryManager:
         # Adding it to session.included_ingredients causes has_positive_context=True
         # downstream, which then prevents the correct SQL_ONLY routing for pure
         # exclusion queries.
+        #
+        # IMPORTANT: We should NOT add ingredients to included_ingredients if they
+        # are the PRIMARY SEARCH TERM (recipe type/dish name) rather than a constraint.
+        # E.g., "ice cream recipes" - "ice cream" is the recipe type, not an ingredient
+        # to filter by. Adding it would incorrectly require recipes to CONTAIN ice cream
+        # as an ingredient in subsequent filter refinements.
         entities = nlid_result.get('entities', {})
         included_ingredients = entities.get('ingredients', [])
         excluded_set_lower = {e.lower() for e in excluded_ingredients}
+
+        # Get the original query to check if ingredients are primary search terms
+        # Use the passed original_query if available, otherwise fall back to summary
+        query_text = original_query or nlid_result.get('summary', '')
+        query_lower = query_text.lower() if query_text else ""
+
+        # Patterns that indicate the ingredient is a primary search term (recipe type)
+        # not a constraint to be added to included_ingredients
+        recipe_type_patterns = [
+            "recipes", "recipe", "dish", "dishes", "how to make", "make",
+            "cook", "prepare", "suggest", "want", "looking for", "find"
+        ]
 
         for ingredient in included_ingredients:
             if (
                 ingredient not in session.included_ingredients
                 and ingredient.lower() not in excluded_set_lower
             ):
-                session.included_ingredients.append(ingredient)
+                # Check if this ingredient appears to be the primary search term
+                # (recipe type) rather than a constraint
+                ing_lower = ingredient.lower()
+                is_recipe_type = False
+
+                # If the query is about "X recipes" or "suggest X", X is likely
+                # a recipe type, not an ingredient constraint
+                for pattern in recipe_type_patterns:
+                    if f"{ing_lower} {pattern}" in query_lower or f"{pattern} {ing_lower}" in query_lower:
+                        is_recipe_type = True
+                        logger.info(
+                            f"[SESSION UPDATE] '{ingredient}' appears to be a recipe type "
+                            f"(matches '{pattern}') - NOT adding to included_ingredients"
+                        )
+                        break
+
+                if not is_recipe_type:
+                    session.included_ingredients.append(ingredient)
+                    logger.info(f"[SESSION UPDATE] Added '{ingredient}' to included_ingredients")
 
         # Update filters if provided
         parameters = nlid_result.get('parameters', {})

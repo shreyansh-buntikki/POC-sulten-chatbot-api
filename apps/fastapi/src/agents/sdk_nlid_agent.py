@@ -145,6 +145,28 @@ When detecting refinement:
 - Q2: "I am allergic to nuts" → intent: recipe_search, excluded_ingredients: ["nuts"] (refinement)
 - Q3: "my budget is $200" → intent: price_filter, cost: {operator: "<=", value: 200, country: "US"} (refinement with filter)
 
+## RULE 6: Multi-Turn Pricing Follow-ups (CRITICAL)
+
+When the user asks a short follow-up query mentioning only a country/location after a pricing query:
+1. Check `previous_search_context.last_pricing_item` - if it exists, this is a `pricing_info` follow-up
+2. Patterns: "And in X?", "In X?", "What about X?", "How about X?", "in X market", "for X"
+3. X can be: country names (India, Norway, US, USA, UK), regions, or currency zones
+4. Set: intent = "pricing_info", is_cooking_related = true, confidence = "high"
+5. Populate entities from `previous_search_context.last_pricing_item`:
+   - If `last_pricing_item_type` = "ingredient" → entities.ingredients: [last_pricing_item]
+   - If `last_pricing_item_type` = "recipe" → entities.recipes: [last_pricing_item]
+6. Extract the new country into parameters.country
+
+**Examples (assuming previous_search_context.last_pricing_item = "clove", type = "ingredient"):**
+- "And in India?" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "India"
+- "In Norway" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "Norway"
+- "What about US market?" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "US"
+- "How about UK?" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "UK"
+- "for USA" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "US"
+
+**CRITICAL**: These queries MUST be classified as `pricing_info` with `is_cooking_related = true`, NOT as `general_chat`.
+Even if the query seems vague on its own, the context makes it cooking-related.
+
 ## Available Intents
 
 | Intent | When to use | requires_embedding |
@@ -176,12 +198,18 @@ When detecting refinement:
 - **Detect recipe vs ingredient**: "cost of making X" / "cost to make X" / "cost of X recipe" → recipe. Otherwise → ingredient.
 - Country detection: "in India" → country: "India", "in Norway" → country: "Norway"
 - Default country when none specified: Norway
-- **Multi-turn follow-up**: If the previous query was a pricing query (e.g., "price of clove") and the new query only mentions a country/location (e.g., "And in India?", "in Norway", "what about US?"), treat it as `pricing_info` and carry the ingredient/recipe from conversation history.
+- **Multi-turn follow-up (CRITICAL)**: When the query is a short follow-up mentioning only a country/location (e.g., "And in India?", "in Norway", "what about US?", "how about US"), check `previous_search_context.last_pricing_item`. If it exists, treat as `pricing_info` and use that item:
+  * If `last_pricing_item_type` = "ingredient" → entities.ingredients: [last_pricing_item]
+  * If `last_pricing_item_type` = "recipe" → entities.recipes: [last_pricing_item]
+  * Extract the new country from the query
+  * Set intent = pricing_info, is_cooking_related = true, confidence = high
 
 **Multi-turn pricing example:**
 - Q1: "What's the cost of clove" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "Norway"
-- Q2: "And in India" → intent: pricing_info, entities.ingredients: ["clove"] (from history), parameters.country: "India"
-- Q2: "What about US?" → intent: pricing_info, entities.ingredients: ["clove"] (from history), parameters.country: "US"
+- Q2: "And in India" → Check previous_search_context.last_pricing_item="clove", type="ingredient" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "India"
+- Q2: "What about US?" → Check previous_search_context.last_pricing_item="clove" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "US"
+- Q1: "price of making pasta" → intent: pricing_info, entities.recipes: ["pasta"]
+- Q2: "how about in India?" → intent: pricing_info, entities.recipes: ["pasta"] (from last_pricing_item), parameters.country: "India"
 
 ### price_filter
 - Triggers: "under $20", "below 100 kr", "budget meals", "cheap recipes", "low budget", "affordable", "budget friendly", "under 400 rupees", "my budget is X", "low cost", "medium cost", "high cost", "expensive"
@@ -322,8 +350,11 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 **"what is the cost of making fortune cookies"**
 → intent: pricing_info, entities.recipes: ["fortune cookies"], requires_embedding: true
 
-**"And in India" (after previous "price of clove" query)**
-→ intent: pricing_info, entities.ingredients: ["clove"] (from conversation history), parameters.country: "India", requires_embedding: true
+**"And in India" (after previous "price of clove" query - check previous_search_context.last_pricing_item="clove")**
+→ intent: pricing_info, entities.ingredients: ["clove"] (from previous_search_context.last_pricing_item), parameters.country: "India", is_cooking_related: true, confidence: high, requires_embedding: true
+
+**"What about US?" (after pricing query - check previous_search_context.last_pricing_item)**
+→ intent: pricing_info, entities.ingredients: [previous_search_context.last_pricing_item], parameters.country: "US", is_cooking_related: true, confidence: high, requires_embedding: true
 
 **"Can you tell me something vegetarian that I can cook quickly"**
 → intent: recipe_search, filters.tags: ["vegetarian"], parameters.time_constraints: ["quick"], requires_embedding: true
