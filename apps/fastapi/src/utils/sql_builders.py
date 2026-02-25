@@ -857,33 +857,17 @@ def build_session_filter_conditions(
                 )
             """)
 
-    # Cuisine filter (via tags)
-    cuisines = session_filters.get("cuisines", [])
-    if cuisines:
-        escaped_cuisines = [c.replace("'", "''").lower() for c in cuisines]
-        or_conditions = " OR ".join([f"LOWER(t.\"name\") = '{c}'" for c in escaped_cuisines])
-        conditions.append(f"""
-            EXISTS (
-                SELECT 1 FROM recipe_tags_tag rtt
-                JOIN tag t ON rtt."tagId" = t."id"
-                WHERE rtt."recipeId" = r."id"
-                AND ({or_conditions})
-            )
-        """)
+    # Cuisine filter - REMOVED strict filtering, cuisines are now used for scoring only
+    # Cuisines should boost relevant recipes but not exclude recipes without the cuisine tag
+    # The SQL generator uses LEFT JOIN LATERAL for cuisine/tag scoring
+    # Cuisines are still passed in session_filters for reference but NOT added as WHERE conditions
+    # This prevents narrowing down results too aggressively when tags are incomplete in the database
 
-    # Tags filter
-    tags = session_filters.get("tags", [])
-    if tags:
-        escaped_tags = [t.replace("'", "''").lower() for t in tags]
-        or_conditions = " OR ".join([f"LOWER(t.\"name\") = '{t}'" for t in escaped_tags])
-        conditions.append(f"""
-            EXISTS (
-                SELECT 1 FROM recipe_tags_tag rtt
-                JOIN tag t ON rtt."tagId" = t."id"
-                WHERE rtt."recipeId" = r."id"
-                AND ({or_conditions})
-            )
-        """)
+    # Tags filter - REMOVED strict filtering, tags are now used for scoring only
+    # Tags should boost relevant recipes but not exclude recipes without the tag
+    # The SQL generator uses LEFT JOIN LATERAL for tag scoring
+    # Tags are still passed in session_filters for reference but NOT added as WHERE conditions
+    # This prevents narrowing down results too aggressively when tags are incomplete in the database
 
     # Difficulty filter - supports both single value and list
     # When user asks for "easy" or "beginner", we include both "easy" and "normal"

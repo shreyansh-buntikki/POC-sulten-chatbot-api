@@ -478,22 +478,45 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
    Instead, rely on ORDER BY to sort results by actual values""")
 
         # Add pricing filters
+        # pricing_filters can be in two formats:
+        # 1. {'max_price': 100, 'min_price': 50} (legacy)
+        # 2. {'operator': '<=', 'value': 400, 'country': 'US', 'sort_order': 'DESC'} (current)
         if sql_filters.get("pricing_filters"):
             pricing_filters = sql_filters['pricing_filters']
-            currency = sql_filters.get('currency', 'USD')
-            parts.append(f"\n## Pricing Filters (Currency: {currency})")
+            parts.append(f"\n## Pricing Filters")
 
-            for constraint, amount in pricing_filters.items():
-                if constraint == 'max_price':
-                    parts.append(f"- Max price: {amount} {currency}")
-                    parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
-                    parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) <= {amount}")
-                elif constraint == 'min_price':
-                    parts.append(f"- Min price: {amount} {currency}")
-                    parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
-                    parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) >= {amount}")
+            # Handle new format with operator/value/country
+            if isinstance(pricing_filters, dict) and 'value' in pricing_filters:
+                operator = pricing_filters.get('operator', '<=')
+                value = pricing_filters.get('value')
+                country = pricing_filters.get('country', 'US')
+                sort_order = pricing_filters.get('sort_order', 'ASC')
 
-            parts.append("  Use appropriate ORDER BY clauses for sorting by price")
+                # Map country to pricing key (lowercase)
+                country_key = country.lower() if country else 'usa'
+
+                parts.append(f"- Price constraint: {operator} {value} {country}")
+                parts.append(f"  CRITICAL: Filter by r.recipe_metadata->'pricing'->'{country_key}'->>'total'")
+                parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}")
+                parts.append(f"  Sort order: {sort_order} (DESC = highest price first, ASC = lowest price first)")
+                if sort_order == 'DESC':
+                    parts.append(f"  Example ORDER BY: ORDER BY CAST(r.recipe_metadata->'pricing'->'{country_key}'->>'total' AS FLOAT) DESC")
+                else:
+                    parts.append(f"  Example ORDER BY: ORDER BY CAST(r.recipe_metadata->'pricing'->'{country_key}'->>'total' AS FLOAT) ASC")
+            else:
+                # Handle legacy format with max_price/min_price keys
+                currency = sql_filters.get('currency', 'USD')
+                parts.append(f"(Currency: {currency})")
+                for constraint, amount in pricing_filters.items():
+                    if constraint == 'max_price':
+                        parts.append(f"- Max price: {amount} {currency}")
+                        parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
+                        parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) <= {amount}")
+                    elif constraint == 'min_price':
+                        parts.append(f"- Min price: {amount} {currency}")
+                        parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
+                        parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) >= {amount}")
+                parts.append("  Use appropriate ORDER BY clauses for sorting by price")
 
         # IMPORTANT: Only show included_ingredients if we DON'T have candidate_ids
         # When candidate_ids are provided, embedding search already handled ingredient matching semantically
@@ -1619,6 +1642,275 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
         return sql
 
+    def _inject_servings_filter(
+        self,
+        sql: str,
+        servings: Any
+    ) -> str:
+        """
+        Inject servings filter into SQL.
+
+        Supports multiple formats:
+        - Exact integer: servings = 4
+        - Range dict: {"min": 2, "max": 4} → servings >= 2 AND servings <= 4
+        - Comparison dict: {"operator": ">=", "value": 4} → servings >= 4
+
+        Args:
+            sql: The SQL query to modify
+            servings: The servings filter value
+
+        Returns:
+            Modified SQL with servings filter
+        """
+        import re
+
+        if not servings:
+            return sql
+
+        # Build the servings clause based on the format
+        servings_clause = None
+
+        if isinstance(servings, int):
+            # Simple integer - exact match
+            servings_clause = f'AND r.servings = {servings}'
+            logger.info(f"[SERVINGS INJECTION] Adding exact servings filter: {servings}")
+        elif isinstance(servings, dict):
+            # Complex servings filter
+            min_val = servings.get("min")
+            max_val = servings.get("max")
+            operator = servings.get("operator")
+            value = servings.get("value")
+
+            if min_val is not None and max_val is not None:
+                # Range filter: servings >= min AND servings <= max
+                try:
+                    min_int = int(min_val)
+                    max_int = int(max_val)
+                    servings_clause = f'AND r.servings >= {min_int} AND r.servings <= {max_int}'
+                    logger.info(f"[SERVINGS INJECTION] Adding range servings filter: {min_int}-{max_int}")
+                except (ValueError, TypeError):
+                    pass
+            elif operator and value is not None:
+                # Comparison filter: servings >= 4, servings > 3, etc.
+                operator_map = {"==": "=", "<": "<", ">": ">", "<=": "<=", ">=": ">="}
+                sql_op = operator_map.get(operator, "=")
+                try:
+                    value_int = int(value)
+                    servings_clause = f'AND r.servings {sql_op} {value_int}'
+                    logger.info(f"[SERVINGS INJECTION] Adding comparison servings filter: {sql_op} {value_int}")
+                except (ValueError, TypeError):
+                    pass
+        else:
+            # Try to parse as integer (string or other type)
+            try:
+                servings_int = int(servings)
+                servings_clause = f'AND r.servings = {servings_int}'
+                logger.info(f"[SERVINGS INJECTION] Adding parsed servings filter: {servings_int}")
+            except (ValueError, TypeError):
+                pass
+
+        if not servings_clause:
+            return sql
+
+        # Step 1: Remove any existing servings filter the LLM may have added
+        # Pattern: AND r.servings = X or AND r."servings" = X (with or without quotes)
+        sql_cleaned = re.sub(
+            r'AND\s+r\.\"servings\"\s*[=<>]+\s*\d+',
+            "",
+            sql,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.servings\s*[=<>]+\s*\d+",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        # Also remove range patterns: AND r.servings >= X AND r.servings <= Y
+        sql_cleaned = re.sub(
+            r'AND\s+r\.\"servings\"\s*>=\s*\d+\s+AND\s+r\.\"servings\"\s*<=\s*\d+',
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.servings\s*>=\s*\d+\s+AND\s+r\.servings\s*<=\s*\d+",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+
+        if sql_cleaned != sql:
+            sql = sql_cleaned
+            logger.info("[SERVINGS INJECTION] Cleaned up existing servings filters")
+
+        # Step 2: Check if we already have the correct servings filter
+        # (after cleanup, this shouldn't happen, but just in case)
+        if servings_clause.replace("AND ", "") in sql:
+            logger.info(f"[SERVINGS INJECTION] Servings filter already exists in SQL")
+            return sql
+
+        # Step 3: Inject the servings filter
+        # Use strip-and-reattach strategy (no paren-depth counting needed)
+        body, trailing = self._strip_trailing_clauses(sql)
+        if trailing.strip():
+            sql = body + "\n" + servings_clause + trailing
+            logger.info("[SERVINGS INJECTION] Injected servings filter before trailing clause")
+        else:
+            sql = body + "\n" + servings_clause
+            logger.info("[SERVINGS INJECTION] Appended servings filter at end")
+
+        return sql
+
+    def _inject_pricing_filter(
+        self,
+        sql: str,
+        pricing_filter: Dict[str, Any]
+    ) -> str:
+        """
+        Inject pricing filter into SQL.
+
+        Supports format:
+        - {"operator": "<=", "value": 400, "country": "US", "sort_order": "DESC"}
+
+        Args:
+            sql: The SQL query to modify
+            pricing_filter: The pricing filter dict with operator, value, country, sort_order
+
+        Returns:
+            Modified SQL with pricing filter
+        """
+        import re
+
+        if not pricing_filter or not isinstance(pricing_filter, dict):
+            return sql
+
+        # Extract filter parameters
+        operator = pricing_filter.get("operator", "<=")
+        value = pricing_filter.get("value")
+        country = pricing_filter.get("country", "US")
+        sort_order = pricing_filter.get("sort_order", "ASC")
+
+        if value is None:
+            return sql
+
+        # Map country to pricing key (lowercase)
+        # IMPORTANT: Use consistent key format - match what's in the database
+        country_key_map = {"US": "usa", "USA": "usa", "INDIA": "india", "NORWAY": "norway"}
+        country_key = country_key_map.get(country.upper(), country.lower())
+
+        # Normalize operator
+        operator_map = {"<=": "<=", ">=": ">=", "<": "<", ">": ">", "==": "="}
+        sql_op = operator_map.get(operator, "<=")
+
+        # Build the pricing filter clause
+        # Using recipe_metadata->'pricing'->'country'->>'total'
+        pricing_clause = (
+            f"AND r.\"recipe_metadata\" IS NOT NULL\n"
+            f"  AND r.\"recipe_metadata\"->'pricing' IS NOT NULL\n"
+            f"  AND r.\"recipe_metadata\"->'pricing'->'{country_key}' IS NOT NULL\n"
+            f"  AND r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' IS NOT NULL\n"
+            f"  AND CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {sql_op} {value}"
+        )
+
+        logger.info(f"[PRICING INJECTION] Adding pricing filter: {sql_op} {value} {country} (key={country_key})")
+
+        # Step 1: Remove ALL existing pricing filter patterns the LLM may have added
+        # These patterns can vary in quote style and country key
+
+        # Pattern 1: CAST(r.recipe_metadata->'pricing'->'xx'->>'total' AS FLOAT) <= X
+        # The LLM generates: CAST(r.recipe_metadata->'pricing'->'us'->>'total' AS FLOAT) <= 400
+        # Note: closing ) is after FLOAT, not after 'total'
+        sql_cleaned = re.sub(
+            r"AND\s+CAST\s*\(\s*r\.\"recipe_metadata\"\s*->\s*'pricing'\s*->\s*'[a-z]+'\s*->>\s*'total'\s+AS\s+FLOAT\s*\)\s*[<>=]+\s*\d+",
+            "",
+            sql,
+            flags=re.IGNORECASE
+        )
+        # Same pattern without escaped quotes on column name
+        sql_cleaned = re.sub(
+            r"AND\s+CAST\s*\(\s*r\.recipe_metadata\s*->\s*'pricing'\s*->\s*'[a-z]+'\s*->>\s*'total'\s+AS\s+FLOAT\s*\)\s*[<>=]+\s*\d+",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+
+        # Pattern 2: Multi-line metadata null checks followed by CAST
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"->'pricing'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata->'pricing'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        # Remove null checks for specific country keys
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"->'pricing'->'[a-z]+'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata->'pricing'->'[a-z]+'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        # Remove null checks for total field
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"->'pricing'->'[a-z]+'->>'total'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata->'pricing'->'[a-z]+'->>'total'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+
+        # Pattern 3: Remove ORDER BY clauses with pricing (LLM might have added them)
+        # We'll handle ORDER BY separately via trailing clause stripping
+
+        if sql_cleaned != sql:
+            sql = sql_cleaned
+            logger.info("[PRICING INJECTION] Cleaned up existing pricing filters")
+
+        # Step 2: Check if we already have the correct pricing filter
+        if f"'{country_key}'->>'total'" in sql.lower() and str(value) in sql:
+            logger.info(f"[PRICING INJECTION] Pricing filter already exists in SQL")
+            return sql
+
+        # Step 3: Inject the pricing filter
+        # Use strip-and-reattach strategy
+        body, trailing = self._strip_trailing_clauses(sql)
+        if trailing.strip():
+            sql = body + "\n" + pricing_clause + trailing
+            logger.info("[PRICING INJECTION] Injected pricing filter before trailing clause")
+        else:
+            sql = body + "\n" + pricing_clause
+            logger.info("[PRICING INJECTION] Appended pricing filter at end")
+
+        return sql
+
     def _inject_time_order_by(
         self,
         sql: str,
@@ -1839,6 +2131,18 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             creator_uid = creator_uid[0] if creator_uid else None
         if creator_uid and isinstance(creator_uid, str):
             sql = self._inject_creator_filter(sql, creator_uid)
+
+        # Inject servings filter (multi-turn context: preserve servings across queries)
+        # e.g., Q1: "italian for 2 people" → Q2: "allergic to chicken" → servings=2 preserved
+        servings = sql_filters.get("servings")
+        if servings:
+            sql = self._inject_servings_filter(sql, servings)
+
+        # Inject pricing filter (budget constraint)
+        # e.g., Q1: "my budget is 400" → Q2: "dessert recipes" → budget filter preserved
+        pricing_filter = sql_filters.get("pricing_filters") or sql_filters.get("cost_filter")
+        if pricing_filter:
+            sql = self._inject_pricing_filter(sql, pricing_filter)
 
         return sql
 

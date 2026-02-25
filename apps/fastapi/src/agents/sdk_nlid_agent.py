@@ -89,18 +89,6 @@ Examples:
 - "show me @john's recipes" → creator_username: "john" (strip 's)
 - "suggest me something of @sriyans." → creator_username: "sriyans" (strip .)
 
-## RULE 2: Creator Name Extraction (without @)
-
-When query matches patterns: "by X", "of X", "X's recipes", "created by X", "made by X":
-1. Extract the name as `creator_name`
-2. Place in BOTH `entities.creator_name` AND `filters.creator_name`
-3. Intent = `recipe_search`
-
-Examples:
-- "recipes by Shreyansh" → creator_name: "Shreyansh"
-- "suggest me something of sriyans" → creator_name: "sriyans"
-
-**@username always takes priority over creator_name.**
 
 ## RULE 3: Multi-Turn Context & Refinement (CRITICAL)
 
@@ -117,6 +105,8 @@ Refinement patterns:
 - "make it quick" / "under 30 minutes" → Add time constraint
 - "my budget is $200" / "under 500 rupees" → Add price filter
 - "I'm lactose intolerant" → excluded_ingredients: ["dairy", "milk", "cheese", "cream", "butter"]
+- "for 2 people" / "cooking for 4" / "serves 6" / "for X guests" → Add servings filter (CRITICAL: always extract servings when user specifies portion size)
+- "I'm cooking for 2" / "need to serve 4 people" → Add servings filter
 
 ## RULE 4: Combined @username + Budget/Filter Queries (CRITICAL)
 
@@ -241,7 +231,7 @@ When detecting refinement:
 - **CRITICAL**: ALWAYS extract ALL other filters present in the query alongside nutrition. If the query also mentions servings, ingredients, cuisines, tags, time, cost, etc., extract those too.
 - Examples with additional filters:
   - "high protein meals for 3 people" → intent: nutrition_filter, filters.nutrition: {sort_by: "protein", order: "DESC", level: "high"}, filters.servings: 3
-  - "low carb dinner for 2" → intent: nutrition_filter, filters.nutrition: {sort_by: "carbohydrates", order: "ASC", level: "low"}, filters.servings: 2, filters.tags: ["dinner"]
+  - "low carb dinner for 2 people" → intent: nutrition_filter, filters.nutrition: {sort_by: "carbohydrates", order: "ASC", level: "low"}, filters.servings: 2, filters.tags: ["dinner"]
 
 ### recipe_search
 - The most common intent. Use for any recipe finding/suggesting query.
@@ -399,6 +389,15 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 - Q1: "I want something quick" → intent: time_filter, filters.time: {sort_order: "ASC"}
 - Q2: "my budget is 100$" → intent: price_filter, filters.cost: {operator: "<=", value: 100, country: "US", sort_order: "DESC"}
   (Pipeline will combine both: quick recipes under $100 sorted nearest to $100 first, then by quickest)
+
+**Multi-turn servings filter chain (CRITICAL for portion persistence):**
+- Q1: "I am cooking something italian for 2 people" → intent: recipe_search, filters.cuisines: ["italian"], filters.servings: 2
+- Q2: "I am allergic to chicken" → intent: recipe_search, filters.excluded_ingredients: ["chicken"], filters.servings: 2 (refinement - servings preserved)
+- Q1: "dessert recipes" → intent: recipe_search, filters.tags: ["dessert"]
+- Q2: "cooking for 4 people" → intent: recipe_search, filters.servings: 4 (refinement - add servings to previous search)
+- Q1: "italian for 2 people" → intent: recipe_search, filters.cuisines: ["italian"], filters.servings: 2
+- Q2: "my budget is 800 kr" → intent: price_filter, filters.cost: {operator: "<=", value: 800, country: "Norway", sort_order: "DESC"}
+  (Pipeline carries forward servings=2 from session)
 
 **"under 500" or "under 500 kr" or "my budget is 500 krone"** (Norwegian currency, explicit or implied)
 → intent: price_filter, filters.cost: {operator: "<=", value: 500, country: "Norway", sort_order: "DESC"}, requires_embedding: false
