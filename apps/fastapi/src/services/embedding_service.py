@@ -232,7 +232,8 @@ class EmbeddingService:
         threshold: float = 0.7,
         language_id: Optional[str] = None,
         offset: int = 0,
-        creator_uid: Optional[str] = None
+        creator_uid: Optional[str] = None,
+        exclude_ids: Optional[List[str]] = None
     ) -> List[Tuple[Recipe, float]]:
         """
         Search recipes by semantic similarity using cosine similarity
@@ -244,10 +245,13 @@ class EmbeddingService:
             language_id: Optional language ID filter (e.g., 'en', 'no')
             offset: Number of results to skip (for pagination)
             creator_uid: Optional user UID to restrict search to a specific creator
+            exclude_ids: Optional list of recipe IDs to exclude from results
 
         Returns:
             List of (Recipe, similarity_score) tuples
         """
+        # Log the exact embedding query being searched
+        logger.warning(f"[EMBEDDING SEARCH] Query text for embedding: '{query_text}'")
 
         # Generate embedding for query
         query_embedding = self._generate_embedding(query_text)
@@ -285,6 +289,16 @@ class EmbeddingService:
             where_conditions.append('"userUid" = :creator_uid')
             params["creator_uid"] = creator_uid
             logger.warning(f"[EMBEDDING SEARCH] Creator filter added: userUid={creator_uid}")
+
+        # Exclude specific recipe IDs (used by fallback re-embedding)
+        if exclude_ids:
+            placeholders = ", ".join(
+                f":excl_{i}" for i in range(len(exclude_ids))
+            )
+            where_conditions.append(f'id::text NOT IN ({placeholders})')
+            for i, eid in enumerate(exclude_ids):
+                params[f"excl_{i}"] = eid
+            logger.warning(f"[EMBEDDING SEARCH] Excluding {len(exclude_ids)} recipe IDs")
 
 
         # Use cosine similarity search (1 - cosine_distance)

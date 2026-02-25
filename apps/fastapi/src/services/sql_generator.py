@@ -304,8 +304,12 @@ CRITICAL RULES:
 9. CRITICAL: When candidate_ids placeholder (:recipe_ids) is present:
    - DO NOT add included_ingredients EXISTS clauses (embedding search already handled ingredient matching semantically)
    - DO NOT add excluded_ingredients (allergies) - these are handled programmatically
-10. For tags (vegetarian, vegan, dessert, etc.): AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%tag_name%')
-11. When filtering by multiple tags, use OR: AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name ILIKE '%vegetarian%' OR t.name ILIKE '%vegan%'))
+10. For tags (vegetarian, vegan, dessert, etc.): DO NOT use AND EXISTS (which would exclude recipes without the tag). Instead, use a LEFT JOIN to compute a tag_match score and ORDER BY it DESC so tagged recipes rank higher but untagged recipes are still included:
+   LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%tag_name%' LIMIT 1) tag_match ON true
+   Then add: ORDER BY (CASE WHEN tag_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC
+11. When ranking by multiple tags, combine them in one LEFT JOIN LATERAL with OR:
+   LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND (t.name ILIKE '%vegetarian%' OR t.name ILIKE '%vegan%') LIMIT 1) tag_match ON true
+   Then ORDER BY (CASE WHEN tag_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC
 12. BUNDLE TABLE: When joining bundle table, ALWAYS add: AND b."deletedAt" IS NULL. The column is mixed-case so MUST be quoted.
 
 SUPER IMPORTANT - PARENTHESES BALANCE:
@@ -334,17 +338,19 @@ WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :l
 LIMIT 20
 ```
 
-TAG FILTERING TEMPLATE (for dessert, vegetarian, etc.):
+TAG FILTERING TEMPLATE (for dessert, vegetarian, christmas, etc.):
+IMPORTANT: Tags are NOT strict filters. Use LEFT JOIN LATERAL to BOOST/RANK tagged recipes higher, but still include untagged recipes.
 ```sql
 SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
 FROM recipe r
 LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
 LEFT JOIN "bundle" b ON br."bundleId" = b."id" AND b."deletedAt" IS NULL
 LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
+LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%dessert%' LIMIT 1) tag_match ON true
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
   AND r."id" IN (:recipe_ids)
-  AND EXISTS (SELECT 1 FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%dessert%')
+ORDER BY (CASE WHEN tag_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC
 LIMIT 20
 ```
 
@@ -361,6 +367,23 @@ LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :
 WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
   AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
   AND r."userUid" = ':creator_uid'
+LIMIT 20
+```
+
+CUISINE FILTERING TEMPLATE (for italian, asian, mexican, etc.):
+IMPORTANT: Cuisines are NOT strict filters. Use LEFT JOIN LATERAL to BOOST/RANK cuisine-matching recipes higher, but still include non-matching recipes.
+Cuisines are stored as tags in the database.
+```sql
+SELECT r."id", r."name", r."ingress", r."image", (r."prepTime" + r."cookTime") as total_time, r."difficulty", r."servings"
+FROM recipe r
+LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
+LEFT JOIN "bundle" b ON br."bundleId" = b."id" AND b."deletedAt" IS NULL
+LEFT JOIN user_likes_recipe ulr ON r."id" = ulr."recipeId" AND ulr."userUid" = :user_uid
+LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt."tagId" = t.id WHERE rtt."recipeId" = r."id" AND t.name ILIKE '%italian%' LIMIT 1) cuisine_match ON true
+WHERE r."deletedAt" IS NULL AND r."status" = 'published' AND r."languageId" = :language_id
+  AND (r."private" = false OR r."userUid" = :user_uid OR br."bundleId" IS NOT NULL)
+  AND r."id" IN (:recipe_ids)
+ORDER BY (CASE WHEN cuisine_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC
 LIMIT 20
 ```
 
@@ -397,7 +420,13 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             parts.append(f"- Difficulty: {sql_filters['difficulty']}")
 
         if sql_filters.get("tags"):
-            parts.append(f"- Tags: {', '.join(sql_filters['tags'])}")
+            parts.append(f"- Tags (SOFT RANKING, NOT strict filter): {', '.join(sql_filters['tags'])}")
+            parts.append("  CRITICAL: Do NOT use AND EXISTS for tags. Tags are unreliable in the database.")
+            parts.append("  Instead, use LEFT JOIN LATERAL to compute a tag_match score and ORDER BY it DESC.")
+            parts.append("  Recipes WITH matching tags rank higher, but recipes WITHOUT the tag are STILL included.")
+            tag_conditions = " OR ".join([f"t.name ILIKE '%{t}%'" for t in sql_filters['tags']])
+            parts.append(f"  Use: LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt.\"tagId\" = t.id WHERE rtt.\"recipeId\" = r.\"id\" AND ({tag_conditions}) LIMIT 1) tag_match ON true")
+            parts.append("  Then: ORDER BY (CASE WHEN tag_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC")
             # Vegetarian context: make clear eggs/dairy are vegetarian so the LLM
             # does not generate ingredient exclusions for eggs or dairy products.
             if "vegetarian" in sql_filters.get("tags", []):
@@ -408,7 +437,31 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
                 )
 
         if sql_filters.get("cuisines"):
-            parts.append(f"- Cuisines: {', '.join(sql_filters['cuisines'])}")
+            parts.append(f"- Cuisines (SOFT RANKING, NOT strict filter): {', '.join(sql_filters['cuisines'])}")
+            parts.append("  CRITICAL: Do NOT use AND EXISTS for cuisines. Cuisine data may be incomplete.")
+            parts.append("  Instead, use LEFT JOIN LATERAL to compute a cuisine_match score and ORDER BY it DESC.")
+            parts.append("  Recipes WITH matching cuisine rank higher, but recipes WITHOUT the cuisine are STILL included.")
+            cuisine_conditions = " OR ".join([f"t.name ILIKE '%{c}%'" for c in sql_filters['cuisines']])
+            parts.append(f"  Use: LEFT JOIN LATERAL (SELECT 1 AS match FROM recipe_tags_tag rtt JOIN tag t ON rtt.\"tagId\" = t.id WHERE rtt.\"recipeId\" = r.\"id\" AND ({cuisine_conditions}) LIMIT 1) cuisine_match ON true")
+            parts.append("  Then: ORDER BY (CASE WHEN cuisine_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC")
+
+        # Servings filter
+        if sql_filters.get("servings"):
+            servings = sql_filters['servings']
+            parts.append(f"- Servings: exactly {servings} servings")
+            parts.append(f"  CRITICAL: Filter by r.servings = {servings}")
+            parts.append(f"  Example: AND r.servings = {servings}")
+
+        # Ingredient count filter
+        if sql_filters.get("ingredient_count"):
+            ing_count = sql_filters['ingredient_count']
+            operator = ing_count.get("operator", "==")
+            value = ing_count.get("value", 5)
+            operator_map = {"==": "=", "<": "<", ">": ">", "<=": "<=", ">=": ">="}
+            sql_op = operator_map.get(operator, "=")
+            parts.append(f"- Ingredient count: {operator} {value} ingredients")
+            parts.append(f"  CRITICAL: Count ingredients in recipe using subquery")
+            parts.append(f"  Example: AND (SELECT COUNT(*) FROM recipe_ingredient ri WHERE ri.\"recipeId\" = r.\"id\" AND ri.\"deletedAt\" IS NULL) {sql_op} {value}")
 
         if sql_filters.get("excluded_ingredients"):
             parts.append(f"- Exclude ingredients: {', '.join(sql_filters['excluded_ingredients'])}")
@@ -429,32 +482,64 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
    CRITICAL: For filter-only nutrition queries, use ORDER BY sorting instead of WHERE filter clauses
    This allows dynamic sorting by actual nutrition values in recipe_metadata
 
+   NUTRITION PATHS:
+   - Macronutrients (protein, carbs, fat, calories, fiber, sugar): r."recipe_metadata"->'totalNutrition'->'macros'->>'column'
+   - Micronutrients (iron, zinc, calcium, magnesium, vitamins): r."recipe_metadata"->'totalNutrition'->'micros'->>'column'
+
+   MACRONUTRIENT COLUMNS: protein, carbohydrates, totalFat, energyKcal, totalFiber, totalSugars, sodium, cholesterol
+   MICRONUTRIENT COLUMNS (minerals): calcium, iron, magnesium, zinc, potassium, copper, phosphorus, selenium
+   MICRONUTRIENT COLUMNS (vitamins): vitaminA, vitaminC, vitaminD, vitaminE, vitaminK, vitaminB6, vitaminB12, folateB9
+
    SORTING LOGIC:
-   - "high protein" → ORDER BY protein DESC (higher protein first)
-   - "low carb" → ORDER BY carbohydrates ASC (lower carbs first)
-   - "high calorie" → ORDER BY calories DESC
-   - "under 300 calories" → ORDER BY calories ASC (under 300)
+   - "high protein" → ORDER BY CAST(r."recipe_metadata"->'totalNutrition'->'macros'->>'protein' AS FLOAT) DESC
+   - "low carb" → ORDER BY CAST(r."recipe_metadata"->'totalNutrition'->'macros'->>'carbohydrates' AS FLOAT) ASC
+   - "high iron" → ORDER BY CAST(r."recipe_metadata"->'totalNutrition'->'micros'->>'iron' AS FLOAT) DESC
+   - "high calcium" → ORDER BY CAST(r."recipe_metadata"->'totalNutrition'->'micros'->>'calcium' AS FLOAT) DESC
+   - "vitamin c rich" → ORDER BY CAST(r."recipe_metadata"->'totalNutrition'->'micros'->>'vitaminC' AS FLOAT) DESC
 
    DO NOT use hardcoded WHERE clauses like "> 20" or "< 10"
    Instead, rely on ORDER BY to sort results by actual values""")
 
         # Add pricing filters
+        # pricing_filters can be in two formats:
+        # 1. {'max_price': 100, 'min_price': 50} (legacy)
+        # 2. {'operator': '<=', 'value': 400, 'country': 'US', 'sort_order': 'DESC'} (current)
         if sql_filters.get("pricing_filters"):
             pricing_filters = sql_filters['pricing_filters']
-            currency = sql_filters.get('currency', 'USD')
-            parts.append(f"\n## Pricing Filters (Currency: {currency})")
+            parts.append(f"\n## Pricing Filters")
 
-            for constraint, amount in pricing_filters.items():
-                if constraint == 'max_price':
-                    parts.append(f"- Max price: {amount} {currency}")
-                    parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
-                    parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) <= {amount}")
-                elif constraint == 'min_price':
-                    parts.append(f"- Min price: {amount} {currency}")
-                    parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
-                    parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) >= {amount}")
+            # Handle new format with operator/value/country
+            if isinstance(pricing_filters, dict) and 'value' in pricing_filters:
+                operator = pricing_filters.get('operator', '<=')
+                value = pricing_filters.get('value')
+                country = pricing_filters.get('country', 'US')
+                sort_order = pricing_filters.get('sort_order', 'ASC')
 
-            parts.append("  Use appropriate ORDER BY clauses for sorting by price")
+                # Map country to pricing key (lowercase)
+                country_key = country.lower() if country else 'usa'
+
+                parts.append(f"- Price constraint: {operator} {value} {country}")
+                parts.append(f"  CRITICAL: Filter by r.recipe_metadata->'pricing'->'{country_key}'->>'total'")
+                parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->'{country_key}'->>'total' AS FLOAT) {operator} {value}")
+                parts.append(f"  Sort order: {sort_order} (DESC = highest price first, ASC = lowest price first)")
+                if sort_order == 'DESC':
+                    parts.append(f"  Example ORDER BY: ORDER BY CAST(r.recipe_metadata->'pricing'->'{country_key}'->>'total' AS FLOAT) DESC")
+                else:
+                    parts.append(f"  Example ORDER BY: ORDER BY CAST(r.recipe_metadata->'pricing'->'{country_key}'->>'total' AS FLOAT) ASC")
+            else:
+                # Handle legacy format with max_price/min_price keys
+                currency = sql_filters.get('currency', 'USD')
+                parts.append(f"(Currency: {currency})")
+                for constraint, amount in pricing_filters.items():
+                    if constraint == 'max_price':
+                        parts.append(f"- Max price: {amount} {currency}")
+                        parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
+                        parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) <= {amount}")
+                    elif constraint == 'min_price':
+                        parts.append(f"- Min price: {amount} {currency}")
+                        parts.append(f"  CRITICAL: Use r.recipe_metadata->'pricing'->>'{currency}' for {currency} pricing")
+                        parts.append(f"  Example: AND CAST(r.recipe_metadata->'pricing'->>'{currency}' AS FLOAT) >= {amount}")
+                parts.append("  Use appropriate ORDER BY clauses for sorting by price")
 
         # IMPORTANT: Only show included_ingredients if we DON'T have candidate_ids
         # When candidate_ids are provided, embedding search already handled ingredient matching semantically
@@ -693,10 +778,14 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
         sql = fix_unclosed_exists_before_rname(sql)
 
-        # Find LIMIT clause
-        limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
-        if not limit_match:
+        # Find the TOP-LEVEL LIMIT clause (use LAST LIMIT to avoid subquery LIMITs)
+        limit_matches = list(re.finditer(r'\bLIMIT\s+\d+', sql, re.IGNORECASE))
+        if not limit_matches:
             return sql
+
+        # Use the last LIMIT - it's the top-level one
+        limit_match = limit_matches[-1]
+        logger.info(f"[SQL FIXER] Using LIMIT at position {limit_match.start()}: '{limit_match.group()}'")
 
         sql_before_limit = sql[:limit_match.start()].rstrip()
 
@@ -998,19 +1087,26 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         order_by_matches = list(order_by_pat.finditer(sql))
         limit_matches = list(limit_pat.finditer(sql))
 
+        # Debug logging
+        logger.info(f"[STRIP TRAILING] Found {len(order_by_matches)} ORDER BY matches, {len(limit_matches)} LIMIT matches")
+
         cut_pos = None
 
         if order_by_matches:
             # Use the last ORDER BY — it is the top-level trailing clause
             cut_pos = order_by_matches[-1].start()
+            logger.info(f"[STRIP TRAILING] Using ORDER BY at position {cut_pos}")
         elif limit_matches:
             cut_pos = limit_matches[-1].start()
+            logger.info(f"[STRIP TRAILING] Using LIMIT at position {cut_pos}")
 
         if cut_pos is None:
+            logger.info("[STRIP TRAILING] No trailing clauses found, returning full SQL")
             return sql, ""
 
         body = sql[:cut_pos].rstrip()
         trailing = '\n' + sql[cut_pos:].lstrip('\n')
+        logger.info(f"[STRIP TRAILING] Body length: {len(body)}, Trailing: '{trailing[:50]}...'")
         return body, trailing
 
 
@@ -1122,6 +1218,138 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
         return ''.join(result)
 
+    def _remove_suspicious_not_exists_blocks(self, sql: str) -> str:
+        """
+        Remove suspicious NOT EXISTS blocks that don't contain any ILIKE pattern.
+
+        These are typically LLM-generated blocks that are incorrect and would
+        exclude all recipes or cause other issues. A legitimate NOT EXISTS block
+        for allergen filtering should contain an ILIKE pattern.
+
+        Example of suspicious block to remove:
+            AND NOT EXISTS (
+                SELECT 1 FROM recipe_ingredient ri
+                JOIN ingredient i ON i.id = ri."ingredientId"
+                WHERE ri."recipeId" = r."id"
+                  AND ri."deletedAt" IS NULL
+                  AND i."languageId" = 'en'
+            )
+
+        This block has no ILIKE and would exclude ALL recipes with ingredients.
+        """
+        import re
+
+        result = []
+        i = 0
+        n = len(sql)
+        in_string = False
+
+        while i < n:
+            ch = sql[i]
+
+            # Track single-quoted string literals
+            if ch == "'" and not in_string:
+                in_string = True
+                result.append(ch)
+                i += 1
+                continue
+            if in_string:
+                result.append(ch)
+                if ch == "'" and i + 1 < n and sql[i + 1] == "'":
+                    result.append(sql[i + 1])
+                    i += 2
+                elif ch == "'":
+                    in_string = False
+                    i += 1
+                else:
+                    i += 1
+                continue
+
+            # Look for "AND NOT EXISTS" at depth 0
+            and_not_exists_match = re.match(
+                r'AND\s+NOT\s+EXISTS\s*\(',
+                sql[i:],
+                re.IGNORECASE,
+            )
+            if and_not_exists_match:
+                prefix_len = len(and_not_exists_match.group(0))
+                paren_start = i + prefix_len - 1  # position of the "("
+                # Walk forward to find the matching closing paren
+                depth = 0
+                j = paren_start
+                block_has_ilike = False
+                in_str_inner = False
+                while j < n:
+                    c = sql[j]
+                    if c == "'" and not in_str_inner:
+                        in_str_inner = True
+                        j += 1
+                        continue
+                    if in_str_inner:
+                        if c == "'" and j + 1 < n and sql[j + 1] == "'":
+                            j += 2
+                            continue
+                        if c == "'":
+                            in_str_inner = False
+                        j += 1
+                        continue
+                    if c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            # Closing paren found — check if block contains ILIKE
+                            block_text = sql[paren_start: j + 1].upper()
+                            if 'ILIKE' in block_text:
+                                block_has_ilike = True
+                            break
+                    j += 1
+
+                if not block_has_ilike and j < n:
+                    # This NOT EXISTS block has no ILIKE - it's suspicious
+                    # Check if it's doing something legitimate like checking for
+                    # recipe existence or has other filtering conditions
+                    block_text_lower = sql[paren_start: j + 1].lower()
+
+                    # Check for legitimate patterns that should be kept
+                    # - Bundle check: br."bundleId"
+                    # - Deleted check: "deletedAt" IS NULL
+                    # - Access control checks
+                    legitimate_patterns = [
+                        'br."bundleid"',
+                        '"bundleid"',
+                        'private',
+                        'access',
+                        'permission',
+                    ]
+
+                    is_legitimate = any(
+                        pattern in block_text_lower
+                        for pattern in legitimate_patterns
+                    )
+
+                    if not is_legitimate:
+                        # Skip this suspicious block
+                        logger.info(
+                            f"[SQL FIXER] Removed suspicious NOT EXISTS block "
+                            f"with no ILIKE pattern at offset {i}"
+                        )
+                        i = j + 1
+                        # Also remove trailing whitespace
+                        while i < n and sql[i] in ' \n\t':
+                            i += 1
+                        continue
+
+                # Block is legitimate or has ILIKE — keep it
+                result.append(sql[i])
+                i += 1
+                continue
+
+            result.append(ch)
+            i += 1
+
+        return ''.join(result)
+
     def _inject_allergen_exclusion(
         self,
         sql: str,
@@ -1161,6 +1389,10 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             sql_cleaned = self._remove_ilike_blocks_for_ingredient(
                 sql_cleaned, ing_lower
             )
+
+        # Remove suspicious NOT EXISTS blocks that have no ILIKE pattern
+        # These are typically LLM-generated errors that would exclude all recipes
+        sql_cleaned = self._remove_suspicious_not_exists_blocks(sql_cleaned)
 
         # Pattern A: AND NOT (...) blocks — the clean negation form
         # AND NOT ( r."name" ILIKE '%X%' OR r."ingress" ILIKE '%X%' OR EXISTS(...) )
@@ -1433,6 +1665,275 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
 
         return sql
 
+    def _inject_servings_filter(
+        self,
+        sql: str,
+        servings: Any
+    ) -> str:
+        """
+        Inject servings filter into SQL.
+
+        Supports multiple formats:
+        - Exact integer: servings = 4
+        - Range dict: {"min": 2, "max": 4} → servings >= 2 AND servings <= 4
+        - Comparison dict: {"operator": ">=", "value": 4} → servings >= 4
+
+        Args:
+            sql: The SQL query to modify
+            servings: The servings filter value
+
+        Returns:
+            Modified SQL with servings filter
+        """
+        import re
+
+        if not servings:
+            return sql
+
+        # Build the servings clause based on the format
+        servings_clause = None
+
+        if isinstance(servings, int):
+            # Simple integer - exact match
+            servings_clause = f'AND r.servings = {servings}'
+            logger.info(f"[SERVINGS INJECTION] Adding exact servings filter: {servings}")
+        elif isinstance(servings, dict):
+            # Complex servings filter
+            min_val = servings.get("min")
+            max_val = servings.get("max")
+            operator = servings.get("operator")
+            value = servings.get("value")
+
+            if min_val is not None and max_val is not None:
+                # Range filter: servings >= min AND servings <= max
+                try:
+                    min_int = int(min_val)
+                    max_int = int(max_val)
+                    servings_clause = f'AND r.servings >= {min_int} AND r.servings <= {max_int}'
+                    logger.info(f"[SERVINGS INJECTION] Adding range servings filter: {min_int}-{max_int}")
+                except (ValueError, TypeError):
+                    pass
+            elif operator and value is not None:
+                # Comparison filter: servings >= 4, servings > 3, etc.
+                operator_map = {"==": "=", "<": "<", ">": ">", "<=": "<=", ">=": ">="}
+                sql_op = operator_map.get(operator, "=")
+                try:
+                    value_int = int(value)
+                    servings_clause = f'AND r.servings {sql_op} {value_int}'
+                    logger.info(f"[SERVINGS INJECTION] Adding comparison servings filter: {sql_op} {value_int}")
+                except (ValueError, TypeError):
+                    pass
+        else:
+            # Try to parse as integer (string or other type)
+            try:
+                servings_int = int(servings)
+                servings_clause = f'AND r.servings = {servings_int}'
+                logger.info(f"[SERVINGS INJECTION] Adding parsed servings filter: {servings_int}")
+            except (ValueError, TypeError):
+                pass
+
+        if not servings_clause:
+            return sql
+
+        # Step 1: Remove any existing servings filter the LLM may have added
+        # Pattern: AND r.servings = X or AND r."servings" = X (with or without quotes)
+        sql_cleaned = re.sub(
+            r'AND\s+r\.\"servings\"\s*[=<>]+\s*\d+',
+            "",
+            sql,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.servings\s*[=<>]+\s*\d+",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        # Also remove range patterns: AND r.servings >= X AND r.servings <= Y
+        sql_cleaned = re.sub(
+            r'AND\s+r\.\"servings\"\s*>=\s*\d+\s+AND\s+r\.\"servings\"\s*<=\s*\d+',
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.servings\s*>=\s*\d+\s+AND\s+r\.servings\s*<=\s*\d+",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+
+        if sql_cleaned != sql:
+            sql = sql_cleaned
+            logger.info("[SERVINGS INJECTION] Cleaned up existing servings filters")
+
+        # Step 2: Check if we already have the correct servings filter
+        # (after cleanup, this shouldn't happen, but just in case)
+        if servings_clause.replace("AND ", "") in sql:
+            logger.info(f"[SERVINGS INJECTION] Servings filter already exists in SQL")
+            return sql
+
+        # Step 3: Inject the servings filter
+        # Use strip-and-reattach strategy (no paren-depth counting needed)
+        body, trailing = self._strip_trailing_clauses(sql)
+        if trailing.strip():
+            sql = body + "\n" + servings_clause + trailing
+            logger.info("[SERVINGS INJECTION] Injected servings filter before trailing clause")
+        else:
+            sql = body + "\n" + servings_clause
+            logger.info("[SERVINGS INJECTION] Appended servings filter at end")
+
+        return sql
+
+    def _inject_pricing_filter(
+        self,
+        sql: str,
+        pricing_filter: Dict[str, Any]
+    ) -> str:
+        """
+        Inject pricing filter into SQL.
+
+        Supports format:
+        - {"operator": "<=", "value": 400, "country": "US", "sort_order": "DESC"}
+
+        Args:
+            sql: The SQL query to modify
+            pricing_filter: The pricing filter dict with operator, value, country, sort_order
+
+        Returns:
+            Modified SQL with pricing filter
+        """
+        import re
+
+        if not pricing_filter or not isinstance(pricing_filter, dict):
+            return sql
+
+        # Extract filter parameters
+        operator = pricing_filter.get("operator", "<=")
+        value = pricing_filter.get("value")
+        country = pricing_filter.get("country", "US")
+        sort_order = pricing_filter.get("sort_order", "ASC")
+
+        if value is None:
+            return sql
+
+        # Map country to pricing key (lowercase)
+        # IMPORTANT: Use consistent key format - match what's in the database
+        country_key_map = {"US": "usa", "USA": "usa", "INDIA": "india", "NORWAY": "norway"}
+        country_key = country_key_map.get(country.upper(), country.lower())
+
+        # Normalize operator
+        operator_map = {"<=": "<=", ">=": ">=", "<": "<", ">": ">", "==": "="}
+        sql_op = operator_map.get(operator, "<=")
+
+        # Build the pricing filter clause
+        # Using recipe_metadata->'pricing'->'country'->>'total'
+        pricing_clause = (
+            f"AND r.\"recipe_metadata\" IS NOT NULL\n"
+            f"  AND r.\"recipe_metadata\"->'pricing' IS NOT NULL\n"
+            f"  AND r.\"recipe_metadata\"->'pricing'->'{country_key}' IS NOT NULL\n"
+            f"  AND r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' IS NOT NULL\n"
+            f"  AND CAST(r.\"recipe_metadata\"->'pricing'->'{country_key}'->>'total' AS FLOAT) {sql_op} {value}"
+        )
+
+        logger.info(f"[PRICING INJECTION] Adding pricing filter: {sql_op} {value} {country} (key={country_key})")
+
+        # Step 1: Remove ALL existing pricing filter patterns the LLM may have added
+        # These patterns can vary in quote style and country key
+
+        # Pattern 1: CAST(r.recipe_metadata->'pricing'->'xx'->>'total' AS FLOAT) <= X
+        # The LLM generates: CAST(r.recipe_metadata->'pricing'->'us'->>'total' AS FLOAT) <= 400
+        # Note: closing ) is after FLOAT, not after 'total'
+        sql_cleaned = re.sub(
+            r"AND\s+CAST\s*\(\s*r\.\"recipe_metadata\"\s*->\s*'pricing'\s*->\s*'[a-z]+'\s*->>\s*'total'\s+AS\s+FLOAT\s*\)\s*[<>=]+\s*\d+",
+            "",
+            sql,
+            flags=re.IGNORECASE
+        )
+        # Same pattern without escaped quotes on column name
+        sql_cleaned = re.sub(
+            r"AND\s+CAST\s*\(\s*r\.recipe_metadata\s*->\s*'pricing'\s*->\s*'[a-z]+'\s*->>\s*'total'\s+AS\s+FLOAT\s*\)\s*[<>=]+\s*\d+",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+
+        # Pattern 2: Multi-line metadata null checks followed by CAST
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"->'pricing'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata->'pricing'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        # Remove null checks for specific country keys
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"->'pricing'->'[a-z]+'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata->'pricing'->'[a-z]+'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        # Remove null checks for total field
+        sql_cleaned = re.sub(
+            r"AND\s+r\.\"recipe_metadata\"->'pricing'->'[a-z]+'->>'total'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+        sql_cleaned = re.sub(
+            r"AND\s+r\.recipe_metadata->'pricing'->'[a-z]+'->>'total'\s+IS\s+NOT\s+NULL",
+            "",
+            sql_cleaned,
+            flags=re.IGNORECASE
+        )
+
+        # Pattern 3: Remove ORDER BY clauses with pricing (LLM might have added them)
+        # We'll handle ORDER BY separately via trailing clause stripping
+
+        if sql_cleaned != sql:
+            sql = sql_cleaned
+            logger.info("[PRICING INJECTION] Cleaned up existing pricing filters")
+
+        # Step 2: Check if we already have the correct pricing filter
+        if f"'{country_key}'->>'total'" in sql.lower() and str(value) in sql:
+            logger.info(f"[PRICING INJECTION] Pricing filter already exists in SQL")
+            return sql
+
+        # Step 3: Inject the pricing filter
+        # Use strip-and-reattach strategy
+        body, trailing = self._strip_trailing_clauses(sql)
+        if trailing.strip():
+            sql = body + "\n" + pricing_clause + trailing
+            logger.info("[PRICING INJECTION] Injected pricing filter before trailing clause")
+        else:
+            sql = body + "\n" + pricing_clause
+            logger.info("[PRICING INJECTION] Appended pricing filter at end")
+
+        return sql
+
     def _inject_time_order_by(
         self,
         sql: str,
@@ -1480,11 +1981,19 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
         # Build the ORDER BY clause
         order_clause = f'ORDER BY (r."prepTime" + r."cookTime") {sort_order}'
 
-        # Find LIMIT clause
-        limit_match = re.search(r'\bLIMIT\s+\d+', sql, re.IGNORECASE)
+        # Find the TOP-LEVEL LIMIT clause (not one inside subqueries)
+        # Use the LAST LIMIT in multi-line SQL (top-level LIMIT comes after all subqueries)
+        limit_matches = list(re.finditer(r'\bLIMIT\s+\d+', sql, re.IGNORECASE))
+        if limit_matches:
+            # Use the last LIMIT - it's the top-level one
+            limit_match = limit_matches[-1]
+            logger.info(f"[TIME ORDER] Found LIMIT at position {limit_match.start()}: '{limit_match.group()}'")
+        else:
+            limit_match = None
 
         if limit_match:
-            # Check if there's already an ORDER BY clause
+            # Check if there's already an ORDER BY clause (top-level, not in subquery)
+            # Look for ORDER BY that comes after the last closing paren of WHERE clause
             existing_order_match = re.search(r'\bORDER\s+BY\b', sql, re.IGNORECASE)
 
             if existing_order_match:
@@ -1495,8 +2004,13 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
                 logger.info(f"[TIME ORDER] Replaced existing ORDER BY with time sorting")
             else:
                 # Insert ORDER BY before LIMIT
-                sql = sql[:limit_match.start()] + order_clause + "\n" + sql[limit_match.start():]
-                logger.info(f"[TIME ORDER] Inserted ORDER BY before LIMIT")
+                # Ensure there's a newline before ORDER BY for proper detection by _strip_trailing_clauses
+                before_limit = sql[:limit_match.start()]
+                # Add newline if the character before LIMIT is not already a newline
+                if before_limit and not before_limit.endswith('\n'):
+                    before_limit = before_limit.rstrip() + '\n'
+                sql = before_limit + order_clause + "\n" + sql[limit_match.start():]
+                logger.info(f"[TIME ORDER] Inserted ORDER BY before LIMIT at position {limit_match.start()}")
         else:
             # No LIMIT, append at the end
             sql = sql.rstrip() + "\n" + order_clause
@@ -1640,6 +2154,18 @@ Return ONLY the SQL query wrapped in ```sql ... ``` blocks."""
             creator_uid = creator_uid[0] if creator_uid else None
         if creator_uid and isinstance(creator_uid, str):
             sql = self._inject_creator_filter(sql, creator_uid)
+
+        # Inject servings filter (multi-turn context: preserve servings across queries)
+        # e.g., Q1: "italian for 2 people" → Q2: "allergic to chicken" → servings=2 preserved
+        servings = sql_filters.get("servings")
+        if servings:
+            sql = self._inject_servings_filter(sql, servings)
+
+        # Inject pricing filter (budget constraint)
+        # e.g., Q1: "my budget is 400" → Q2: "dessert recipes" → budget filter preserved
+        pricing_filter = sql_filters.get("pricing_filters") or sql_filters.get("cost_filter")
+        if pricing_filter:
+            sql = self._inject_pricing_filter(sql, pricing_filter)
 
         return sql
 

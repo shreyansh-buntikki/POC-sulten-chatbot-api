@@ -2,7 +2,7 @@
 Session Memory Manager
 Maintains conversational context and state across turns
 """
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional, Set, Union
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -40,6 +40,13 @@ class SessionFilters:
     region: Optional[str] = None  # regional preference
     creator_uid: Optional[str] = None  # filter by recipe creator
     creator_username: Optional[str] = None  # resolved username for NLG context
+    servings: Optional[Union[int, Dict[str, Any]]] = None  # int for exact, dict for range/comparison/sort
+    # Examples:
+    #   - 4 → exactly 4 servings
+    #   - {"min": 2, "max": 4} → between 2 and 4 servings
+    #   - {"operator": ">=", "value": 4} → at least 4 servings
+    #   - {"sort": "DESC"} → just sort by servings DESC (no filter)
+    ingredient_count: Optional[Dict[str, Any]] = None  # e.g. {"operator": "<=", "value": 5}
     # Persisted filter state for multi-turn context
     cost_filter: Optional[Dict[str, Any]] = None  # e.g. {"operator": "<=", "value": 100, "country": "Norway", "sort_order": "DESC"}
     time_filter: Optional[Dict[str, Any]] = None  # e.g. {"sort_order": "ASC"}
@@ -473,6 +480,10 @@ class SessionMemoryManager:
                     "allergic", "allergy", "can't have", "cannot have",
                     "i'm not a fan", "im not a fan", "not a fan",
                     "avoid", "without", "exclude",
+                    # NEW: Handle "don't have" patterns
+                    "dont have", "don't have", "do not have",
+                    "ran out", "ran out of", "missing", "i'm missing",
+                    "no more", "out of",
                 ]
                 is_exclusion_query = any(indicator in content for indicator in exclusion_indicators)
 
@@ -502,6 +513,36 @@ class SessionMemoryManager:
                     r"no (\w+(?:\s+\w+)*)(?:\s+please)?",
                 ]
 
+                # Additional exclusion patterns for "ran out of", "don't have", etc.
+                # These catch cases where the NLID agent might miss the extraction
+                exclusion_patterns = [
+                    # "ran out of X", "ran out of eggs"
+                    r"ran out of (\w+(?:\s+\w+)*)",
+                    # "don't have X", "dont have eggs"
+                    r"don'?t have (\w+(?:\s+\w+)*)",
+                    # "don't like X", "dont like chicken"
+                    r"don'?t like (\w+(?:\s+\w+)*)",
+                    # "do not have X"
+                    r"do not have (\w+(?:\s+\w+)*)",
+                    # "do not like X"
+                    r"do not like (\w+(?:\s+\w+)*)",
+                    # "missing X", "i'm missing X"
+                    r"(?:i'?m\s+)?missing (\w+(?:\s+\w+)*)",
+                    # "out of X" (when referring to ingredients)
+                    r"out of (\w+(?:\s+\w+)*)",
+                    # "no more X"
+                    r"no more (\w+(?:\s+\w+)*)",
+                    # "avoid X"
+                    r"avoid (\w+(?:\s+\w+)*)",
+                    # "without X"
+                    r"without (\w+(?:\s+\w+)*)",
+                    # "hate X"
+                    r"hate (\w+(?:\s+\w+)*)",
+                    # "can't eat X"
+                    r"can'?t eat (\w+(?:\s+\w+)*)",
+                ]
+
+                # Process allergy patterns
                 for pattern in allergy_patterns:
                     matches = re.finditer(pattern, content)
                     for match in matches:
@@ -509,6 +550,24 @@ class SessionMemoryManager:
                         if ingredient and ingredient not in ["no", "not", "dont", "don't"]:
                             if ingredient not in session.excluded_ingredients:
                                 session.excluded_ingredients.append(ingredient)
+                                logger.info(f"[SESSION FALLBACK] Extracted excluded ingredient via allergy pattern: {ingredient}")
+
+                # Process exclusion patterns
+                for pattern in exclusion_patterns:
+                    matches = re.finditer(pattern, content)
+                    for match in matches:
+                        ingredient = match.group(1).strip().lower()
+                        # Filter out false positives (common words that aren't ingredients)
+                        false_positives = [
+                            "a", "an", "the", "it", "that", "this", "my", "your", "his", "her",
+                            "any", "some", "much", "many", "more", "most", "other", "another",
+                            "time", "money", "idea", "clue", "problem", "issue", "luck",
+                            "recipes", "recipe", "food", "meal", "dinner", "lunch", "breakfast",
+                        ]
+                        if ingredient and ingredient not in false_positives:
+                            if ingredient not in session.excluded_ingredients:
+                                session.excluded_ingredients.append(ingredient)
+                                logger.info(f"[SESSION FALLBACK] Extracted excluded ingredient via exclusion pattern: {ingredient}")
 
         return session
 
@@ -580,7 +639,8 @@ class SessionMemoryManager:
     def update_session_from_nlid(
         self,
         session: SessionState,
-        nlid_result: Dict[str, Any]
+        nlid_result: Dict[str, Any],
+        original_query: Optional[str] = None
     ) -> SessionState:
         """
         Update session state based on NLID results
@@ -591,6 +651,7 @@ class SessionMemoryManager:
         Args:
             session: Current session state
             nlid_result: Result from NLID agent
+            original_query: Optional original user query for detecting recipe types
 
         Returns:
             Updated session state
@@ -615,16 +676,52 @@ class SessionMemoryManager:
         # Adding it to session.included_ingredients causes has_positive_context=True
         # downstream, which then prevents the correct SQL_ONLY routing for pure
         # exclusion queries.
+        #
+        # IMPORTANT: We should NOT add ingredients to included_ingredients if they
+        # are the PRIMARY SEARCH TERM (recipe type/dish name) rather than a constraint.
+        # E.g., "ice cream recipes" - "ice cream" is the recipe type, not an ingredient
+        # to filter by. Adding it would incorrectly require recipes to CONTAIN ice cream
+        # as an ingredient in subsequent filter refinements.
         entities = nlid_result.get('entities', {})
         included_ingredients = entities.get('ingredients', [])
         excluded_set_lower = {e.lower() for e in excluded_ingredients}
+
+        # Get the original query to check if ingredients are primary search terms
+        # Use the passed original_query if available, otherwise fall back to summary
+        query_text = original_query or nlid_result.get('summary', '')
+        query_lower = query_text.lower() if query_text else ""
+
+        # Patterns that indicate the ingredient is a primary search term (recipe type)
+        # not a constraint to be added to included_ingredients
+        recipe_type_patterns = [
+            "recipes", "recipe", "dish", "dishes", "how to make", "make",
+            "cook", "prepare", "suggest", "want", "looking for", "find"
+        ]
 
         for ingredient in included_ingredients:
             if (
                 ingredient not in session.included_ingredients
                 and ingredient.lower() not in excluded_set_lower
             ):
-                session.included_ingredients.append(ingredient)
+                # Check if this ingredient appears to be the primary search term
+                # (recipe type) rather than a constraint
+                ing_lower = ingredient.lower()
+                is_recipe_type = False
+
+                # If the query is about "X recipes" or "suggest X", X is likely
+                # a recipe type, not an ingredient constraint
+                for pattern in recipe_type_patterns:
+                    if f"{ing_lower} {pattern}" in query_lower or f"{pattern} {ing_lower}" in query_lower:
+                        is_recipe_type = True
+                        logger.info(
+                            f"[SESSION UPDATE] '{ingredient}' appears to be a recipe type "
+                            f"(matches '{pattern}') - NOT adding to included_ingredients"
+                        )
+                        break
+
+                if not is_recipe_type:
+                    session.included_ingredients.append(ingredient)
+                    logger.info(f"[SESSION UPDATE] Added '{ingredient}' to included_ingredients")
 
         # Update filters if provided
         parameters = nlid_result.get('parameters', {})
@@ -683,6 +780,20 @@ class SessionMemoryManager:
             session.filters.nutrition_filter = filters['nutrition']
             logger.info(f"[SESSION UPDATE] Persisted nutrition_filter: {filters['nutrition']}")
 
+        # Persist servings for multi-turn context
+        # e.g., Q1: "Italian for 2 people" → Q2: "allergic to chicken" → servings=2 preserved
+        if filters.get('servings'):
+            session.filters.servings = filters['servings']
+            logger.info(f"[SESSION UPDATE] Persisted servings: {filters['servings']}")
+        elif parameters.get('servings'):
+            session.filters.servings = parameters['servings']
+            logger.info(f"[SESSION UPDATE] Persisted servings from parameters: {parameters['servings']}")
+
+        # Persist ingredient_count for multi-turn context
+        if filters.get('ingredient_count'):
+            session.filters.ingredient_count = filters['ingredient_count']
+            logger.info(f"[SESSION UPDATE] Persisted ingredient_count: {filters['ingredient_count']}")
+
         # Save and return
         session.increment_turn()
         self.save_session(session)
@@ -723,6 +834,8 @@ class SessionMemoryManager:
                 "cost_filter": session.filters.cost_filter,
                 "time_filter": session.filters.time_filter,
                 "nutrition_filter": session.filters.nutrition_filter,
+                "servings": session.filters.servings,
+                "ingredient_count": session.filters.ingredient_count,
             },
             "context_entities": {
                 "last_referenced_recipe_id": session.context_entities.last_referenced_recipe_id,

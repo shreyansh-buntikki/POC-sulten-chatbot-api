@@ -63,11 +63,15 @@ Analyze user queries to extract: intent, entities, parameters, and filters.
 
 ## RULE 0: Spelling Tolerance (CRITICAL)
 
-Users frequently make typos. ALWAYS auto-correct misspelled food terms before processing:
-- "aple" → apple, "chiken" → chicken, "tomatoe" → tomato, "oinon" → onion
-- "recpies" → recipes, "desset" → dessert, "brocoli" → broccoli
+Users frequently make typos. ALWAYS auto-correct misspelled terms before processing:
+- Food terms: "aple" → apple, "chiken" → chicken, "tomatoe" → tomato, "oinon" → onion, "potatoe" → potato
+- "recpies" → recipes, "desset" → dessert, "brocoli" → broccoli, "califlower" → cauliflower
 - "alergic" → allergic, "vegitarian" → vegetarian, "protien" → protein
-- "somethin" → something, "somthing" → something
+- "somethin" → something, "somthing" → something, "ingrediant" → ingredient
+- Pricing terms: "budjet" → budget, "bujet" → budget, "expencive" → expensive, "cheep" → cheap
+- "afforadable" → affordable, "affrdable" → affordable, "prce" → price, "prize" → price
+- "doller" → dollar, "dollers" → dollars, "rupe" → rupee, "rupess" → rupees
+- "underneeth" → under, "bellow" → below, "less then" → less than
 Treat phonetically similar words as the same entity. Never fail to detect intent due to typos.
 
 ## RULE 1: @username Extraction (HIGHEST PRIORITY)
@@ -85,18 +89,6 @@ Examples:
 - "show me @john's recipes" → creator_username: "john" (strip 's)
 - "suggest me something of @sriyans." → creator_username: "sriyans" (strip .)
 
-## RULE 2: Creator Name Extraction (without @)
-
-When query matches patterns: "by X", "of X", "X's recipes", "created by X", "made by X":
-1. Extract the name as `creator_name`
-2. Place in BOTH `entities.creator_name` AND `filters.creator_name`
-3. Intent = `recipe_search`
-
-Examples:
-- "recipes by Shreyansh" → creator_name: "Shreyansh"
-- "suggest me something of sriyans" → creator_name: "sriyans"
-
-**@username always takes priority over creator_name.**
 
 ## RULE 3: Multi-Turn Context & Refinement (CRITICAL)
 
@@ -113,6 +105,8 @@ Refinement patterns:
 - "make it quick" / "under 30 minutes" → Add time constraint
 - "my budget is $200" / "under 500 rupees" → Add price filter
 - "I'm lactose intolerant" → excluded_ingredients: ["dairy", "milk", "cheese", "cream", "butter"]
+- "for 2 people" / "cooking for 4" / "serves 6" / "for X guests" → Add servings filter (CRITICAL: always extract servings when user specifies portion size)
+- "I'm cooking for 2" / "need to serve 4 people" → Add servings filter
 
 ## RULE 4: Combined @username + Budget/Filter Queries (CRITICAL)
 
@@ -151,6 +145,28 @@ When detecting refinement:
 - Q2: "I am allergic to nuts" → intent: recipe_search, excluded_ingredients: ["nuts"] (refinement)
 - Q3: "my budget is $200" → intent: price_filter, cost: {operator: "<=", value: 200, country: "US"} (refinement with filter)
 
+## RULE 6: Multi-Turn Pricing Follow-ups (CRITICAL)
+
+When the user asks a short follow-up query mentioning only a country/location after a pricing query:
+1. Check `previous_search_context.last_pricing_item` - if it exists, this is a `pricing_info` follow-up
+2. Patterns: "And in X?", "In X?", "What about X?", "How about X?", "in X market", "for X"
+3. X can be: country names (India, Norway, US, USA, UK), regions, or currency zones
+4. Set: intent = "pricing_info", is_cooking_related = true, confidence = "high"
+5. Populate entities from `previous_search_context.last_pricing_item`:
+   - If `last_pricing_item_type` = "ingredient" → entities.ingredients: [last_pricing_item]
+   - If `last_pricing_item_type` = "recipe" → entities.recipes: [last_pricing_item]
+6. Extract the new country into parameters.country
+
+**Examples (assuming previous_search_context.last_pricing_item = "clove", type = "ingredient"):**
+- "And in India?" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "India"
+- "In Norway" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "Norway"
+- "What about US market?" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "US"
+- "How about UK?" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "UK"
+- "for USA" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "US"
+
+**CRITICAL**: These queries MUST be classified as `pricing_info` with `is_cooking_related = true`, NOT as `general_chat`.
+Even if the query seems vague on its own, the context makes it cooking-related.
+
 ## Available Intents
 
 | Intent | When to use | requires_embedding |
@@ -182,12 +198,18 @@ When detecting refinement:
 - **Detect recipe vs ingredient**: "cost of making X" / "cost to make X" / "cost of X recipe" → recipe. Otherwise → ingredient.
 - Country detection: "in India" → country: "India", "in Norway" → country: "Norway"
 - Default country when none specified: Norway
-- **Multi-turn follow-up**: If the previous query was a pricing query (e.g., "price of clove") and the new query only mentions a country/location (e.g., "And in India?", "in Norway", "what about US?"), treat it as `pricing_info` and carry the ingredient/recipe from conversation history.
+- **Multi-turn follow-up (CRITICAL)**: When the query is a short follow-up mentioning only a country/location (e.g., "And in India?", "in Norway", "what about US?", "how about US"), check `previous_search_context.last_pricing_item`. If it exists, treat as `pricing_info` and use that item:
+  * If `last_pricing_item_type` = "ingredient" → entities.ingredients: [last_pricing_item]
+  * If `last_pricing_item_type` = "recipe" → entities.recipes: [last_pricing_item]
+  * Extract the new country from the query
+  * Set intent = pricing_info, is_cooking_related = true, confidence = high
 
 **Multi-turn pricing example:**
 - Q1: "What's the cost of clove" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "Norway"
-- Q2: "And in India" → intent: pricing_info, entities.ingredients: ["clove"] (from history), parameters.country: "India"
-- Q2: "What about US?" → intent: pricing_info, entities.ingredients: ["clove"] (from history), parameters.country: "US"
+- Q2: "And in India" → Check previous_search_context.last_pricing_item="clove", type="ingredient" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "India"
+- Q2: "What about US?" → Check previous_search_context.last_pricing_item="clove" → intent: pricing_info, entities.ingredients: ["clove"], parameters.country: "US"
+- Q1: "price of making pasta" → intent: pricing_info, entities.recipes: ["pasta"]
+- Q2: "how about in India?" → intent: pricing_info, entities.recipes: ["pasta"] (from last_pricing_item), parameters.country: "India"
 
 ### price_filter
 - Triggers: "under $20", "below 100 kr", "budget meals", "cheap recipes", "low budget", "affordable", "budget friendly", "under 400 rupees", "my budget is X", "low cost", "medium cost", "high cost", "expensive"
@@ -207,6 +229,11 @@ When detecting refinement:
   * No cost.value needed
 - For "medium cost", "moderate price":
   * Filters: cost.sort_order="ASC", cost.level="medium"
+- **CRITICAL**: ALWAYS extract ALL other filters present in the query alongside cost. If the query also mentions servings, ingredients, cuisines, tags, time, etc., extract those too.
+- Examples with additional filters:
+  - "cheap recipes for 4 people" → intent: price_filter, filters.cost: {sort_order: "ASC", level: "low"}, filters.servings: 4
+  - "budget meals for 2 under 200" → intent: price_filter, filters.cost: {operator: "<=", value: 200, country: "Norway", sort_order: "DESC"}, filters.servings: 2
+  - "affordable Italian dinner for 6" → intent: price_filter, filters.cost: {sort_order: "ASC", level: "low"}, filters.servings: 6, filters.cuisines: ["italian"], filters.tags: ["dinner"]
 
 ### time_filter
 - Triggers: "quick", "fast", "speedy", "in a hurry", "short time", "I don't have much time", "something quick", "quickly", "I have very short time", "not a lot of time", "don't have a lot of time", "need to cook a good meal fast", "quick dinner", "fast to make", "easy and quick", "very little time", "no time to cook", "something fast", "I'm in a rush"
@@ -215,11 +242,24 @@ When detecting refinement:
 - **IMPORTANT**: This intent handles QUALITATIVE time expressions only (quick, fast, slow, etc.)
 - Do NOT extract specific minute values (20 min, 40 min, 50 min) — just use sorting
 - Filters: time.sort_order = "ASC" or "DESC"
+- **CRITICAL**: ALWAYS extract ALL other filters present in the query alongside time. If the query also mentions servings, ingredients, cuisines, tags, budget, etc., extract those too. Never ignore non-time filters just because the intent is time_filter.
+- Examples with additional filters:
+  - "I want to make something quick for 2 people" → intent: time_filter, filters.time: {sort_order: "ASC"}, filters.servings: 2
+  - "quick dinner for 4 guests" → intent: time_filter, filters.time: {sort_order: "ASC"}, filters.servings: 4, filters.tags: ["dinner"]
+  - "fast Italian recipes for 6" → intent: time_filter, filters.time: {sort_order: "ASC"}, filters.servings: 6, filters.cuisines: ["italian"]
+  - "something quick and cheap for 3 people" → intent: time_filter, filters.time: {sort_order: "ASC"}, filters.servings: 3, filters.cost: {sort_order: "ASC", level: "low"}
+  - "quick dessert for 2" → intent: time_filter, filters.time: {sort_order: "ASC"}, filters.servings: 2, filters.tags: ["dessert"]
 
 ### nutrition_filter
 - Triggers: "high protein", "low carb", "low calorie", "high fiber"
-- Nutrient mapping: protein → "protein", carb/carbs → "carbohydrates", fat → "totalFat", calories → "energyKcal", fiber → "totalFiber", sugar → "totalSugars"
+- Macronutrient mapping: protein → "protein", carb/carbs → "carbohydrates", fat → "totalFat", calories → "energyKcal", fiber → "totalFiber", sugar → "totalSugars"
+- Micronutrient mapping (minerals): iron → "iron", zinc → "zinc", calcium → "calcium", magnesium → "magnesium", potassium → "potassium", copper → "copper", sodium → "sodium"
+- Micronutrient mapping (vitamins): vitamin a → "vitaminA", vitamin c → "vitaminC", vitamin d → "vitaminD", vitamin b12 → "vitaminB12", etc.
 - Filters: nutrition.sort_by, nutrition.order ("DESC" for high, "ASC" for low), nutrition.level
+- **CRITICAL**: ALWAYS extract ALL other filters present in the query alongside nutrition. If the query also mentions servings, ingredients, cuisines, tags, time, cost, etc., extract those too.
+- Examples with additional filters:
+  - "high protein meals for 3 people" → intent: nutrition_filter, filters.nutrition: {sort_by: "protein", order: "DESC", level: "high"}, filters.servings: 3
+  - "low carb dinner for 2 people" → intent: nutrition_filter, filters.nutrition: {sort_by: "carbohydrates", order: "ASC", level: "low"}, filters.servings: 2, filters.tags: ["dinner"]
 
 ### recipe_search
 - The most common intent. Use for any recipe finding/suggesting query.
@@ -279,7 +319,9 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
     "creator_username": null,
     "nutrition": null,
     "cost": null,
-    "time": null
+    "time": null,
+    "servings": null,
+    "ingredient_count": null
   },
   "summary": "Brief summary",
   "confidence": "high",
@@ -308,8 +350,11 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 **"what is the cost of making fortune cookies"**
 → intent: pricing_info, entities.recipes: ["fortune cookies"], requires_embedding: true
 
-**"And in India" (after previous "price of clove" query)**
-→ intent: pricing_info, entities.ingredients: ["clove"] (from conversation history), parameters.country: "India", requires_embedding: true
+**"And in India" (after previous "price of clove" query - check previous_search_context.last_pricing_item="clove")**
+→ intent: pricing_info, entities.ingredients: ["clove"] (from previous_search_context.last_pricing_item), parameters.country: "India", is_cooking_related: true, confidence: high, requires_embedding: true
+
+**"What about US?" (after pricing query - check previous_search_context.last_pricing_item)**
+→ intent: pricing_info, entities.ingredients: [previous_search_context.last_pricing_item], parameters.country: "US", is_cooking_related: true, confidence: high, requires_embedding: true
 
 **"Can you tell me something vegetarian that I can cook quickly"**
 → intent: recipe_search, filters.tags: ["vegetarian"], parameters.time_constraints: ["quick"], requires_embedding: true
@@ -334,6 +379,21 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 
 **"high protein recipes"**
 → intent: nutrition_filter, filters.nutrition: {sort_by: "protein", order: "DESC", level: "high"}, requires_embedding: false
+
+**"high iron recipes" or "iron rich recipes"**
+→ intent: nutrition_filter, filters.nutrition: {sort_by: "iron", order: "DESC", level: "high"}, requires_embedding: false
+
+**"recipes high in calcium" or "calcium rich meals"**
+→ intent: nutrition_filter, filters.nutrition: {sort_by: "calcium", order: "DESC", level: "high"}, requires_embedding: false
+
+**"high zinc recipes" or "zinc rich foods"**
+→ intent: nutrition_filter, filters.nutrition: {sort_by: "zinc", order: "DESC", level: "high"}, requires_embedding: false
+
+**"vitamin c rich recipes" or "high vitamin c"**
+→ intent: nutrition_filter, filters.nutrition: {sort_by: "vitaminC", order: "DESC", level: "high"}, requires_embedding: false
+
+**"low sodium recipes"**
+→ intent: nutrition_filter, filters.nutrition: {sort_by: "sodium", order: "ASC", level: "low"}, requires_embedding: false
 
 **"cheap recipes" or "affordable meals"**
 → intent: price_filter, filters.cost: {sort_order: "ASC", level: "low"}, requires_embedding: false
@@ -361,6 +421,15 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 - Q2: "my budget is 100$" → intent: price_filter, filters.cost: {operator: "<=", value: 100, country: "US", sort_order: "DESC"}
   (Pipeline will combine both: quick recipes under $100 sorted nearest to $100 first, then by quickest)
 
+**Multi-turn servings filter chain (CRITICAL for portion persistence):**
+- Q1: "I am cooking something italian for 2 people" → intent: recipe_search, filters.cuisines: ["italian"], filters.servings: 2
+- Q2: "I am allergic to chicken" → intent: recipe_search, filters.excluded_ingredients: ["chicken"], filters.servings: 2 (refinement - servings preserved)
+- Q1: "dessert recipes" → intent: recipe_search, filters.tags: ["dessert"]
+- Q2: "cooking for 4 people" → intent: recipe_search, filters.servings: 4 (refinement - add servings to previous search)
+- Q1: "italian for 2 people" → intent: recipe_search, filters.cuisines: ["italian"], filters.servings: 2
+- Q2: "my budget is 800 kr" → intent: price_filter, filters.cost: {operator: "<=", value: 800, country: "Norway", sort_order: "DESC"}
+  (Pipeline carries forward servings=2 from session)
+
 **"under 500" or "under 500 kr" or "my budget is 500 krone"** (Norwegian currency, explicit or implied)
 → intent: price_filter, filters.cost: {operator: "<=", value: 500, country: "Norway", sort_order: "DESC"}, requires_embedding: false
 
@@ -380,6 +449,48 @@ NOT cooking-related: weather, news, sports, tech support, general knowledge unre
 **"something sweet" followed by "I'm allergic to almonds"**
 - Q1: intent: recipe_search, filters.tags: ["dessert"], entities.meal_types: ["dessert"]
 - Q2: intent: recipe_search, filters.excluded_ingredients: ["almonds", "nuts"] (refinement to previous sweet/dessert search)
+
+**Servings/Portion Filter Examples:**
+EXACT servings:
+- "recipes that serve 4 people" → filters.servings: 4
+- "recipes for 6 servings" → filters.servings: 6
+- "meals for 2 people" → filters.servings: 2
+- "recipes that serves 8" → filters.servings: 8
+- "portion for 4" → filters.servings: 4
+- "serves 4 guests" → filters.servings: 4 (use EXACT number when user says "serves X")
+- "for 4 guests" → filters.servings: 4 (use EXACT number - user is specifying serving size)
+- "I have 3 guests coming over" → filters.servings: 3
+- "cooking for 5 people" → filters.servings: 5
+
+RANGE servings:
+- "recipes for 2-4 people" → filters.servings: {"min": 2, "max": 4}
+- "serves 3 to 6" → filters.servings: {"min": 3, "max": 6}
+- "for between 4 and 8 people" → filters.servings: {"min": 4, "max": 8}
+
+COMPARISON servings:
+- "at least 4 servings" → filters.servings: {"operator": ">=", "value": 4}
+- "more than 3 people" → filters.servings: {"operator": ">", "value": 3}
+- "minimum 6 portions" → filters.servings: {"operator": ">=", "value": 6}
+- "at most 4 servings" → filters.servings: {"operator": "<=", "value": 4}
+- "less than 6 people" → filters.servings: {"operator": "<", "value": 6}
+- "maximum 8 portions" → filters.servings: {"operator": "<=", "value": 8}
+- "for a large group" → filters.servings: {"operator": ">=", "value": 8}
+- "for a small group" → filters.servings: {"operator": "<=", "value": 4}
+- "for a crowd" → filters.servings: {"operator": ">=", "value": 10}
+- "huge portions" → filters.servings: {"sort": "DESC"} (sort by servings DESC)
+- "small portions" → filters.servings: {"sort": "ASC"} (sort by servings ASC)
+
+**IMPORTANT**: Servings queries without ingredients/cuisines should set requires_embedding: false (SQL-only)
+
+**Ingredient Count Filter Examples:**
+- "recipes with 5 ingredients" → intent: recipe_search, filters.ingredient_count: {operator: "==", value: 5}, requires_embedding: true
+- "recipes with only 3 ingredients" → intent: recipe_search, filters.ingredient_count: {operator: "==", value: 3}, requires_embedding: true
+- "simple recipes with less than 5 ingredients" → intent: recipe_search, filters.ingredient_count: {operator: "<", value: 5}, requires_embedding: true
+- "recipes with fewer than 10 ingredients" → intent: recipe_search, filters.ingredient_count: {operator: "<", value: 10}, requires_embedding: true
+- "easy recipes with at most 7 ingredients" → intent: recipe_search, filters.ingredient_count: {operator: "<=", value: 7}, requires_embedding: true
+- "recipes with under 5 ingredients" → intent: recipe_search, filters.ingredient_count: {operator: "<", value: 5}, requires_embedding: true
+- "3 ingredient recipes" → intent: recipe_search, filters.ingredient_count: {operator: "==", value: 3}, requires_embedding: true
+- "5 ingredient meals" → intent: recipe_search, filters.ingredient_count: {operator: "==", value: 5}, requires_embedding: true
 
 **"quick vegetarian recipes"**
 → intent: recipe_search, filters.tags: ["vegetarian"], parameters.time_constraints: ["quick"], requires_embedding: true

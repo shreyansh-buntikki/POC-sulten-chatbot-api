@@ -67,6 +67,7 @@ from apps.fastapi.src.utils.sql_builders import (
     build_recipe_nutrition_filter_sql,
     build_recipe_combined_filter_sql,
     build_recipe_time_filter_sql,
+    build_recipe_base_sql,
     build_session_filter_conditions
 )
 from apps.fastapi.src.services.ingredient_matcher import IntelligentIngredientMatcher
@@ -91,6 +92,26 @@ class RecipeSearchPipelineSDK:
     """
 
     MAX_RECIPES = 5
+
+    # Waterfall fallback constants
+    FALLBACK_THRESHOLD = 5  # Trigger fallback when results < this (user wants at least 5 results)
+    # Hard filters: never relaxed (safety / user constraints)
+    HARD_FILTERS = frozenset({
+        "excluded_ingredients",
+        "exclude_ingredients",
+        "creator_uid",
+    })
+    # Soft filters: relaxed in priority order (first = removed first)
+    SOFT_FILTERS_PRIORITY = [
+        "tags",
+        "difficulty",
+        "servings",
+        "cuisines",
+        "nutrition_filters",
+        "cost_filter",
+        "time_filter",
+        "max_time",
+    ]
 
     def __init__(self, db: Session, openai_client: OpenAI):
         """
@@ -229,24 +250,47 @@ class RecipeSearchPipelineSDK:
                 "session_id": session_id,
                 "user_uid": user_uid,
                 "conversation_history": conversation_history,
-                "previous_search_context": None
+                "previous_search_context": {}
             }
 
             # Add previous search context if available
             if session.context_entities.last_vector_query:
-                enhanced_context["previous_search_context"] = {
-                    "last_query": session.context_entities.last_vector_query,
-                    "last_filters": session.context_entities.last_search_filters,
-                    "last_intent": session.last_intent,
-                    "excluded_ingredients": session.excluded_ingredients,
-                    "included_ingredients": session.included_ingredients
-                }
+                enhanced_context["previous_search_context"]["last_query"] = session.context_entities.last_vector_query
+                enhanced_context["previous_search_context"]["last_filters"] = session.context_entities.last_search_filters
+                enhanced_context["previous_search_context"]["last_intent"] = session.last_intent
+                enhanced_context["previous_search_context"]["excluded_ingredients"] = session.excluded_ingredients
+                enhanced_context["previous_search_context"]["included_ingredients"] = session.included_ingredients
+
+            # Add pricing context for multi-turn pricing follow-ups (e.g., "And in India?")
+            if session.context_entities.last_pricing_item:
+                enhanced_context["previous_search_context"]["last_pricing_item"] = session.context_entities.last_pricing_item
+                enhanced_context["previous_search_context"]["last_pricing_item_type"] = session.context_entities.last_pricing_item_type
 
             async def run_nlid():
                 """Run NLID agent with conversation history and previous search context"""
+                # Build an enriched input that includes conversation history
+                # and previous search context so the LLM can see them
+                # (the SDK context param is NOT injected into the prompt).
+                nlid_input_parts = []
+
+                if conversation_history:
+                    nlid_input_parts.append(
+                        f"conversation_history:\n{conversation_history}"
+                    )
+
+                prev_ctx = enhanced_context.get("previous_search_context", {})
+                if prev_ctx:
+                    nlid_input_parts.append(
+                        f"previous_search_context: {prev_ctx}"
+                    )
+
+                nlid_input_parts.append(f"User query: {query}")
+
+                nlid_input = "\n\n".join(nlid_input_parts)
+
                 return await Runner.run(
                     current_nlid_agent,
-                    query,
+                    nlid_input,
                     context=enhanced_context
                 )
 
@@ -293,40 +337,12 @@ class RecipeSearchPipelineSDK:
                 "confidence": nlid_data.confidence,
             }
 
-            # Check if query is cooking-related
-            if not nlid_data.is_cooking_related:
-                logger.warning(f"[STAGE 2] Query NOT cooking-related, returning scope message")
-                # Return a direct rejection message without running orchestrator
-                # (orchestrator has its own guardrail that would raise an exception)
-                rejection_message = (
-                    "I'm Sulten Chatbot, your cooking and recipe assistant! "
-                    "I can help you with:\n"
-                    "- Finding recipes and meal ideas\n"
-                    "- Nutritional information about foods\n"
-                    "- Cooking tips and techniques\n"
-                    "- Ingredient substitutions\n\n"
-                    "I'm not able to help with non-cooking topics, but I'd be happy to assist with any food-related questions!"
-                )
-
-
-                session.add_to_history("assistant", rejection_message)
-                self.session_manager.save_session(session)
-
-                return {
-                    "response": rejection_message,
-                    "metadata": {
-                        "is_cooking_related": False,
-                        "intent": "not_supported",
-                        "retrieval_strategy": "none",
-                        "num_results": 0,
-                    }
-                }
-
             # ============ PRICING FOLLOW-UP DETECTION ============
-            # If the last intent was `pricing_info` and the current query looks like
-            # a country/currency refinement (e.g., "And in India?", "in Norway"),
-            # reuse the previously priced item with the new country instead of
-            # misrouting to recipe_search.
+            # MUST run BEFORE the is_cooking_related check because the NLID
+            # may classify a short country follow-up (e.g., "In India?") as
+            # general_chat / not-cooking-related.  If the session's previous
+            # intent was pricing_info and the query mentions a country, we
+            # override NLID's output to keep it as a valid pricing follow-up.
             if (
                 session.last_intent == "pricing_info"
                 and session.context_entities.last_pricing_item
@@ -354,9 +370,39 @@ class RecipeSearchPipelineSDK:
                             "recipes": [],
                         }
                     nlid_result_dict["intent"] = "pricing_info"
+                    nlid_result_dict["is_cooking_related"] = True
                     nlid_result_dict["entities"] = override_entities
                     nlid_result_dict["parameters"] = {"country": detected_country}
                     nlid_result_dict["filters"] = nlid_result_dict.get("filters", {})
+
+            # Check if query is cooking-related
+            if not nlid_result_dict["is_cooking_related"]:
+                logger.warning(f"[STAGE 2] Query NOT cooking-related, returning scope message")
+                # Return a direct rejection message without running orchestrator
+                # (orchestrator has its own guardrail that would raise an exception)
+                rejection_message = (
+                    "I'm Sulten Chatbot, your cooking and recipe assistant! "
+                    "I can help you with:\n"
+                    "- Finding recipes and meal ideas\n"
+                    "- Nutritional information about foods\n"
+                    "- Cooking tips and techniques\n"
+                    "- Ingredient substitutions\n\n"
+                    "I'm not able to help with non-cooking topics, but I'd be happy to assist with any food-related questions!"
+                )
+
+
+                session.add_to_history("assistant", rejection_message)
+                self.session_manager.save_session(session)
+
+                return {
+                    "response": rejection_message,
+                    "metadata": {
+                        "is_cooking_related": False,
+                        "intent": "not_supported",
+                        "retrieval_strategy": "none",
+                        "num_results": 0,
+                    }
+                }
 
             # ============ SPECIAL HANDLING: Pricing and Nutrition Queries ============
             # Handle pricing_info and nutritional_info intents directly
@@ -366,14 +412,56 @@ class RecipeSearchPipelineSDK:
                 )
 
             # ============ SPECIAL HANDLING: Cost, Nutrition, and Time Filter Queries ============
-            # Handle price_filter, nutrition_filter, and time_filter intents with direct SQL (NO EMBEDDING)
-            # These queries filter/sort recipes by recipe_metadata (pricing/nutrition) or columns (time)
+            # Handle price_filter, nutrition_filter, and time_filter intents.
+            # CRITICAL: If the query ALSO contains semantic content (cuisines, tags like "dessert",
+            # ingredients, meal types, etc.), we must do embedding search first, then apply filters.
+            # Only use direct SQL (no embedding) if there's NO semantic content.
+            # Track whether the intent was converted from a pure filter
+            # (price_filter / nutrition_filter / time_filter) to recipe_search.
+            # Used later to decide whether cached embedding candidates can be
+            # reused instead of running a pointless new embedding search with
+            # a non-semantic query like "my budget is 800 kr".
+            _converted_from_filter_intent = False
+
             if nlid_result_dict["intent"] in ["price_filter", "nutrition_filter", "time_filter"]:
-                # Update session from NLID first so filters are persisted for multi-turn context
-                session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
-                return await self._handle_filter_query(
-                    query, nlid_result_dict, session, user_uid, language
+                _filter_intent = nlid_result_dict["intent"]
+                _filters_for_filter_intent = nlid_result_dict.get("filters", {})
+                _entities_for_filter_intent = nlid_result_dict.get("entities", {})
+
+                # Check for semantic content that requires embedding search
+                # Tags like "dessert", "dinner", cuisines like "italian", ingredients, etc.
+                _has_semantic_for_filter = bool(
+                    _filters_for_filter_intent.get("cuisines")
+                    or _filters_for_filter_intent.get("tags")  # e.g., "dessert", "dinner"
+                    or _filters_for_filter_intent.get("included_ingredients")
+                    or _filters_for_filter_intent.get("include_ingredients")
+                    or _entities_for_filter_intent.get("cuisines")
+                    or _entities_for_filter_intent.get("ingredients")
+                    or _entities_for_filter_intent.get("meal_types")
+                    or _entities_for_filter_intent.get("recipe_name")
                 )
+
+                if _has_semantic_for_filter:
+                    # Query has semantic content + filter - treat as recipe_search with filter
+                    # This will do embedding search first, then apply the price/time/nutrition filter
+                    logger.info(
+                        f"[FILTER INTENT WITH SEMANTIC] Intent={_filter_intent} has semantic content "
+                        f"(cuisines={_filters_for_filter_intent.get('cuisines')}, "
+                        f"tags={_filters_for_filter_intent.get('tags')}, "
+                        f"ingredients={_entities_for_filter_intent.get('ingredients')}). "
+                        f"Converting to recipe_search for embedding + filter."
+                    )
+                    # Change intent to recipe_search and let it flow through the normal pipeline
+                    nlid_result_dict["intent"] = "recipe_search"
+                    _converted_from_filter_intent = True
+                    # Continue to the recipe_search flow below (don't return here)
+                else:
+                    # No semantic content - use direct SQL (no embedding)
+                    # Update session from NLID first so filters are persisted for multi-turn context
+                    session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
+                    return await self._handle_filter_query(
+                        query, nlid_result_dict, session, user_uid, language
+                    )
 
             # ============ NEW INTENTS: Recipe Reference, Negative Feedback, etc. ============
 
@@ -420,8 +508,10 @@ class RecipeSearchPipelineSDK:
                 )
 
             # Also check if NLID returned requires_embedding=False or if we can detect cost/nutrition filters
+            # IMPORTANT: Skip this check if intent was already converted to recipe_search from a filter intent
+            # (e.g., "dessert with budget 400" was converted from price_filter to recipe_search)
             requires_embedding = getattr(nlid_data, 'requires_embedding', True)
-            if not requires_embedding:
+            if not requires_embedding and nlid_result_dict["intent"] != "recipe_search":
                 # Try to extract filters from query
                 cost_filter = extract_cost_filter(query)
                 nutrition_filter = extract_nutrition_filter(query)
@@ -516,7 +606,7 @@ class RecipeSearchPipelineSDK:
                     }
 
             # Update session state from NLID results
-            session = self.session_manager.update_session_from_nlid(session, nlid_result_dict)
+            session = self.session_manager.update_session_from_nlid(session, nlid_result_dict, original_query=query)
 
             # ============ RE-ROUTE: recipe_search with cost/time/nutrition filter ============
             # When NLID detects both @username (→ recipe_search) and a budget/time
@@ -527,31 +617,61 @@ class RecipeSearchPipelineSDK:
             # a previous turn (e.g. Q1 "budget 400" → Q2 "dessert recipes" should
             # keep the 400 kr constraint).
             _filters_for_reroute = nlid_result_dict.get("filters", {})
+            _entities_for_reroute = nlid_result_dict.get("entities", {})
             _has_cost_reroute = bool(_filters_for_reroute.get("cost"))
             _has_time_reroute = bool(_filters_for_reroute.get("time"))
             _has_nutrition_reroute = bool(_filters_for_reroute.get("nutrition"))
+            _has_servings_reroute = bool(_filters_for_reroute.get("servings"))
 
             # Check session-persisted filters too
             _has_session_cost = bool(session.filters.cost_filter)
             _has_session_time = bool(session.filters.time_filter)
             _has_session_nutrition = bool(session.filters.nutrition_filter)
+            _has_session_servings = bool(session.filters.servings)
 
-            _any_filter = (
+            # Check if there's semantic content that requires embedding search
+            # (cuisines, ingredients, meal types, tags, etc.)
+            # Tags like "dessert", "dinner", "breakfast" are semantic content that should trigger embedding
+            _has_semantic_content = bool(
+                _filters_for_reroute.get("cuisines")
+                or _filters_for_reroute.get("tags")  # e.g., "dessert", "dinner", "breakfast"
+                or _filters_for_reroute.get("included_ingredients")
+                or _filters_for_reroute.get("include_ingredients")
+                or _entities_for_reroute.get("cuisines")
+                or _entities_for_reroute.get("ingredients")
+                or _entities_for_reroute.get("meal_types")
+                or _entities_for_reroute.get("recipe_name")
+            )
+
+            # Only route to _handle_filter_query if:
+            # 1. There are cost/time/nutrition filters (need special SQL for metadata sorting)
+            # 2. OR there are ONLY servings/exclusions with NO semantic content
+            # Do NOT route if there's semantic content that needs embedding search
+            _has_metadata_filter = (
                 _has_cost_reroute or _has_time_reroute or _has_nutrition_reroute
                 or _has_session_cost or _has_session_time or _has_session_nutrition
+            )
+            _has_structural_only = (
+                (_has_servings_reroute or _has_session_servings
+                 or _filters_for_reroute.get("excluded_ingredients")
+                 or _filters_for_reroute.get("exclude_ingredients"))
+                and not _has_semantic_content
             )
 
             if (
                 nlid_result_dict["intent"] == "recipe_search"
-                and _any_filter
+                and (_has_metadata_filter or _has_structural_only)
+                and not _has_semantic_content  # Don't route if there's semantic content
             ):
                 logger.info(
                     f"[REROUTE] recipe_search has filter(s): "
                     f"cost={_has_cost_reroute or _has_session_cost}, "
                     f"time={_has_time_reroute or _has_session_time}, "
-                    f"nutrition={_has_nutrition_reroute or _has_session_nutrition}. "
-                    f"(from_nlid={_has_cost_reroute or _has_time_reroute or _has_nutrition_reroute}, "
-                    f"from_session={_has_session_cost or _has_session_time or _has_session_nutrition}) "
+                    f"nutrition={_has_nutrition_reroute or _has_session_nutrition}, "
+                    f"servings={_has_servings_reroute or _has_session_servings}. "
+                    f"(from_nlid={_has_cost_reroute or _has_time_reroute or _has_nutrition_reroute or _has_servings_reroute}, "
+                    f"from_session={_has_session_cost or _has_session_time or _has_session_nutrition or _has_session_servings}) "
+                    f"semantic_content={_has_semantic_content}. "
                     f"Re-routing to _handle_filter_query for deterministic SQL."
                 )
                 return await self._handle_filter_query(
@@ -646,6 +766,56 @@ class RecipeSearchPipelineSDK:
             for pattern, tag in dietary_patterns.items():
                 if pattern in query_lower and tag not in mentioned_tags:
                     mentioned_tags.append(tag)
+
+            # ============ TAG REMOVAL: Handle negative dietary preferences ============
+            # When user says "no sugar free", "don't want gluten free", etc.,
+            # remove those tags from session.filters.tags
+            tag_removal_patterns = {
+                "no sugar free": "sugar-free",
+                "no sugar-free": "sugar-free",
+                "not sugar free": "sugar-free",
+                "not sugar-free": "sugar-free",
+                "don't want sugar free": "sugar-free",
+                "dont want sugar free": "sugar-free",
+                "don't want sugar-free": "sugar-free",
+                "dont want sugar-free": "sugar-free",
+                "without sugar free": "sugar-free",
+                "no gluten free": "gluten-free",
+                "no gluten-free": "gluten-free",
+                "not gluten free": "gluten-free",
+                "not gluten-free": "gluten-free",
+                "don't want gluten free": "gluten-free",
+                "dont want gluten free": "gluten-free",
+                "no dairy free": "dairy-free",
+                "no dairy-free": "dairy-free",
+                "not dairy free": "dairy-free",
+                "don't want dairy free": "dairy-free",
+                "no keto": "keto",
+                "not keto": "keto",
+                "don't want keto": "keto",
+                "no vegan": "vegan",
+                "not vegan": "vegan",
+                "don't want vegan": "vegan",
+                "no vegetarian": "vegetarian",
+                "not vegetarian": "vegetarian",
+                "don't want vegetarian": "vegetarian",
+            }
+
+            tags_to_remove = []
+            for pattern, tag in tag_removal_patterns.items():
+                if pattern in query_lower:
+                    tags_to_remove.append(tag)
+                    # Also remove from mentioned_tags if it was added
+                    if tag in mentioned_tags:
+                        mentioned_tags.remove(tag)
+
+            # Remove tags from session
+            if tags_to_remove:
+                for tag in tags_to_remove:
+                    if tag in session.filters.tags:
+                        session.filters.tags.remove(tag)
+                        logger.info(f"[TAG REMOVAL] Removed tag '{tag}' from session based on query pattern")
+                self.session_manager.save_session(session)
 
             has_dietary_preference = bool(mentioned_tags)
 
@@ -877,20 +1047,28 @@ class RecipeSearchPipelineSDK:
                                    if k != "excluded_ingredients"},
                                 "excluded_ingredients": merged_exclusions,
                             }
-                            # Also include session cuisines if not already present
+                            # Carry forward session filters not already in retrieval_plan
                             if session.filters.cuisines and "cuisines" not in _merged_sql_filters:
                                 _merged_sql_filters["cuisines"] = session.filters.cuisines
+                            if session.filters.servings and "servings" not in _merged_sql_filters:
+                                _merged_sql_filters["servings"] = session.filters.servings
+                            if session.filters.cost_filter and "cost_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["cost_filter"] = session.filters.cost_filter
+                            if session.filters.time_filter and "time_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["time_filter"] = session.filters.time_filter
+                            if session.filters.nutrition_filter and "nutrition_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["nutrition_filter"] = session.filters.nutrition_filter
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.SQL_ONLY,
                                 reasoning="Exclusion-only refinement: original vector query IS the excluded ingredient",
                                 vector_query=None,
                                 sql_filters=_merged_sql_filters,
-                                top_k=20
+                                top_k=100
                             )
                         else:
                             # Increase top_k when allergies present to handle semantic dominance
                             # e.g., "dessert recipes" + "allergic to chocolate" -> chocolate recipes dominate top 20
-                            top_k = 50 if merged_exclusions else 20
+                            top_k = 150 if merged_exclusions else 100
                             logger.info(f"[ALLERGY] Using top_k={top_k} for hybrid refinement with allergens")
 
                             # Merge session filters (cuisines, tags, etc.) with retrieval_plan filters
@@ -899,9 +1077,17 @@ class RecipeSearchPipelineSDK:
                                    if k != "excluded_ingredients"},
                                 "excluded_ingredients": merged_exclusions,
                             }
-                            # Also include session cuisines if not already present
+                            # Carry forward session filters not already in retrieval_plan
                             if session.filters.cuisines and "cuisines" not in _merged_sql_filters:
                                 _merged_sql_filters["cuisines"] = session.filters.cuisines
+                            if session.filters.servings and "servings" not in _merged_sql_filters:
+                                _merged_sql_filters["servings"] = session.filters.servings
+                            if session.filters.cost_filter and "cost_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["cost_filter"] = session.filters.cost_filter
+                            if session.filters.time_filter and "time_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["time_filter"] = session.filters.time_filter
+                            if session.filters.nutrition_filter and "nutrition_filter" not in _merged_sql_filters:
+                                _merged_sql_filters["nutrition_filter"] = session.filters.nutrition_filter
                             retrieval_plan = RetrievalPlan(
                                 strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
                                 reasoning="Refinement search - preserving original search with allergy exclusion",
@@ -1055,16 +1241,24 @@ class RecipeSearchPipelineSDK:
                             k: v for k, v in (retrieval_plan.sql_filters or {}).items()
                             if k not in ("excluded_ingredients", "exclude_ingredients", "tags")
                         }
-                        # Include session cuisines if not already in preserved_filters
+                        # Carry forward session filters not already in preserved_filters
                         if session.filters.cuisines and "cuisines" not in preserved_filters:
                             preserved_filters["cuisines"] = session.filters.cuisines
+                        if session.filters.servings and "servings" not in preserved_filters:
+                            preserved_filters["servings"] = session.filters.servings
+                        if session.filters.cost_filter and "cost_filter" not in preserved_filters:
+                            preserved_filters["cost_filter"] = session.filters.cost_filter
+                        if session.filters.time_filter and "time_filter" not in preserved_filters:
+                            preserved_filters["time_filter"] = session.filters.time_filter
+                        if session.filters.nutrition_filter and "nutrition_filter" not in preserved_filters:
+                            preserved_filters["nutrition_filter"] = session.filters.nutrition_filter
                         logger.info(
                             f"[STANDALONE] Merged exclusions: session={len(existing_exclusions)}, "
                             f"retrieval_plan={len(retrieval_plan_exclusions)}, "
                             f"new={len(expanded_allergens)}, total={len(merged_exclusions)}"
                         )
 
-                        top_k = 50 if merged_exclusions else 20
+                        top_k = 150 if merged_exclusions else 100
                         if expanded_allergens and not has_positive_constraints:
                             logger.info(f"[EXCLUSION-ONLY] SQL_ONLY routing for standalone exclusion query")
                             retrieval_plan = RetrievalPlan(
@@ -1142,14 +1336,14 @@ class RecipeSearchPipelineSDK:
                         retrieval_plan.sql_filters["excluded_ingredients"] = all_exclusions
 
                     # Increase top_k to handle semantic dominance of allergens in embedding results
-                    if retrieval_plan.top_k < 50:
-                        logger.debug(f"[ALLERGY] Increasing top_k from {retrieval_plan.top_k} to 50 for allergen filtering")
+                    if retrieval_plan.top_k < 150:
+                        logger.debug(f"[ALLERGY] Increasing top_k from {retrieval_plan.top_k} to 150 for allergen filtering")
                         retrieval_plan = RetrievalPlan(
                             strategy=retrieval_plan.strategy,
                             reasoning=retrieval_plan.reasoning + " (allergens detected, increased top_k)",
                             vector_query=retrieval_plan.vector_query,
                             sql_filters=retrieval_plan.sql_filters,
-                            top_k=50
+                            top_k=150
                         )
                 except Exception as e:
                     logger.warning(f"[ALLERGY] Failed to expand allergens in normal search: {e}")
@@ -1176,6 +1370,138 @@ class RecipeSearchPipelineSDK:
             relevant_schema = None
             sql_result = None
 
+            # ---- Cache-aware strategy upgrade / reuse ----
+            # Check if we have cached embedding candidates from a previous search.
+            # This applies to BOTH SQL_ONLY (upgrade to HYBRID) AND HYBRID_VECTOR_TO_SQL
+            # (reuse cached candidates for refinements like "I am allergic to chicken").
+            _search_cache = self.session_manager.get_search_cache(session)
+            _cached_candidates = _search_cache.get("embedding_candidates", [])
+            _cached_vector_query = _search_cache.get("vector_query")
+            _cache_created_at = _search_cache.get("created_at")
+            _cache_is_valid = (
+                _cached_candidates
+                and _cached_vector_query
+                and _cache_created_at is not None
+                and (time.time() - _cache_created_at) < 1800  # SEARCH_CACHE_TTL_SECONDS
+            )
+
+            if (
+                retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY
+                and _cache_is_valid
+            ):
+                # SQL_ONLY with cached candidates → upgrade to HYBRID
+                logger.info(
+                    f"[STRATEGY UPGRADE] SQL_ONLY → HYBRID_VECTOR_TO_SQL: "
+                    f"reusing {len(_cached_candidates)} cached candidates "
+                    f"from '{_cached_vector_query}'"
+                )
+                candidate_ids = _cached_candidates
+                similarity_scores = {}
+                retrieval_plan = RetrievalPlan(
+                    strategy=RetrievalStrategy.HYBRID_VECTOR_TO_SQL,
+                    reasoning=(
+                        retrieval_plan.reasoning
+                        + " (upgraded: cached embedding candidates available)"
+                    ),
+                    vector_query=_cached_vector_query,
+                    sql_filters=retrieval_plan.sql_filters,
+                    top_k=retrieval_plan.top_k,
+                )
+            elif (
+                retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL
+                and _cache_is_valid
+                and retrieval_plan.vector_query == _cached_vector_query
+            ):
+                # HYBRID with same vector query → reuse cached candidates (no re-embedding)
+                logger.info(
+                    f"[CACHE REUSE] HYBRID_VECTOR_TO_SQL: "
+                    f"reusing {len(_cached_candidates)} cached candidates "
+                    f"from '{_cached_vector_query}' (no re-embedding needed)"
+                )
+                candidate_ids = _cached_candidates
+                similarity_scores = {}
+            elif (
+                retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL
+                and _cache_is_valid
+                and _converted_from_filter_intent
+            ):
+                # Filter intent (price/time/nutrition) converted to recipe_search
+                # because of session-carried semantic content (e.g. cuisines).
+                # The current query ("my budget is 800 kr") has no semantic
+                # value for embedding — reuse existing candidates and just
+                # apply the new filter via SQL.
+                logger.info(
+                    f"[CACHE REUSE] Converted filter intent: "
+                    f"reusing {len(_cached_candidates)} cached candidates "
+                    f"from '{_cached_vector_query}' (filter refinement, "
+                    f"no re-embedding needed)"
+                )
+                candidate_ids = _cached_candidates
+                similarity_scores = {}
+                # Override the vector_query on the plan so downstream
+                # logging and cache storage remain consistent.
+                retrieval_plan = RetrievalPlan(
+                    strategy=retrieval_plan.strategy,
+                    reasoning=(
+                        retrieval_plan.reasoning
+                        + " (reused cached candidates for filter refinement)"
+                    ),
+                    vector_query=_cached_vector_query,
+                    sql_filters=retrieval_plan.sql_filters,
+                    top_k=retrieval_plan.top_k,
+                )
+            elif (
+                retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL
+                and _cache_is_valid
+            ):
+                # ── Filter-only refinement detection ──
+                # Compare semantic content between cached and current
+                # sql_filters.  If tags / cuisines / included ingredients
+                # are unchanged, the embedding candidates are still valid
+                # and only structural filters (servings, cost, time, …)
+                # were added or modified → skip re-embedding.
+                _cached_sf = _search_cache.get("sql_filters", {})
+                _current_sf = retrieval_plan.sql_filters or {}
+
+                _SEMANTIC_KEYS = (
+                    "tags", "cuisines", "included_ingredients",
+                    "include_ingredients", "categories",
+                )
+
+                _semantic_same = True
+                for _sk in _SEMANTIC_KEYS:
+                    _cv = _cached_sf.get(_sk, [])
+                    _nv = _current_sf.get(_sk, [])
+                    if isinstance(_cv, list) and isinstance(_nv, list):
+                        if set(_cv) != set(_nv):
+                            _semantic_same = False
+                            break
+                    elif _cv != _nv:
+                        _semantic_same = False
+                        break
+
+                if _semantic_same:
+                    logger.info(
+                        f"[CACHE REUSE] Filter-only refinement: "
+                        f"reusing {len(_cached_candidates)} cached "
+                        f"candidates from '{_cached_vector_query}' "
+                        f"(semantic content unchanged, only structural "
+                        f"filters changed, no re-embedding needed)"
+                    )
+                    candidate_ids = _cached_candidates
+                    similarity_scores = {}
+                    retrieval_plan = RetrievalPlan(
+                        strategy=retrieval_plan.strategy,
+                        reasoning=(
+                            retrieval_plan.reasoning
+                            + " (reused cached candidates – "
+                            "filter-only refinement)"
+                        ),
+                        vector_query=_cached_vector_query,
+                        sql_filters=retrieval_plan.sql_filters,
+                        top_k=retrieval_plan.top_k,
+                    )
+
             if retrieval_plan.strategy == RetrievalStrategy.SQL_ONLY:
                 # FILTER-ONLY queries: Skip embedding search, use deterministic
                 # SQL builder instead of the LLM to avoid broken SQL.
@@ -1198,6 +1524,9 @@ class RecipeSearchPipelineSDK:
                     "cuisines": _sf.get("cuisines", []),
                     "difficulty": _sf.get("difficulty"),
                     "max_time": _sf.get("max_time"),
+                    "servings": _sf.get("servings"),  # Servings filter
+                    "ingredient_count": _sf.get("ingredient_count"),  # Ingredient count filter
+                    "creator_uid": _sf.get("creator_uid"),  # Creator filter
                     "excluded_recipe_ids": (
                         session.excluded_recipe_ids or []
                     ),
@@ -1214,13 +1543,14 @@ class RecipeSearchPipelineSDK:
                 _cost_f = session.filters.cost_filter
                 _nutr_f = session.filters.nutrition_filter
 
+                _sql_limit = retrieval_plan.top_k or 100
                 if _time_f:
                     _direct_sql = build_recipe_time_filter_sql(
                         time_filter=_time_f,
                         user_uid=user_uid or "",
                         language=language or "en",
                         additional_conditions=_additional,
-                        limit=20,
+                        limit=_sql_limit,
                     )
                 elif _cost_f:
                     _direct_sql = build_recipe_cost_filter_sql(
@@ -1228,7 +1558,7 @@ class RecipeSearchPipelineSDK:
                         user_uid=user_uid or "",
                         language=language or "en",
                         additional_conditions=_additional,
-                        limit=20,
+                        limit=_sql_limit,
                     )
                 elif _nutr_f:
                     _direct_sql = build_recipe_nutrition_filter_sql(
@@ -1236,17 +1566,16 @@ class RecipeSearchPipelineSDK:
                         user_uid=user_uid or "",
                         language=language or "en",
                         additional_conditions=_additional,
-                        limit=20,
+                        limit=_sql_limit,
                     )
                 else:
-                    # No session filter — plain base query with
-                    # exclusion conditions only.
-                    _direct_sql = build_recipe_time_filter_sql(
-                        time_filter={"sort_order": "ASC"},
+                    # No session filter — plain base query without specific sort order.
+                    # Used for structural-only queries (like servings, ingredients).
+                    _direct_sql = build_recipe_base_sql(
                         user_uid=user_uid or "",
                         language=language or "en",
                         additional_conditions=_additional,
-                        limit=20,
+                        limit=_sql_limit,
                     )
 
                 from apps.fastapi.src.services.sql_generator import (
@@ -1267,27 +1596,33 @@ class RecipeSearchPipelineSDK:
             elif retrieval_plan.strategy == RetrievalStrategy.HYBRID_VECTOR_TO_SQL:
                 # SEQUENTIAL for hybrid: Embedding first, then SQL with candidate_ids
 
-                # Step 1: Run embedding search
-                embedding_limit = max(retrieval_plan.top_k, 10)
-                # If the search is scoped to a specific creator, filter the embedding
-                # candidates to that creator's recipes only — avoids wasting candidate
-                # slots on other users' recipes and ensures the SQL creator filter
-                # always has enough candidates to work with.
-                embedding_creator_uid = (
-                    retrieval_plan.sql_filters.get("creator_uid")
-                    if retrieval_plan.sql_filters else None
-                )
-                embedding_results = search_recipes_by_embedding(
-                    self.db,
-                    query_text=retrieval_plan.vector_query or query,
-                    limit=embedding_limit,
-                    threshold=0.4,
-                    language_id=language,
-                    creator_uid=embedding_creator_uid
-                )
-                candidate_ids = [str(r.id) for r, _ in embedding_results]
-                similarity_scores = {str(r.id): s for r, s in embedding_results}
-                logger.info(f"[HYBRID] ✓ Embedding search: {len(embedding_results)} candidates")
+                # Step 1: Run embedding search (skip if candidates already loaded from cache)
+                if candidate_ids:
+                    logger.info(
+                        f"[HYBRID] Skipping embedding search — using "
+                        f"{len(candidate_ids)} pre-loaded cached candidates"
+                    )
+                else:
+                    embedding_limit = max(retrieval_plan.top_k, 10)
+                    # If the search is scoped to a specific creator, filter the embedding
+                    # candidates to that creator's recipes only — avoids wasting candidate
+                    # slots on other users' recipes and ensures the SQL creator filter
+                    # always has enough candidates to work with.
+                    embedding_creator_uid = (
+                        retrieval_plan.sql_filters.get("creator_uid")
+                        if retrieval_plan.sql_filters else None
+                    )
+                    embedding_results = search_recipes_by_embedding(
+                        self.db,
+                        query_text=retrieval_plan.vector_query or query,
+                        limit=embedding_limit,
+                        threshold=0.4,
+                        language_id=language,
+                        creator_uid=embedding_creator_uid
+                    )
+                    candidate_ids = [str(r.id) for r, _ in embedding_results]
+                    similarity_scores = {str(r.id): s for r, s in embedding_results}
+                    logger.info(f"[HYBRID] ✓ Embedding search: {len(embedding_results)} candidates")
 
                 # If embedding returned very few results but we have structural SQL filters
                 # (tags, cuisines, difficulty, etc.), drop the candidate restriction so SQL
@@ -1474,6 +1809,99 @@ class RecipeSearchPipelineSDK:
                     }
                 }
 
+            # ============ RE-EMBED FALLBACK ============
+            # When the primary query returns too few results (e.g. 100 dessert
+            # candidates but none with servings=3), re-run the embedding search
+            # excluding the candidates we already tried.  This fetches the
+            # *next* batch of semantically similar recipes and applies the same
+            # SQL filters on them — preserving both semantic relevance and user
+            # constraints instead of dropping either.
+            relaxed_filters: Dict[str, Any] = {}   # tracks what was relaxed for NLG
+            row_count = execution_result.get("row_count", 0)
+
+            if row_count < self.FALLBACK_THRESHOLD and execution_result["success"] and candidate_ids:
+                # Get all previously shown recipes from search cache to exclude them
+                cache = self.session_manager.get_search_cache(session)
+                shown_ids = set(cache.get("shown_recipe_ids", []))
+                # Combine current candidates with shown recipes for exclusion
+                all_exclude_ids = list(set(candidate_ids) | shown_ids)
+
+                logger.info(
+                    f"[FALLBACK] Only {row_count} results (threshold={self.FALLBACK_THRESHOLD}). "
+                    f"Re-embedding with {len(all_exclude_ids)} excluded IDs "
+                    f"(candidates={len(candidate_ids)}, shown={len(shown_ids)})."
+                )
+
+                embedding_limit = max(retrieval_plan.top_k, 10)
+                embedding_creator_uid = (
+                    retrieval_plan.sql_filters.get("creator_uid")
+                    if retrieval_plan.sql_filters else None
+                )
+                fallback_vector_query = retrieval_plan.vector_query or query
+
+                fallback_embedding_results = search_recipes_by_embedding(
+                    self.db,
+                    query_text=fallback_vector_query,
+                    limit=embedding_limit,
+                    threshold=0.4,
+                    language_id=language,
+                    creator_uid=embedding_creator_uid,
+                    exclude_ids=all_exclude_ids  # skip all previously tried/shown recipes
+                )
+                fallback_candidate_ids = [
+                    str(r.id) for r, _ in fallback_embedding_results
+                ]
+                logger.info(
+                    f"[FALLBACK] Re-embedding returned {len(fallback_candidate_ids)} "
+                    f"new candidates (excluded {len(all_exclude_ids)} total)"
+                )
+
+                if fallback_candidate_ids:
+                    # Merge similarity scores
+                    for r, s in fallback_embedding_results:
+                        similarity_scores[str(r.id)] = s
+
+                    # Re-run SQL with the new candidate set
+                    fallback_sql = await self.sql_generator.generate_sql(
+                        query,
+                        nlid_result_dict,
+                        retrieval_plan.sql_filters,
+                        session_context,
+                        fallback_candidate_ids
+                    )
+                    fallback_result = self.sql_executor.execute_sql(
+                        fallback_sql.sql, params
+                    )
+                    fallback_count = fallback_result.get("row_count", 0)
+                    logger.info(f"[FALLBACK] Re-embed SQL result: {fallback_count} rows")
+
+                    if fallback_result["success"] and fallback_count > row_count:
+                        execution_result = fallback_result
+                        sql_result = fallback_sql
+                        candidate_ids = fallback_candidate_ids
+                        relaxed_filters["re_embedded"] = True
+                        logger.info(
+                            f"[FALLBACK] ✓ Using re-embedded results: "
+                            f"{fallback_count} rows"
+                        )
+
+                        # Merge new candidates with existing cache candidates
+                        # This ensures we have a larger pool for future filtering
+                        cache = self.session_manager.get_search_cache(session)
+                        existing_candidates = cache.get("embedding_candidates", [])
+                        merged_candidates = list(set(existing_candidates + fallback_candidate_ids))
+                        self.session_manager.store_embedding_candidates(
+                            session, merged_candidates, offset=len(merged_candidates)
+                        )
+                        logger.info(
+                            f"[FALLBACK] Merged candidates: {len(existing_candidates)} + {len(fallback_candidate_ids)} = {len(merged_candidates)}"
+                        )
+                    else:
+                        logger.info(
+                            f"[FALLBACK] Re-embed did not improve results "
+                            f"({fallback_count} vs {row_count}). Keeping original."
+                        )
+
             # ============ STAGE 9+10: PARALLEL PHASE 3 - Post-Processing + NLG ============
             # Run post-processing and NLG in parallel
             # Post-processing is fast (~0.5s), NLG is slow (~4s)
@@ -1496,6 +1924,13 @@ class RecipeSearchPipelineSDK:
                 # Use SDK NLG agent for natural language responses
                 # We pass the SQL results directly; NLG will format them
                 nlg_filter_ctx = self._build_nlg_filter_context(session)
+
+                # If filters were relaxed during waterfall fallback, inform NLG
+                if relaxed_filters and nlg_filter_ctx is not None:
+                    nlg_filter_ctx["relaxed_filters"] = relaxed_filters
+                elif relaxed_filters:
+                    nlg_filter_ctx = {"relaxed_filters": relaxed_filters}
+
                 response = await self._generate_natural_language_response(
                     query,
                     execution_result["rows"][:self.MAX_RECIPES],  # Use SQL results directly
@@ -1553,6 +1988,7 @@ class RecipeSearchPipelineSDK:
                 "retrieval_strategy": retrieval_plan.strategy.value if retrieval_plan else "unknown",
                 "num_results": len(final_recipes),
                 "pipeline_duration_ms": round((time.time() - pipeline_start_time) * 1000, 2),
+                "fallback_applied": relaxed_filters if relaxed_filters else None,
                 "recipes": [
                     {
                         "id": str(r["id"]) if r.get("id") else None,
@@ -2544,10 +2980,11 @@ class RecipeSearchPipelineSDK:
         intent = nlid_result.get("intent", "")
         filters = nlid_result.get("filters", {})
 
-        # Extract cost, nutrition, and time filters
+        # Extract cost, nutrition, time, and servings filters
         cost_filter = filters.get("cost")
         nutrition_filter = filters.get("nutrition")
         time_filter = filters.get("time")
+        servings_filter = filters.get("servings")
 
         # Fallback: try to extract from query if NLID didn't provide them
         if not cost_filter and intent == "price_filter":
@@ -2583,6 +3020,7 @@ class RecipeSearchPipelineSDK:
         session_cost = session.filters.cost_filter
         session_time = session.filters.time_filter
         session_nutrition = session.filters.nutrition_filter
+        session_servings = session.filters.servings
 
         if not cost_filter and session_cost:
             cost_filter = session_cost
@@ -2590,6 +3028,8 @@ class RecipeSearchPipelineSDK:
             time_filter = session_time
         if not nutrition_filter and session_nutrition:
             nutrition_filter = session_nutrition
+        if not servings_filter and session_servings:
+            servings_filter = session_servings
 
         # Persist current filters back to session for future turns
         if cost_filter:
@@ -2598,8 +3038,10 @@ class RecipeSearchPipelineSDK:
             session.filters.time_filter = time_filter
         if nutrition_filter:
             session.filters.nutrition_filter = nutrition_filter
+        if servings_filter:
+            session.filters.servings = servings_filter
         self.session_manager.save_session(session)
-        logger.info(f"[FILTER QUERY] Active filters: cost={cost_filter is not None}, time={time_filter is not None}, nutrition={nutrition_filter is not None}")
+        logger.info(f"[FILTER QUERY] Active filters: cost={cost_filter is not None}, time={time_filter is not None}, nutrition={nutrition_filter is not None}, servings={servings_filter is not None}")
 
         # Extract previous search context (from search cache or last_vector_query)
         search_cache = session.context_entities.search_cache or {}
@@ -2632,6 +3074,8 @@ class RecipeSearchPipelineSDK:
             "difficulty": session.filters.difficulty,
             "max_time": session.filters.max_time,
             "creator_uid": session.filters.creator_uid,
+            "servings": servings_filter or session.filters.servings,  # Use merged servings or session
+            "ingredient_count": session.filters.ingredient_count,  # Include ingredient count
         }
 
         # Merge any NEW exclusions/inclusions from the current NLID result
@@ -2708,6 +3152,16 @@ class RecipeSearchPipelineSDK:
         # Count active filters to decide which builder to use
         active_filter_count = sum(1 for f in [cost_filter, nutrition_filter, time_filter] if f)
 
+        # Check if we have session-level filters that need SQL
+        _has_servings = bool(filter_data.get("servings"))
+        _has_ingredient_count = bool(filter_data.get("ingredient_count"))
+        _has_exclusions = bool(filter_data.get("excluded_ingredients"))
+        _has_inclusions = bool(filter_data.get("included_ingredients"))
+        _has_tags = bool(filter_data.get("tags"))
+        _has_cuisines = bool(filter_data.get("cuisines"))
+        _has_session_filters = _has_servings or _has_ingredient_count or _has_exclusions or _has_inclusions or _has_tags or _has_cuisines
+
+        _filter_limit = 100  # Larger pool for multi-turn filter narrowing
         if active_filter_count >= 2:
             # Multiple filters active → use combined builder
             from apps.fastapi.src.utils.sql_builders import build_recipe_multi_filter_sql
@@ -2718,7 +3172,7 @@ class RecipeSearchPipelineSDK:
                 user_uid=user_uid or "",
                 language=language or "en",
                 additional_conditions=additional_conditions,
-                limit=20
+                limit=_filter_limit
             )
         elif cost_filter:
             # Cost-only filter
@@ -2727,7 +3181,7 @@ class RecipeSearchPipelineSDK:
                 user_uid=user_uid or "",
                 language=language or "en",
                 additional_conditions=additional_conditions,
-                limit=20
+                limit=_filter_limit
             )
         elif nutrition_filter:
             # Nutrition-only filter
@@ -2736,7 +3190,7 @@ class RecipeSearchPipelineSDK:
                 user_uid=user_uid or "",
                 language=language or "en",
                 additional_conditions=additional_conditions,
-                limit=20
+                limit=_filter_limit
             )
         elif time_filter:
             # Time-only filter (sort by prep + cook time)
@@ -2745,7 +3199,22 @@ class RecipeSearchPipelineSDK:
                 user_uid=user_uid or "",
                 language=language or "en",
                 additional_conditions=additional_conditions,
-                limit=20
+                limit=_filter_limit
+            )
+        elif _has_session_filters:
+            # No cost/time/nutrition filter, but we have session filters (servings, exclusions, etc.)
+            # Use base SQL builder with additional conditions
+            from apps.fastapi.src.utils.sql_builders import build_recipe_base_sql
+            logger.info(
+                f"[FILTER QUERY] Using base SQL with session filters: "
+                f"servings={_has_servings}, exclusions={_has_exclusions}, "
+                f"inclusions={_has_inclusions}, tags={_has_tags}, cuisines={_has_cuisines}"
+            )
+            sql_query = build_recipe_base_sql(
+                user_uid=user_uid or "",
+                language=language or "en",
+                additional_conditions=additional_conditions,
+                limit=_filter_limit
             )
         else:
             # No valid filters found - fall back to error message
@@ -2909,6 +3378,7 @@ class RecipeSearchPipelineSDK:
         """
         from apps.fastapi.src.agents.agent_tools import search_recipes_by_embedding
         from apps.fastapi.src.services.session_memory_manager import EMBEDDING_BATCH_SIZE
+        from apps.fastapi.src.services.session_memory_manager import SEARCH_CACHE_TTL_SECONDS
         from sqlalchemy import text
         import json
 
@@ -2934,37 +3404,70 @@ class RecipeSearchPipelineSDK:
             or session.filters.creator_uid
         )
 
-        # Step 1: Run embedding search with previous query
-        embedding_results = search_recipes_by_embedding(
-            self.db,
-            query_text=previous_vector_query,
-            limit=EMBEDDING_BATCH_SIZE,
-            threshold=0.35,
-            language_id=language or "en",
-            offset=0,
-            creator_uid=embedding_creator_uid,
+        # Step 1: Try to reuse cached embedding candidates instead of re-embedding
+        # Reuse when: same vector query, cache not expired, same creator scope
+        cache = self.session_manager.get_search_cache(session)
+        cached_candidates = cache.get("embedding_candidates", [])
+        cached_vector_query = cache.get("vector_query")
+        cached_created_at = cache.get("created_at")
+        cached_creator_uid = (cache.get("sql_filters") or {}).get("creator_uid")
+
+        cache_is_valid = (
+            cached_candidates
+            and cached_vector_query == previous_vector_query
+            and cached_created_at is not None
+            and (time.time() - cached_created_at) < SEARCH_CACHE_TTL_SECONDS
+            and cached_creator_uid == embedding_creator_uid
         )
 
-        if not embedding_results:
+        if cache_is_valid:
+            candidate_ids = cached_candidates
             logger.info(
-                "[FILTER REFINEMENT] No embedding results found, "
-                "falling back to standalone SQL mode"
+                f"[FILTER REFINEMENT] Reusing {len(candidate_ids)} cached "
+                f"embedding candidates (query='{cached_vector_query}')"
             )
-            # Clear the previous_vector_query so _handle_filter_query
-            # uses standalone mode instead of looping back here.
-            session.context_entities.last_vector_query = None
-            if session.context_entities.search_cache:
-                session.context_entities.search_cache.pop(
-                    "vector_query", None
+        else:
+            # Cache miss — re-embed
+            reason = (
+                "no cached candidates" if not cached_candidates
+                else f"query changed ('{cached_vector_query}' → '{previous_vector_query}')"
+                if cached_vector_query != previous_vector_query
+                else "cache expired"
+                if cached_created_at and (time.time() - cached_created_at) >= SEARCH_CACHE_TTL_SECONDS
+                else f"creator scope changed ({cached_creator_uid} → {embedding_creator_uid})"
+            )
+            logger.info(f"[FILTER REFINEMENT] Cache miss ({reason}), re-embedding")
+
+            embedding_results = search_recipes_by_embedding(
+                self.db,
+                query_text=previous_vector_query,
+                limit=EMBEDDING_BATCH_SIZE,
+                threshold=0.35,
+                language_id=language or "en",
+                offset=0,
+                creator_uid=embedding_creator_uid,
+            )
+
+            if not embedding_results:
+                logger.info(
+                    "[FILTER REFINEMENT] No embedding results found, "
+                    "falling back to standalone SQL mode"
                 )
-            self.session_manager.save_session(session)
+                # Clear the previous_vector_query so _handle_filter_query
+                # uses standalone mode instead of looping back here.
+                session.context_entities.last_vector_query = None
+                if session.context_entities.search_cache:
+                    session.context_entities.search_cache.pop(
+                        "vector_query", None
+                    )
+                self.session_manager.save_session(session)
 
-            return await self._handle_filter_query(
-                query, nlid_result, session, user_uid, language
-            )
+                return await self._handle_filter_query(
+                    query, nlid_result, session, user_uid, language
+                )
 
-        candidate_ids = [str(r.id) for r, _ in embedding_results]
-        logger.info(f"[FILTER REFINEMENT] ✓ {len(candidate_ids)} candidates")
+            candidate_ids = [str(r.id) for r, _ in embedding_results]
+            logger.info(f"[FILTER REFINEMENT] ✓ {len(candidate_ids)} candidates")
 
         # Step 2: Build SQL with cost/nutrition filter + allergen exclusions
         country_key_map = {"US": "usa", "India": "india", "Norway": "norway"}
@@ -3047,27 +3550,54 @@ class RecipeSearchPipelineSDK:
             session_filter_conditions += f"""
           AND r."userUid" = '{session.filters.creator_uid}'"""
 
-        # 3. Cuisine filter from session (via tags table)
+        # 3. Cuisine/Tags filter - REMOVED strict filtering
+        # Cuisines and tags are now used for SCORING only (LEFT JOIN LATERAL)
+        # Recipes WITH matching tags/cuisines rank higher, but recipes WITHOUT are NOT excluded
+        # This prevents narrowing down results too aggressively when tags are incomplete in the database
+        tag_cuisine_conditions = []
         if session.filters.cuisines:
-            cuisine_list = ", ".join([f"'{c.lower()}'" for c in session.filters.cuisines])
-            session_filter_conditions += f"""
-          AND EXISTS (
-              SELECT 1 FROM recipe_tags_tag rtt
-              JOIN tag t ON rtt."tagId" = t."id"
-              WHERE rtt."recipeId" = r."id"
-              AND LOWER(t."name") IN ({cuisine_list})
-          )"""
-
-        # 4. Tags filter from session
+            tag_cuisine_conditions.extend([f"LOWER(t.\"name\") = '{c.lower()}'" for c in session.filters.cuisines])
         if session.filters.tags:
-            tag_list = ", ".join([f"'{t}'" for t in session.filters.tags])
-            session_filter_conditions += f"""
-          AND EXISTS (
-              SELECT 1 FROM recipe_tags_tag rtt
-              JOIN tag t ON rtt."tagId" = t."id"
-              WHERE rtt."recipeId" = r."id"
-              AND LOWER(t."name") IN ({tag_list.lower()})
-          )"""
+            tag_cuisine_conditions.extend([f"LOWER(t.\"name\") = '{t.lower()}'" for t in session.filters.tags])
+
+        # Build LEFT JOIN LATERAL for tag scoring (not added to WHERE, but to FROM clause)
+        tag_lateral_join = ""
+        tag_order_clause = ""
+        if tag_cuisine_conditions:
+            or_conditions = " OR ".join(tag_cuisine_conditions)
+            tag_lateral_join = f"""
+        LEFT JOIN LATERAL (
+            SELECT 1 AS match
+            FROM recipe_tags_tag rtt
+            JOIN tag t ON rtt."tagId" = t."id"
+            WHERE rtt."recipeId" = r."id"
+            AND ({or_conditions})
+            LIMIT 1
+        ) tag_match ON true"""
+            tag_order_clause = "(CASE WHEN tag_match.match IS NOT NULL THEN 1 ELSE 0 END) DESC,"
+
+        # 4. (Removed - merged with cuisine above for combined scoring)
+
+        # 5. Servings filter from session
+        # e.g., Q1: "for 2 people" → Q2: "my budget is 100" → servings=2 preserved
+        if session.filters.servings:
+            servings = session.filters.servings
+            if isinstance(servings, int):
+                session_filter_conditions += f"""
+          AND r.servings = {servings}"""
+            elif isinstance(servings, dict):
+                # Handle range/comparison servings
+                min_val = servings.get("min")
+                max_val = servings.get("max")
+                operator = servings.get("operator")
+                value = servings.get("value")
+                if min_val is not None and max_val is not None:
+                    session_filter_conditions += f"""
+          AND r.servings >= {min_val} AND r.servings <= {max_val}"""
+                elif operator and value is not None:
+                    sql_op = {">=": ">=", "<=": "<=", ">": ">", "<": "<", "=": "="}.get(operator, "=")
+                    session_filter_conditions += f"""
+          AND r.servings {sql_op} {value}"""
 
         if cost_filter:
             # Cost-based ordering
@@ -3080,12 +3610,18 @@ class RecipeSearchPipelineSDK:
             if time_filter:
                 # Both cost and time active
                 time_sort = time_filter.get("sort_order", "ASC").upper()
-                time_order_clause = f"ORDER BY _cost_sort {cost_sort}, (r.\"prepTime\" + r.\"cookTime\") {time_sort}"
+                time_order_clause = f"ORDER BY {tag_order_clause} _cost_sort {cost_sort}, (r.\"prepTime\" + r.\"cookTime\") {time_sort}"
             else:
-                time_order_clause = f"ORDER BY _cost_sort {cost_sort}"
+                time_order_clause = f"ORDER BY {tag_order_clause} _cost_sort {cost_sort}"
         elif time_filter:
             sort_order = time_filter.get("sort_order", "ASC").upper()
-            time_order_clause = f"ORDER BY (r.\"prepTime\" + r.\"cookTime\") {sort_order}"
+            time_order_clause = f"ORDER BY {tag_order_clause} (r.\"prepTime\" + r.\"cookTime\") {sort_order}"
+        elif tag_order_clause:
+            # Only tag scoring, no time or cost filter
+            time_order_clause = f"ORDER BY {tag_order_clause} r.name"
+        else:
+            # No filters, default order
+            time_order_clause = "ORDER BY r.name"
 
         # Build the full SQL query
         candidate_list = ", ".join([f"'{cid}'" for cid in candidate_ids])
@@ -3098,6 +3634,7 @@ class RecipeSearchPipelineSDK:
         FROM recipe r
         LEFT JOIN bundle_recipe br ON r."id" = br."recipeId" AND br."deletedAt" IS NULL
         LEFT JOIN "bundle" b ON br."bundleId" = b."id"
+        {tag_lateral_join}
         WHERE r.id IN ({candidate_list})
           AND r."deletedAt" IS NULL
           AND r."status" = 'published'
