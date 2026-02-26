@@ -258,7 +258,28 @@ class RecipeSearchPipelineSDK:
                 enhanced_context["previous_search_context"]["last_query"] = session.context_entities.last_vector_query
                 enhanced_context["previous_search_context"]["last_filters"] = session.context_entities.last_search_filters
                 enhanced_context["previous_search_context"]["last_intent"] = session.last_intent
-                enhanced_context["previous_search_context"]["excluded_ingredients"] = session.excluded_ingredients
+                # Pass only ORIGINAL allergen names to NLID, not all expanded
+                # variants.  Sending 39+ dairy variants causes the NLID to
+                # echo back a subset (e.g. "dairy", "cheese") which then gets
+                # re-expanded on every turn, snowballing the exclusion list.
+                if session.allergies:
+                    # Allergy keys = original names ("milk", "eggs", etc.)
+                    allergy_variant_set: set = set()
+                    for variants in session.allergies.values():
+                        allergy_variant_set.update(
+                            v.lower() for v in variants
+                        )
+                    # Non-allergy exclusions (e.g. "cabbage" from "I don't have cabbage")
+                    non_allergy = [
+                        e for e in session.excluded_ingredients
+                        if e.lower() not in allergy_variant_set
+                    ]
+                    original_exclusions = (
+                        list(session.allergies.keys()) + non_allergy
+                    )
+                else:
+                    original_exclusions = session.excluded_ingredients
+                enhanced_context["previous_search_context"]["excluded_ingredients"] = original_exclusions
                 enhanced_context["previous_search_context"]["included_ingredients"] = session.included_ingredients
 
             # Add pricing context for multi-turn pricing follow-ups (e.g., "And in India?")
@@ -1294,15 +1315,43 @@ class RecipeSearchPipelineSDK:
             if not is_special_case and raw_allergens:
 
                 try:
-                    # Initialize ingredient matcher
-                    ingredient_matcher = IntelligentIngredientMatcher(self.db, self.client)
-                    # SMART expansion: categories -> full expansion, specific -> singular/plural only
-                    new_expanded_allergens = ingredient_matcher.smart_expand_for_exclusions(raw_allergens)
-                    logger.info(f"[ALLERGY] Expanded allergens: {raw_allergens} -> {new_expanded_allergens}")
+                    # ── De-duplicate: only expand NEW allergens ──
+                    # The NLID may echo back allergens already tracked in the
+                    # session (e.g. "milk" from Q1 echoed during Q2).
+                    # Re-expanding them snowballs the exclusion list on every
+                    # turn (milk→dairy+cheese+cream → dairy re-expanded to 34
+                    # items, etc.).  Filter them out first.
+                    already_tracked: set = set()
+                    if session.allergies:
+                        already_tracked.update(
+                            k.lower() for k in session.allergies.keys()
+                        )
+                        for variants in session.allergies.values():
+                            already_tracked.update(
+                                v.lower() for v in variants
+                            )
+                    new_allergens = [
+                        a for a in raw_allergens
+                        if a.lower() not in already_tracked
+                    ]
 
-                    # Store new allergens in session for persistence
-                    for original_allergen in raw_allergens:
-                        session = self.session_manager.add_allergy(session, original_allergen, new_expanded_allergens)
+                    if new_allergens:
+                        # Initialize ingredient matcher
+                        ingredient_matcher = IntelligentIngredientMatcher(self.db, self.client)
+                        # SMART expansion: categories -> full expansion, specific -> singular/plural only
+                        new_expanded_allergens = ingredient_matcher.smart_expand_for_exclusions(new_allergens)
+                        logger.info(f"[ALLERGY] Expanded NEW allergens: {new_allergens} -> {new_expanded_allergens}")
+
+                        # Store new allergens in session for persistence
+                        for original_allergen in new_allergens:
+                            session = self.session_manager.add_allergy(session, original_allergen, new_expanded_allergens)
+                    else:
+                        # All allergens already tracked — no expansion needed
+                        new_expanded_allergens = []
+                        logger.info(
+                            f"[ALLERGY] All allergens already tracked in session, "
+                            f"skipping re-expansion: {raw_allergens}"
+                        )
 
                     # Merge with existing session exclusions AND any exclusions already in retrieval_plan
                     # (e.g., vegetarian exclusions added by retrieval_strategy.py)
@@ -5385,16 +5434,18 @@ class RecipeSearchPipelineSDK:
             excluded_list = ", ".join([f"'{rid}'" for rid in excluded_recipe_ids])
             conditions.append(f"r.id NOT IN ({excluded_list})")
 
-        # Add allergen exclusions
-        if excluded_ingredients:
-            for ingredient in excluded_ingredients[:20]:  # Limit to prevent huge queries
-                escaped = ingredient.replace("'", "''")
-                conditions.append(f"r.ingredients_text NOT ILIKE '%{escaped}%'")
+        # Merge allergen exclusions from sql_filters with session exclusions
+        # Both sources feed into build_session_filter_conditions which uses
+        # proper JOIN-based filtering (NOT EXISTS on recipe_ingredient)
+        merged_excluded = list(set(
+            (session.excluded_ingredients or [])
+            + (excluded_ingredients or [])
+        ))
 
         # Add session filters
         session_filters_dict = {
             "included_ingredients": [],
-            "excluded_ingredients": session.excluded_ingredients or [],
+            "excluded_ingredients": merged_excluded,
             "tags": [],
             "cuisines": [],
             "categories": [],
@@ -5736,8 +5787,12 @@ class RecipeSearchPipelineSDK:
             logger.error(f"[SHOW_MORE] Error processing cached candidates: {e}")
             import traceback
             logger.error(f"[SHOW_MORE] Traceback: {traceback.format_exc()}")
+            try:
+                self.db.rollback()
+            except Exception:
+                pass
             return {
-                "response": "I encountered an error while fetching more recipes. Please try again.",
+                "response": "I couldn't find more recipes matching your criteria. Would you like to try a different search?",
                 "metadata": {"intent": "show_more", "num_results": 0, "error": str(e), "recipes": []}
             }
 
