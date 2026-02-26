@@ -92,7 +92,7 @@ def root():
     logger.info("Fastapi Framework accessed ...")
     return {
         "success": True,
-        "message": "FastAPI Server is up and running 🚀🚀🚀",
+        "message": "FastAPI Server is up and running 🚀🚀🚀. Last deployment on 2026-02-26",
     }
 
 
