@@ -37,13 +37,16 @@ LLM_MODEL = os.getenv('INGREDIENT_MATCHER_MODEL')
 # Categories that need FULL expansion (e.g., "nuts" -> "walnut", "almond", ...)
 # ============================================================================
 
-# Categories that should be expanded to specific items
-# These are ingredient types where the base word doesn't match specific items
+# Categories that should be expanded to specific items.
+# ONLY true category/group words belong here — words where the base
+# word genuinely doesn't match specific ingredient names in the DB.
+# Specific ingredients (milk, chicken, eggs, etc.) should NOT be here;
+# they get synonym/plural expansion via INGREDIENT_SYNONYMS instead.
+# This prevents "I ran out of milk" from excluding all dairy products.
 EXPAND_CATEGORIES: set = {
     "nuts", "nut", "fruits", "fruit", "dairy", "seafood",
     "shellfish", "meat", "poultry", "vegetables", "vegetable",
-    "spices", "spice", "gluten", "eggs", "egg", "chocolate", "cocoa",
-    "milk", "wheat", "soy", "pork", "beef", "chicken"
+    "spices", "spice", "gluten",
 }
 
 
@@ -113,6 +116,21 @@ INGREDIENT_SYNONYMS: Dict[str, List[str]] = {
     "breadcrumbs": ["breadcrumbs", "breadcrumb", "bread crumbs", "bread crumbs", "panko"],
     "panko": ["panko", "breadcrumbs", "bread crumbs"],
     "scallions": ["scallions", "scallion", "green onion", "green onions", "spring onion", "spring onions"],
+
+    # Specific ingredients — synonym/plural expansion only.
+    # These are NOT category words, so "I ran out of milk" excludes milk,
+    # not all dairy. Use "dairy" if you want the full category.
+    "milk": ["milk", "milks"],
+    "egg": ["egg", "eggs"],
+    "eggs": ["egg", "eggs"],
+    "chicken": ["chicken"],
+    "beef": ["beef"],
+    "pork": ["pork"],
+    "wheat": ["wheat"],
+    "soy": ["soy", "soya"],
+    "chocolate": ["chocolate"],
+    "cocoa": ["cocoa", "cacao"],
+    "cheese": ["cheese"],
 }
 
 

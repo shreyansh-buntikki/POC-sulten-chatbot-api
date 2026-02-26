@@ -863,11 +863,26 @@ def build_session_filter_conditions(
     # Cuisines are still passed in session_filters for reference but NOT added as WHERE conditions
     # This prevents narrowing down results too aggressively when tags are incomplete in the database
 
-    # Tags filter - REMOVED strict filtering, tags are now used for scoring only
-    # Tags should boost relevant recipes but not exclude recipes without the tag
-    # The SQL generator uses LEFT JOIN LATERAL for tag scoring
-    # Tags are still passed in session_filters for reference but NOT added as WHERE conditions
-    # This prevents narrowing down results too aggressively when tags are incomplete in the database
+    # Tags filter
+    # For the SQL_ONLY path (deterministic builder), tags MUST be enforced as
+    # WHERE conditions because there is no LLM-generated SQL with LATERAL JOINs
+    # for scoring.  Without an explicit WHERE clause the tag is simply ignored
+    # and the user gets unfiltered results (e.g. vegan tag → non-vegan recipes).
+    tags = session_filters.get("tags", [])
+    if tags:
+        escaped_tags = [t.replace("'", "''") for t in tags]
+        tag_likes = " OR ".join(
+            [f"t.name ILIKE '%{tag}%'" for tag in escaped_tags]
+        )
+        conditions.append(f"""
+            EXISTS (
+                SELECT 1
+                FROM recipe_tags_tag rtt
+                JOIN tag t ON rtt."tagId" = t.id
+                WHERE rtt."recipeId" = r."id"
+                AND ({tag_likes})
+            )
+        """)
 
     # Difficulty filter - supports both single value and list
     # When user asks for "easy" or "beginner", we include both "easy" and "normal"

@@ -160,50 +160,63 @@ class RetrievalStrategyDecider:
 
         q = query.lower()
 
-        # First, explicitly remove excluded ingredient names from the query
-        # This handles cases where regex patterns might miss them
-        excluded_ingredients = filters.get("excluded_ingredients", [])
-        if excluded_ingredients:
-            for ingredient in excluded_ingredients:
-                # Remove the ingredient word(s) from query
-                # Use word boundaries to avoid partial matches
-                ing_lower = ingredient.lower().strip()
-                if ing_lower and len(ing_lower) > 2:  # Skip very short words
-                    # Remove ingredient with optional surrounding context
-                    q = re.sub(rf'\b{re.escape(ing_lower)}s?\b', '', q, flags=re.IGNORECASE)
+        # IMPORTANT: Apply strip patterns BEFORE removing ingredient names.
+        # If we remove ingredients first, phrases like "allergic to chicken"
+        # become "allergic to " and the strip pattern \ballergic\s+to\s+\w+
+        # no longer matches, leaving orphaned words like "allergic".
 
         # Ordered from most-specific to least-specific so broad patterns
         # don't swallow more specific ones.
-        # FIXED: Removed the typo `[,.]!\s*` and improved patterns
+        _NUM = r'(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)'
+
         STRIP_PATTERNS = [
-            # Structural filter phrases - these don't add semantic meaning for embeddings
+            # ── @username / creator phrases ──
+            # "created by @mammapia", "made by @chef" → remove entirely
+            r'\b(?:created|made|posted|shared|recipes?\s+by)\s+@\w+',
+            # Standalone "@username" mentions
+            r'@\w+',
+
+            # ── Structural serving/guest phrases ──
             # "that serves 4 guests" → remove entirely
-            r"\bthat\s+serv(?:es?|ing)\s+\d+\s*(?:guests?|people|portions?|servings?)?\b",
+            r'\bthat\s+serv(?:es?|ing)\s+' + _NUM + r'\s*(?:guests?|people|portions?|servings?)?\b',
             # "serves 4 guests" / "serves 4 people" → remove entirely
-            r"\bserv(?:es?|ing)\s+\d+\s*(?:guests?|people|portions?|servings?)?\b",
-            # "for 4 guests" / "for 4 people" when used as serving specification
-            r"\bfor\s+\d+\s+(?:guests?|people|portions?|servings?)\b",
+            r'\bserv(?:es?|ing)\s+' + _NUM + r'\s*(?:guests?|people|portions?|servings?)?\b',
+            # "for 4 guests" / "for my 2 kids" / "for 4 people"
+            r'\bfor\s+(?:my\s+)?' + _NUM + r'\s+(?:guests?|people|kids?|children|portions?|servings?|friends?|persons?)\b',
+            # "2 guests are coming over" / "3 people are joining"
+            # Allow 0-2 adjective words between number and "guests" (e.g. "2 asian guests")
+            # BUT the adjective words are preserved — only the number & structural words are stripped
+            _NUM + r'\s+(?:guests?|people|friends?|persons?)\s+(?:are\s+)?(?:coming|joining|visiting|arriving)(?:\s+over)?\b',
+            # "N of them is/are ..." (filler referring to guests)
+            _NUM + r'\s+of\s+(?:them|us|my\s+guests?)\s+(?:is|are)\b',
+            # Standalone "N guests" / "N people" (serving count)
+            _NUM + r'\s+(?:guests?|people|persons?|portions?|servings?|kids?|children)\b',
+            # "cooking for my N kids" → remove "cooking for my N kids"
+            r'\b(?:cooking|cook)\s+for\s+(?:my\s+)?' + _NUM + r'\s+(?:kids?|children|guests?|friends?|people)\b',
+            # "my N kids/children" standalone
+            r'\bmy\s+' + _NUM + r'\s+(?:kids?|children|guests?|friends?)\b',
+
+            # ── Exclusion / allergy phrases ──
             # "remember I am a vegetarian" → keep "vegetarian" but strip the frame
-            r"remember\s+i\s+(?:'?m|am)\s+",
+            r'remember\s+i\s+(?:\'?m|am)\s+',
             # "I am / I'm allergic to X", "I am intolerant to X"
-            r"(?:i\s+)?(?:i'?m|i\s+am)\s+(?:allergic|intolerant)\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'(?:i\s+)?(?:i\'?m|i\s+am)\s+(?:allergic|intolerant)\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "allergic to X"
-            r"\ballergic\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
-            # "I don't like/want/eat/have/use/need X" - matches "dont" and "don't"
-            # FIXED: Greedily match up to 3 words after the verb to capture ingredient names
-            r"(?:i\s+)?(?:don'?t|do\s+not)\s+(?:like|want|eat|have|use|need)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'\ballergic\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
+            # "I/she/he/one/other don't/doesn't/do not/does not like/eat/... X"
+            r'(?:\w+\s+)?(?:don\'?t|doesn\'?t|do\s+not|does\s+not)\s+(?:like|want|eat|have|use|need)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "I ran out of X", "I'm missing X"
-            r"(?:i\s+)?(?:ran\s+out\s+of|missing|out\s+of)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'(?:i\s+)?(?:ran\s+out\s+of|missing|out\s+of)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "without X"
-            r"\bwithout\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'\bwithout\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "but no X / except X / avoid X"
-            r"\b(?:but\s+no|except|avoid(?:ing)?)\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'\b(?:but\s+no|except|avoid(?:ing)?)\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "I hate X"
-            r"(?:i\s+)?hate\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'(?:i\s+)?hate\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "can't eat X"
-            r"can'?t\s+eat\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
+            r'can\'?t\s+eat\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)',
             # "no X" followed by comma or end of clause
-            r",?\s*no\s+\w+(?:\s+\w+)?(?=\s*,|\s*\.|\s+and\b|\s+but\b|$)",
+            r',?\s*no\s+\w+(?:\s+\w+)?(?=\s*,|\s*\.|\s+and\b|\s+but\b|$)',
         ]
 
         for pat in STRIP_PATTERNS:
@@ -212,21 +225,64 @@ class RetrievalStrategyDecider:
             if old_q != q:
                 logger.info(f"[RETRIEVAL STRATEGY] Pattern '{pat[:50]}...' matched and removed text")
 
-        # Clean up punctuation and whitespace
-        q = re.sub(r'[,;]+', ' ', q)
-        q = re.sub(r'\s+', ' ', q).strip().strip('.,;:!?')
+        # Second pass: remove any excluded ingredient names that survived
+        # (e.g. ingredient mentioned outside a recognized phrase)
+        excluded_ingredients = filters.get("excluded_ingredients", [])
+        if excluded_ingredients:
+            for ingredient in excluded_ingredients:
+                ing_lower = ingredient.lower().strip()
+                if ing_lower and len(ing_lower) > 2:
+                    q = re.sub(rf'\b{re.escape(ing_lower)}s?\b', '', q, flags=re.IGNORECASE)
 
-        # Remove pure stop-words to check meaningful residual content
+        # Clean up ALL sentence punctuation and whitespace
+        q = re.sub(r'[,;.!?]+', ' ', q)
+        q = re.sub(r'\s+', ' ', q).strip()
+
+        # Remove pure stop-words / structural words so only semantic content
+        # (cuisines, flavors, dish types, cooking styles) remains.
         STOP_WORDS = {
-            'i', 'me', 'my', 'can', 'you', 'suggest', 'please', 'a', 'an', 'the',
-            'and', 'or', 'but', 'that', 'some', 'is', 'are', 'was', 'be',
-            'do', 'does', 'did', 'have', 'has', 'will', 'would', 'could', 'should',
-            'tell', 'give', 'show', 'get', 'make', 'want', 'need',
-            'something', 'anything', 'everything', 'it', 'its',
-            'with', 'for', 'from', 'to', 'at', 'by', 'on', 'in',
-            'dont', "don't", 'not', 'no', 'im', "i'm", 'am',
+            # Pronouns / determiners
+            'i', 'me', 'my', 'we', 'us', 'our', 'you', 'your', 'he', 'she',
+            'they', 'them', 'their', 'it', 'its', 'this', 'that', 'these',
+            # Articles / conjunctions
+            'a', 'an', 'the', 'and', 'or', 'but', 'so', 'yet', 'nor',
+            # Prepositions
+            'with', 'for', 'from', 'to', 'at', 'by', 'on', 'in', 'of',
+            'about', 'into', 'over', 'up',
+            # Verbs (generic / structural)
+            'is', 'are', 'was', 'were', 'be', 'been', 'being',
+            'do', 'does', 'did', 'have', 'has', 'had',
+            'will', 'would', 'could', 'should', 'shall', 'may', 'might',
+            'can', 'want', 'need', 'like', 'eat', 'get', 'got', 'make',
+            'tell', 'give', 'show', 'find', 'cook', 'cooking',
+            'suggest', 'recommend',
+            # Negation
+            'not', 'no', 'dont', "don't", 'doesnt', "doesn't",
+            'im', "i'm", 'am',
+            # Generic nouns / filler
+            'something', 'anything', 'everything', 'some', 'any',
+            'thing', 'things', 'food', 'foods', 'meal', 'meals',
+            'recipe', 'recipes', 'dish', 'dishes', 'option', 'options',
+            # Structural (guests, time-related filler)
+            'guests', 'guest', 'people', 'friends', 'friend',
+            'persons', 'person', 'kids', 'kid', 'children',
+            'coming', 'going', 'getting', 'arriving', 'visiting',
+            'one', 'two', 'three', 'four', 'five', 'other', 'another',
+            # Allergy / exclusion filler
+            'allergic', 'allergy', 'intolerant',
+            # Common filler
+            'also', 'just', 'really', 'very', 'too', 'much',
+            'there', 'here', 'what', 'how', 'which', 'where',
+            'please', 'thanks', 'ok', 'okay',
+            'created', 'made', 'posted',
+            'good', 'nice', 'great',
+            'am', 'hurry', 'late',
         }
-        tokens = [w for w in q.split() if w not in STOP_WORDS and len(w) > 1]
+        # Filter stop words AND pure numbers (serving counts etc.)
+        tokens = [
+            w for w in q.split()
+            if w not in STOP_WORDS and len(w) > 1 and not w.isdigit()
+        ]
 
         if len(tokens) >= 2:
             return ' '.join(tokens)
@@ -655,14 +711,12 @@ class RetrievalStrategyDecider:
             # For new searches, use the contextual query (may include constraints)
             vector_query = query
 
-        # If the query contains exclusion language ("I dont like X", "allergic to X",
-        # "without X", etc.), strip those negative phrases so the embedding target
-        # reflects what the user *wants*, not what they want to avoid.
-        has_exclusions = bool(
-            filters.get("excluded_ingredients")
-            or filters.get("exclude_ingredients")
-        )
-        if has_exclusions and not is_refinement:
+        # Strip structural noise (@username, guest counts, negative phrases)
+        # from the vector query so embeddings target what the user *wants*.
+        # Always run — not just when exclusions are present — because queries
+        # like "recipes created by @mammapia" or "2 guests coming over" also
+        # need cleaning even without excluded ingredients.
+        if not is_refinement:
             clean_query = self._extract_positive_vector_query(vector_query, filters)
             if clean_query and clean_query != vector_query:
                 logger.info(
@@ -978,7 +1032,8 @@ class RetrievalStrategyDecider:
             filters.get("cost") or
             filters.get("nutrition") or
             filters.get("ingredient_count") or
-            filters.get("excluded_ingredients")  # Exclusions are structural
+            filters.get("excluded_ingredients") or  # Exclusions are structural
+            filters.get("creator_uid")  # Creator filter (@username) is structural
         )
 
         return has_structural
@@ -1136,7 +1191,39 @@ class RetrievalStrategyDecider:
                         flattened.extend(item)
                     else:
                         flattened.append(item)
-                sql_filters["excluded_ingredients"] = flattened
+                # Validate ingredient names: reject junk text that clearly
+                # isn't an ingredient (e.g. "milk and other is allergic to egg")
+                validated = []
+                _JUNK_WORDS = {"allergic", "allergy", "intolerant", "other"}
+                for name in flattened:
+                    if not isinstance(name, str) or not name.strip():
+                        continue
+                    name = name.strip()
+                    # Reject entries longer than 40 chars (not a real ingredient)
+                    if len(name) > 40:
+                        logger.warning(
+                            f"[RETRIEVAL STRATEGY] Rejected junk ingredient "
+                            f"name (too long): '{name[:60]}...'"
+                        )
+                        continue
+                    # Reject entries with 4+ words (phrases, not ingredients)
+                    word_count = len(name.split())
+                    if word_count > 3:
+                        logger.warning(
+                            f"[RETRIEVAL STRATEGY] Rejected junk ingredient "
+                            f"name (too many words): '{name}'"
+                        )
+                        continue
+                    # Reject if it contains known junk/sentence words
+                    name_lower = name.lower()
+                    if any(jw in name_lower.split() for jw in _JUNK_WORDS):
+                        logger.warning(
+                            f"[RETRIEVAL STRATEGY] Rejected junk ingredient "
+                            f"name (contains sentence fragment): '{name}'"
+                        )
+                        continue
+                    validated.append(name)
+                sql_filters["excluded_ingredients"] = validated
             else:
                 sql_filters["excluded_ingredients"] = [nlid_excluded]
 
