@@ -160,29 +160,29 @@ class RetrievalStrategyDecider:
 
         q = query.lower()
 
-        # First, explicitly remove excluded ingredient names from the query
-        # This handles cases where regex patterns might miss them
-        excluded_ingredients = filters.get("excluded_ingredients", [])
-        if excluded_ingredients:
-            for ingredient in excluded_ingredients:
-                # Remove the ingredient word(s) from query
-                # Use word boundaries to avoid partial matches
-                ing_lower = ingredient.lower().strip()
-                if ing_lower and len(ing_lower) > 2:  # Skip very short words
-                    # Remove ingredient with optional surrounding context
-                    q = re.sub(rf'\b{re.escape(ing_lower)}s?\b', '', q, flags=re.IGNORECASE)
+        # IMPORTANT: Apply strip patterns BEFORE removing ingredient names.
+        # If we remove ingredients first, phrases like "allergic to chicken"
+        # become "allergic to " and the strip pattern \ballergic\s+to\s+\w+
+        # no longer matches, leaving orphaned words like "allergic".
 
         # Ordered from most-specific to least-specific so broad patterns
         # don't swallow more specific ones.
-        # FIXED: Removed the typo `[,.]!\s*` and improved patterns
         STRIP_PATTERNS = [
-            # Structural filter phrases - these don't add semantic meaning for embeddings
+            # ── Structural serving/guest phrases ──
             # "that serves 4 guests" → remove entirely
             r"\bthat\s+serv(?:es?|ing)\s+\d+\s*(?:guests?|people|portions?|servings?)?\b",
             # "serves 4 guests" / "serves 4 people" → remove entirely
             r"\bserv(?:es?|ing)\s+\d+\s*(?:guests?|people|portions?|servings?)?\b",
             # "for 4 guests" / "for 4 people" when used as serving specification
             r"\bfor\s+\d+\s+(?:guests?|people|portions?|servings?)\b",
+            # "2 guests are coming over" / "3 people are joining"
+            r"\d+\s+(?:guests?|people|friends?|persons?)\s+(?:are\s+)?(?:coming|joining|visiting|arriving)(?:\s+over)?\b",
+            # "N of them is/are ..." (filler referring to guests)
+            r"\b\d+\s+of\s+(?:them|us|my\s+guests?)\s+(?:is|are)\b",
+            # Standalone "N guests" / "N people" (serving count)
+            r"\b\d+\s+(?:guests?|people|persons?|portions?|servings?)\b",
+
+            # ── Exclusion / allergy phrases ──
             # "remember I am a vegetarian" → keep "vegetarian" but strip the frame
             r"remember\s+i\s+(?:'?m|am)\s+",
             # "I am / I'm allergic to X", "I am intolerant to X"
@@ -190,7 +190,6 @@ class RetrievalStrategyDecider:
             # "allergic to X"
             r"\ballergic\s+to\s+\w+(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "I don't like/want/eat/have/use/need X" - matches "dont" and "don't"
-            # FIXED: Greedily match up to 3 words after the verb to capture ingredient names
             r"(?:i\s+)?(?:don'?t|do\s+not)\s+(?:like|want|eat|have|use|need)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
             # "I ran out of X", "I'm missing X"
             r"(?:i\s+)?(?:ran\s+out\s+of|missing|out\s+of)\s+\w+(?:\s+\w+)?(?:\s+\w+)?(?=\s*[,.]|\s+and\b|\s+but\b|$)",
@@ -212,6 +211,15 @@ class RetrievalStrategyDecider:
             if old_q != q:
                 logger.info(f"[RETRIEVAL STRATEGY] Pattern '{pat[:50]}...' matched and removed text")
 
+        # Second pass: remove any excluded ingredient names that survived
+        # (e.g. ingredient mentioned outside a recognized phrase)
+        excluded_ingredients = filters.get("excluded_ingredients", [])
+        if excluded_ingredients:
+            for ingredient in excluded_ingredients:
+                ing_lower = ingredient.lower().strip()
+                if ing_lower and len(ing_lower) > 2:
+                    q = re.sub(rf'\b{re.escape(ing_lower)}s?\b', '', q, flags=re.IGNORECASE)
+
         # Clean up punctuation and whitespace
         q = re.sub(r'[,;]+', ' ', q)
         q = re.sub(r'\s+', ' ', q).strip().strip('.,;:!?')
@@ -223,8 +231,11 @@ class RetrievalStrategyDecider:
             'do', 'does', 'did', 'have', 'has', 'will', 'would', 'could', 'should',
             'tell', 'give', 'show', 'get', 'make', 'want', 'need',
             'something', 'anything', 'everything', 'it', 'its',
-            'with', 'for', 'from', 'to', 'at', 'by', 'on', 'in',
+            'with', 'for', 'from', 'to', 'at', 'by', 'on', 'in', 'of',
             'dont', "don't", 'not', 'no', 'im', "i'm", 'am',
+            'cook', 'recipe', 'recipes',
+            'over', 'them', 'coming', 'going', 'guests', 'guest',
+            'allergic', 'allergy',
         }
         tokens = [w for w in q.split() if w not in STOP_WORDS and len(w) > 1]
 
@@ -978,7 +989,8 @@ class RetrievalStrategyDecider:
             filters.get("cost") or
             filters.get("nutrition") or
             filters.get("ingredient_count") or
-            filters.get("excluded_ingredients")  # Exclusions are structural
+            filters.get("excluded_ingredients") or  # Exclusions are structural
+            filters.get("creator_uid")  # Creator filter (@username) is structural
         )
 
         return has_structural
