@@ -176,7 +176,8 @@ def get_recipe_details(
         "instructions": instruction_list,
         "tags": tag_names,
         "seasonality": season_list,
-        "is_liked": is_liked
+        "is_liked": is_liked,
+        "recipe_metadata": recipe.recipe_metadata,  # JSON: {pricing: {...}, totalNutrition: {macros: {...}, micros: {...}}}
     }
 
 

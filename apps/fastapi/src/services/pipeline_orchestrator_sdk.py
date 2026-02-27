@@ -4860,9 +4860,15 @@ class RecipeSearchPipelineSDK:
         """
         Handle recipe_reference intent - show details for a previously shown recipe.
 
-        Examples: "Explain the 1st recipe", "Tell me about the second one"
+        Supported detail_types:
+          full            - overview (time, servings, difficulty, description)
+          ingredients     - list of ingredients
+          instructions    - step-by-step cooking instructions
+          nutrition       - macro nutritional info per serving
+          cost            - total estimated cost in Norway (kr)
+          ingredient_costs - per-ingredient price breakdown + total in Norway
         """
-        from apps.fastapi.src.agents.agent_tools import get_recipe_details
+        from apps.fastapi.src.agents.agent_tools import get_recipe_details, get_recipe_cost
 
         entities = nlid_result.get("entities", {})
         reference_position = entities.get("reference_position", 1)
@@ -4872,10 +4878,12 @@ class RecipeSearchPipelineSDK:
         if isinstance(reference_position, str):
             position_map = {
                 "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
-                "last": -1, "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5
+                "last": -1, "1st": 1, "2nd": 2, "3rd": 3, "4th": 4, "5th": 5,
+                "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
             }
             reference_position = position_map.get(
-                reference_position.lower(), int(reference_position) if reference_position.isdigit() else 1
+                reference_position.lower(),
+                int(reference_position) if str(reference_position).isdigit() else 1
             )
 
         # Get last recipe results from session
@@ -4883,7 +4891,10 @@ class RecipeSearchPipelineSDK:
 
         if not last_results:
             return {
-                "response": "I don't have any recent recipe results to reference. Try searching for recipes first!",
+                "response": (
+                    "I don't have any recent recipe results to reference. "
+                    "Please search for recipes first and then ask about a specific one!"
+                ),
                 "metadata": {"intent": "recipe_reference", "num_results": 0}
             }
 
@@ -4893,44 +4904,80 @@ class RecipeSearchPipelineSDK:
 
         # Validate position
         if reference_position < 1 or reference_position > len(last_results):
+            ordinal_map = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+            available = [
+                ordinal_map.get(i + 1, f"{i + 1}th")
+                for i in range(len(last_results))
+            ]
+            available_str = ", ".join(available)
             return {
-                "response": f"I can only reference recipes 1 through {len(last_results)}. Please specify a valid recipe number.",
-                "metadata": {"intent": "recipe_reference", "num_results": 0, "available_count": len(last_results)}
+                "response": (
+                    f"I only have {len(last_results)} recipe(s) from the last search "
+                    f"({available_str}). "
+                    f"I couldn't find a recipe at position {reference_position}. "
+                    "Please try a valid number."
+                ),
+                "metadata": {
+                    "intent": "recipe_reference",
+                    "num_results": 0,
+                    "available_count": len(last_results),
+                    "requested_position": reference_position,
+                }
             }
 
         # Get the referenced recipe
         target_recipe = last_results[reference_position - 1]
         recipe_id = target_recipe.get("id")
 
-        logger.info(f"[RECIPE_REFERENCE] Referencing recipe {reference_position}: {target_recipe.get('name')}")
+        logger.info(
+            f"[RECIPE_REFERENCE] detail_type={detail_type} position={reference_position} "
+            f"recipe={target_recipe.get('name')} id={recipe_id}"
+        )
 
         # Get full recipe details
-        recipe_details = get_recipe_details(self.db, recipe_id, user_uid, language or "en")
+        recipe_details = get_recipe_details(self.db, recipe_id, user_uid)
 
         if not recipe_details:
             return {
-                "response": "I couldn't retrieve the details for that recipe.",
+                "response": "I couldn't retrieve the details for that recipe. Please try again.",
                 "metadata": {"intent": "recipe_reference", "num_results": 0}
             }
+
+        # For cost-related detail types, fetch pricing from Norway (default country)
+        if detail_type in ("cost", "ingredient_costs"):
+            cost_data = get_recipe_cost(self.db, recipe_id, country_code="Norway")
+            if cost_data:
+                recipe_details["cost_data"] = cost_data
+            else:
+                recipe_details["cost_data"] = None
+                logger.warning(
+                    f"[RECIPE_REFERENCE] No cost data found for recipe {recipe_id} in Norway"
+                )
 
         # Generate response based on detail type using NLG agent
         response = await generate_recipe_detail_response(
             recipe_details, detail_type, query
         )
 
-        # Update session with referenced recipe
+        # Update session with referenced recipe (do NOT update last_recipe_results —
+        # that must stay pointing at the last real search so subsequent reference
+        # queries (Q5, Q6 …) can keep resolving against the same list)
         session.context_entities.last_referenced_recipe_id = recipe_id
         session.context_entities.last_referenced_recipe_name = target_recipe.get("name")
+        session.add_to_history("assistant", response)
         self.session_manager.save_session(session)
 
         return {
             "response": response,
             "metadata": {
                 "intent": "recipe_reference",
-                "num_results": 1,
-                "recipes": [recipe_details],
+                # No recipe cards — the full answer is in the text response.
+                # The frontend should render only the response text for this intent.
+                "num_results": 0,
+                "recipes": [],
                 "reference_position": reference_position,
-                "detail_type": detail_type
+                "detail_type": detail_type,
+                "recipe_name": target_recipe.get("name"),
             }
         }
 
