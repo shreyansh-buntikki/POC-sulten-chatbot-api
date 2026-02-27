@@ -80,6 +80,21 @@ The price of [Ingredient] in [Country] is [SYMBOL][price] per [unit].
 
 Currency symbols: Norway → kr, India → ₹, United States → $
 
+### 5. Ingredient Cost Breakdown for a Specific Recipe (CRITICAL FORMATTING)
+When presenting a per-ingredient cost breakdown for a referenced recipe, ALWAYS use this format:
+
+Here's the ingredient cost breakdown for **[Recipe Name]** in Norway:
+
+  [Ingredient 1] ([amount] [unit]): kr[price]
+  [Ingredient 2] ([amount] [unit]): kr[price]
+  ...
+  ─────────────────────────
+  **Total: kr[TOTAL]**
+  *(Serves [N] — kr[cost_per_serving] per serving)*
+
+If an ingredient has no pricing data, show it as: `[Ingredient Name]: price not available`.
+Always include the total and per-serving cost at the end.
+
 ### 3. No Results
 When no recipes match:
 - Acknowledge what they were looking for
@@ -461,39 +476,158 @@ Generate a friendly response that presents these cooking steps clearly.
 Include the recipe name at the start. Be concise and helpful."""
 
     elif detail_type == "nutrition":
-        nutrition = recipe.get("nutrition") or {}
-        if recipe.get("recipe_metadata"):
-            import json
-            metadata = recipe.get("recipe_metadata", {})
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            nutrition = metadata.get("totalNutrition", {}).get("macros", {})
+        import json as _json
+
+        # recipe_metadata holds total-recipe nutrition; divide by servings for per-serving
+        servings = recipe.get("servings") or 1
+        raw_meta = recipe.get("recipe_metadata") or {}
+        if isinstance(raw_meta, str):
+            try:
+                raw_meta = _json.loads(raw_meta)
+            except Exception:
+                raw_meta = {}
+
+        total_nutrition = raw_meta.get("totalNutrition", {})
+        raw_macros = total_nutrition.get("macros", {})
+        raw_micros = total_nutrition.get("micros", {})
+
+        def _fmt(val, divisor):
+            """Return rounded per-serving value or 'N/A' if unavailable."""
+            if val is None:
+                return "N/A"
+            try:
+                result = round(float(val) / divisor, 1)
+                return result
+            except (TypeError, ValueError):
+                return "N/A"
+
+        macros_per_serving = {
+            "energyKcal":     _fmt(raw_macros.get("energyKcal"), servings),
+            "protein":        _fmt(raw_macros.get("protein"), servings),
+            "carbohydrates":  _fmt(raw_macros.get("carbohydrates"), servings),
+            "totalFat":       _fmt(raw_macros.get("totalFat"), servings),
+            "totalFiber":     _fmt(raw_macros.get("totalFiber"), servings),
+            "totalSugars":    _fmt(raw_macros.get("totalSugars"), servings),
+            "saturatedFat":   _fmt(raw_macros.get("saturatedFat"), servings),
+        }
+        micros_per_serving = {
+            "calcium":   _fmt(raw_micros.get("calcium"), servings),
+            "iron":      _fmt(raw_micros.get("iron"), servings),
+            "vitaminC":  _fmt(raw_micros.get("vitaminC"), servings),
+            "vitaminD":  _fmt(raw_micros.get("vitaminD"), servings),
+            "sodium":    _fmt(raw_micros.get("sodium"), servings),
+            "potassium": _fmt(raw_micros.get("potassium"), servings),
+        }
+
+        has_nutrition = any(v != "N/A" for v in macros_per_serving.values())
+
+        if has_nutrition:
+            macro_lines = (
+                f"- Calories: {macros_per_serving['energyKcal']} kcal\n"
+                f"- Protein: {macros_per_serving['protein']} g\n"
+                f"- Carbohydrates: {macros_per_serving['carbohydrates']} g\n"
+                f"- Total Fat: {macros_per_serving['totalFat']} g\n"
+                f"- Dietary Fiber: {macros_per_serving['totalFiber']} g\n"
+                f"- Total Sugars: {macros_per_serving['totalSugars']} g\n"
+                f"- Saturated Fat: {macros_per_serving['saturatedFat']} g"
+            )
+            micro_lines = (
+                f"- Calcium: {micros_per_serving['calcium']} mg\n"
+                f"- Iron: {micros_per_serving['iron']} mg\n"
+                f"- Vitamin C: {micros_per_serving['vitaminC']} mg\n"
+                f"- Vitamin D: {micros_per_serving['vitaminD']} μg\n"
+                f"- Sodium: {micros_per_serving['sodium']} mg\n"
+                f"- Potassium: {micros_per_serving['potassium']} mg"
+            )
+            nutrition_block = (
+                f"Macronutrients (per serving, serves {servings}):\n{macro_lines}\n\n"
+                f"Key Micronutrients (per serving):\n{micro_lines}"
+            )
+        else:
+            nutrition_block = "Detailed nutritional information is not available for this recipe."
 
         prompt = f"""User asked: "{query}"
 
-They want to know the nutrition for "{recipe_name}".
+They want to know the nutritional values for "{recipe_name}".
 
-Nutrition per serving:
-- Calories: {nutrition.get('energyKcal', 'N/A')} kcal
-- Protein: {nutrition.get('protein', 'N/A')}g
-- Carbs: {nutrition.get('carbohydrates', 'N/A')}g
-- Fat: {nutrition.get('totalFat', 'N/A')}g
+{nutrition_block}
 
-Generate a friendly response that presents the nutrition information clearly.
-Include the recipe name at the start. Be concise."""
+Present this nutritional information clearly using the EXACT values above.
+Include the recipe name at the start. Do NOT say values are unavailable if they are shown above.
+Be concise and well-formatted."""
 
     elif detail_type == "cost":
-        cost = recipe.get("cost") or {}
-        usa_cost = cost.get("usa", {}).get("total", "N/A")
+        # Use structured cost data passed from the pipeline
+        cost_data = recipe.get("cost_data") or {}
+        total_cost = cost_data.get("total_cost") or cost_data.get("cost_per_serving")
+        currency_symbol = cost_data.get("currency_symbol", "kr")
+        country_name = cost_data.get("country_name", "Norway")
+        servings = cost_data.get("servings", 1)
+        cost_per_serving = cost_data.get("cost_per_serving")
+
+        if total_cost is not None:
+            cost_summary = (
+                f"Total: {currency_symbol}{total_cost} "
+                f"(serves {servings}, {currency_symbol}{cost_per_serving} per serving)"
+            )
+        else:
+            cost_summary = "Pricing data not available for this recipe."
 
         prompt = f"""User asked: "{query}"
 
-They want to know the cost for "{recipe_name}".
+They want to know the cost of "{recipe_name}" in {country_name}.
 
-Estimated cost: ${usa_cost}
+Cost estimate:
+{cost_summary}
 
-Generate a brief response about the recipe cost.
-Include the recipe name. Be concise."""
+Generate a brief, friendly response about the recipe cost in {country_name}.
+Include the recipe name and the cost clearly. Be concise."""
+
+    elif detail_type == "ingredient_costs":
+        cost_data = recipe.get("cost_data") or {}
+        ingredient_costs = cost_data.get("ingredient_costs", [])
+        total_cost = cost_data.get("total_cost")
+        cost_per_serving = cost_data.get("cost_per_serving")
+        currency_symbol = cost_data.get("currency_symbol", "kr")
+        country_name = cost_data.get("country_name", "Norway")
+        servings = cost_data.get("servings", 1)
+
+        if ingredient_costs:
+            lines = []
+            for ing in ingredient_costs:
+                name = ing.get("ingredient", "Unknown")
+                amount = ing.get("amount", "")
+                unit = ing.get("unit", "")
+                cost = ing.get("cost")
+                note = ing.get("note", "")
+
+                amount_unit = f"{amount} {unit}".strip() if (amount or unit) else ""
+                amount_str = f" ({amount_unit})" if amount_unit else ""
+
+                if cost is not None:
+                    lines.append(f"  {name}{amount_str}: {currency_symbol}{cost}")
+                else:
+                    lines.append(f"  {name}{amount_str}: price not available" + (f" ({note})" if note else ""))
+
+            ingredient_list = "\n".join(lines)
+            total_str = (
+                f"\n  {'─' * 35}\n  Total: {currency_symbol}{total_cost}"
+                f" (serves {servings}, {currency_symbol}{cost_per_serving} per serving)"
+            ) if total_cost is not None else ""
+            cost_block = ingredient_list + total_str
+        else:
+            cost_block = "No ingredient pricing data available for this recipe."
+
+        prompt = f"""User asked: "{query}"
+
+They want a full ingredient cost breakdown for "{recipe_name}" in {country_name}.
+
+Ingredient costs:
+{cost_block}
+
+Present this breakdown clearly using the EXACT ingredient cost data above.
+Include the recipe name, each ingredient with its cost, and the total.
+Currency symbol: {currency_symbol}. Be concise and well-formatted."""
 
     else:  # full details
         prep_time = recipe.get("prepTime", 0) or 0

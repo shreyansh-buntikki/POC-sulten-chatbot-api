@@ -188,6 +188,57 @@ Even if the query seems vague on its own, the context makes it cooking-related.
 | `combined_meal_search` | Multi-course meal planning | true |
 | `show_more` | Show more results from previous search | false |
 
+## RULE 7: Recipe Reference Queries (CRITICAL)
+
+When the user asks about a **previously shown recipe** by its position (first, second, 1st, 4th, etc.) — this is a `recipe_reference` query.
+
+### Triggers
+Any query referencing a recipe by ordinal position in the previous results:
+- "What are the ingredients for the first one"
+- "Show the cost estimate of 4th recipe"
+- "Explain me in detail about the second one"
+- "What are the nutritions in the 3rd one"
+- "Show me price estimate of all ingredients for second"
+- "How do I make the third one"
+- "Tell me more about the 2nd recipe"
+- "Give me the steps for the last one"
+
+### Rules
+1. Intent = `recipe_reference`, `requires_embedding = false`
+2. **NEVER extract filters** — do NOT populate `filters.excluded_ingredients`, `filters.cost`, `filters.time`, `filters.servings`, etc.
+3. **Do NOT persist any session filters** — this query only looks up a previously shown recipe.
+4. Extract `entities.reference_position` as an integer (1–5) using the position map below.
+5. Extract `entities.detail_type` based on what the user wants to know (see table below).
+
+### Position Map
+| User says | reference_position |
+|-----------|-------------------|
+| first / 1st / one | 1 |
+| second / 2nd / two | 2 |
+| third / 3rd / three | 3 |
+| fourth / 4th / four | 4 |
+| fifth / 5th / five | 5 |
+| last | -1 (handled by pipeline) |
+
+### Detail Type Map
+| User query pattern | detail_type |
+|--------------------|------------|
+| "What are the ingredients for..." / "ingredients of..." | `ingredients` |
+| "Show the cost estimate of..." / "cost of the..." / "how much is the..." | `cost` |
+| "Show me price estimate of all ingredients for..." / "all ingredient prices for..." / "breakdown of costs for..." | `ingredient_costs` |
+| "Explain me in detail about..." / "tell me about..." / "more about..." / "details of..." | `full` |
+| "What are the nutritions in..." / "nutrition of..." / "calories in..." / "macros of..." | `nutrition` |
+| "How do I make the..." / "steps for the..." / "instructions for..." / "how to cook the..." | `instructions` |
+
+### Examples
+- "What are the ingredients for the first one" → intent: recipe_reference, entities.reference_position: 1, entities.detail_type: "ingredients"
+- "Show the cost estimate of 4th recipe" → intent: recipe_reference, entities.reference_position: 4, entities.detail_type: "cost"
+- "Explain me in detail about the second one" → intent: recipe_reference, entities.reference_position: 2, entities.detail_type: "full"
+- "What are the nutritions in the 3rd one" → intent: recipe_reference, entities.reference_position: 3, entities.detail_type: "nutrition"
+- "Show me price estimate of all ingredients for second" → intent: recipe_reference, entities.reference_position: 2, entities.detail_type: "ingredient_costs"
+- "How do I make the 5th one" → intent: recipe_reference, entities.reference_position: 5, entities.detail_type: "instructions"
+- "Tell me more about the last one" → intent: recipe_reference, entities.reference_position: -1, entities.detail_type: "full"
+
 ## Intent Details
 
 ### pricing_info
